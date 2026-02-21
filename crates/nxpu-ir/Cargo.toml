@@ -1,0 +1,8 @@
+[package]
+name = "nxpu-ir"
+description = "Intermediate representation for NxPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

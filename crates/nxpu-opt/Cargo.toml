@@ -1,0 +1,9 @@
+[package]
+name = "nxpu-opt"
+description = "IR optimization passes for NxPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nxpu-ir = { path = "../nxpu-ir" }

@@ -1,0 +1,9 @@
+[package]
+name = "nxpu-parser"
+description = "WGSL parser for NxPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"

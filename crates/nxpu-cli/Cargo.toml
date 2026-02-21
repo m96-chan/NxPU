@@ -1,0 +1,16 @@
+[package]
+name = "nxpu-cli"
+description = "CLI for the NxPU transpiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nxpu"
+path = "src/main.rs"
+
+[dependencies]
+nxpu-parser = { path = "../nxpu-parser" }
+nxpu-ir = { path = "../nxpu-ir" }
+nxpu-opt = { path = "../nxpu-opt" }
+clap = { version = "4", features = ["derive"] }
