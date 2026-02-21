@@ -85,6 +85,7 @@ fn run() -> miette::Result<()> {
     // 6. Backend dispatch.
     let mut registry = BackendRegistry::with_builtins();
     registry.register(Box::new(nxpu_backend_onnx::OnnxBackend));
+    registry.register(Box::new(nxpu_backend_tflite::TfLiteBackend));
     let backend = registry.find(&cli.target).ok_or_else(|| {
         let available = registry.list_targets().join(", ");
         miette::miette!("unknown target '{}' (available: {})", cli.target, available)

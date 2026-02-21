@@ -1,0 +1,16 @@
+[package]
+name = "nxpu-backend-tflite"
+description = "TFLite/LiteRT backend emitter for NxPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nxpu-ir = { path = "../nxpu-ir" }
+nxpu-backend-core = { path = "../nxpu-backend-core" }
+nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }
+flatbuffers = "25"
+thiserror = "2"
+
+[dev-dependencies]
+nxpu-parser = { path = "../nxpu-parser" }
