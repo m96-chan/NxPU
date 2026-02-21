@@ -7,6 +7,7 @@ use crate::analyze::{
     ActivationOp, Conv2DShape, ElementWiseOp, KernelPattern, MatMulShape, PoolKind, PoolShape,
     ReduceOp, TensorBinding,
 };
+use crate::fusion::{FusedActivation, FusedPattern};
 use crate::proto::*;
 
 /// Build an ONNX model from a classified kernel pattern.
@@ -89,6 +90,166 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> ModelProto {
             domain: String::new(),
             version: 13,
         }],
+    }
+}
+
+/// Build an ONNX model from a fused pattern.
+///
+/// Handles single patterns, Conv+BatchNorm fusion, and activation fusion.
+pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> ModelProto {
+    match fp {
+        FusedPattern::Single(p) => build_model(p, ep_name),
+        FusedPattern::ConvBatchNorm { conv, norm } => {
+            let (input, weight, shape) = match conv {
+                KernelPattern::Conv2D {
+                    input,
+                    weight,
+                    shape,
+                    ..
+                } => (input, weight, shape),
+                _ => unreachable!("ConvBatchNorm conv must be Conv2D"),
+            };
+            let (scale, bias, norm_output) = match norm.as_ref() {
+                KernelPattern::Normalization {
+                    scale,
+                    bias,
+                    output,
+                    ..
+                } => (scale, bias, output),
+                _ => unreachable!("ConvBatchNorm norm must be Normalization"),
+            };
+
+            let intermediate = "conv_out_intermediate";
+
+            let conv_node = NodeProto::with_attrs(
+                "Conv",
+                "conv_0",
+                vec![input.name.clone(), weight.name.clone()],
+                vec![intermediate.into()],
+                vec![
+                    AttributeProto::ints(
+                        "kernel_shape",
+                        vec![shape.stride_h.max(1), shape.stride_w.max(1)],
+                    ),
+                    AttributeProto::ints(
+                        "strides",
+                        vec![shape.stride_h.max(1), shape.stride_w.max(1)],
+                    ),
+                    AttributeProto::ints(
+                        "pads",
+                        vec![shape.pad_h, shape.pad_w, shape.pad_h, shape.pad_w],
+                    ),
+                ],
+            );
+
+            let bn_node = NodeProto::with_attrs(
+                "BatchNormalization",
+                "batchnorm_0",
+                vec![
+                    intermediate.into(),
+                    scale.name.clone(),
+                    bias.name.clone(),
+                    "running_mean".into(),
+                    "running_var".into(),
+                ],
+                vec![norm_output.name.clone()],
+                vec![AttributeProto::int("epsilon", 1065353216)],
+            );
+
+            let graph = GraphProto {
+                name: ep_name.into(),
+                node: vec![conv_node, bn_node],
+                input: vec![
+                    ValueInfoProto::tensor(
+                        &input.name,
+                        input.elem_type,
+                        vec![
+                            TensorShapeDimension::symbolic(&shape.batch),
+                            TensorShapeDimension::symbolic(&shape.channels_in),
+                            TensorShapeDimension::symbolic(&shape.height),
+                            TensorShapeDimension::symbolic(&shape.width),
+                        ],
+                    ),
+                    ValueInfoProto::tensor(
+                        &weight.name,
+                        weight.elem_type,
+                        vec![
+                            TensorShapeDimension::symbolic(&shape.channels_out),
+                            TensorShapeDimension::symbolic(&shape.channels_in),
+                            TensorShapeDimension::symbolic(&shape.kernel_h),
+                            TensorShapeDimension::symbolic(&shape.kernel_w),
+                        ],
+                    ),
+                    ValueInfoProto::tensor(
+                        &scale.name,
+                        scale.elem_type,
+                        vec![TensorShapeDimension::symbolic(&shape.channels_out)],
+                    ),
+                    ValueInfoProto::tensor(
+                        &bias.name,
+                        bias.elem_type,
+                        vec![TensorShapeDimension::symbolic(&shape.channels_out)],
+                    ),
+                ],
+                output: vec![ValueInfoProto::tensor(
+                    &norm_output.name,
+                    norm_output.elem_type,
+                    vec![
+                        TensorShapeDimension::symbolic(&shape.batch),
+                        TensorShapeDimension::symbolic(&shape.channels_out),
+                        TensorShapeDimension::symbolic("OH"),
+                        TensorShapeDimension::symbolic("OW"),
+                    ],
+                )],
+            };
+
+            ModelProto {
+                ir_version: 7,
+                producer_name: "nxpu".into(),
+                producer_version: env!("CARGO_PKG_VERSION").into(),
+                graph: Some(graph),
+                opset_import: vec![OperatorSetIdProto {
+                    domain: String::new(),
+                    version: 13,
+                }],
+            }
+        }
+        FusedPattern::WithActivation { base, activation } => {
+            let mut model = build_fused_model(base, ep_name);
+            if let (Some(graph), FusedActivation::Relu) = (model.graph.as_mut(), activation) {
+                // Rename the last output to an intermediate and add a Relu node.
+                if let Some(last_output) = graph.output.last_mut() {
+                    let original_name = last_output.name.clone();
+                    let intermediate_name = format!("{original_name}_pre_relu");
+
+                    // Rename graph output to intermediate.
+                    last_output.name = intermediate_name.clone();
+
+                    // Rename the last node's output to the intermediate.
+                    if let Some(last_node) = graph.node.last_mut() {
+                        for out in &mut last_node.output {
+                            if *out == original_name {
+                                *out = intermediate_name.clone();
+                            }
+                        }
+                    }
+
+                    // Add the Relu node.
+                    graph.node.push(NodeProto::simple(
+                        "Relu",
+                        "relu_0",
+                        vec![intermediate_name],
+                        vec![original_name.clone()],
+                    ));
+
+                    // Restore the original output name.
+                    if let Some(last_output) = graph.output.last_mut() {
+                        last_output.name = original_name;
+                    }
+                }
+            }
+            model
+        }
     }
 }
 
@@ -596,6 +757,11 @@ fn build_attention_graph(
             ValueInfoProto::tensor(&query.name, query.elem_type, q_shape),
             ValueInfoProto::tensor(&key.name, key.elem_type, k_shape),
             ValueInfoProto::tensor(&value.name, value.elem_type, v_shape),
+            ValueInfoProto::tensor(
+                "sqrt_dk",
+                query.elem_type,
+                vec![TensorShapeDimension::fixed(1)],
+            ),
         ],
         output: vec![ValueInfoProto::tensor(
             &output.name,
@@ -673,9 +839,7 @@ mod tests {
 
         // Verify A shape = [M, K].
         let a_type = graph.input[0].r#type.as_ref().unwrap();
-        let a_tensor = match a_type.value.as_ref().unwrap() {
-            type_proto::Value::TensorType(t) => t,
-        };
+        let type_proto::Value::TensorType(a_tensor) = a_type.value.as_ref().unwrap();
         assert_eq!(a_tensor.elem_type, data_type::FLOAT);
         let a_dims = &a_tensor.shape.as_ref().unwrap().dim;
         assert_eq!(a_dims.len(), 2);
@@ -690,9 +854,7 @@ mod tests {
 
         // Verify C shape = [M, N].
         let c_type = graph.output[0].r#type.as_ref().unwrap();
-        let c_tensor = match c_type.value.as_ref().unwrap() {
-            type_proto::Value::TensorType(t) => t,
-        };
+        let type_proto::Value::TensorType(c_tensor) = c_type.value.as_ref().unwrap();
         let c_dims = &c_tensor.shape.as_ref().unwrap().dim;
         assert_eq!(c_dims.len(), 2);
         assert_eq!(
@@ -728,9 +890,8 @@ mod tests {
 
         // All tensors are 1D with symbolic dim "N".
         for vi in graph.input.iter().chain(graph.output.iter()) {
-            let tensor = match vi.r#type.as_ref().unwrap().value.as_ref().unwrap() {
-                type_proto::Value::TensorType(t) => t,
-            };
+            let type_proto::Value::TensorType(tensor) =
+                vi.r#type.as_ref().unwrap().value.as_ref().unwrap();
             let dims = &tensor.shape.as_ref().unwrap().dim;
             assert_eq!(dims.len(), 1);
             assert_eq!(

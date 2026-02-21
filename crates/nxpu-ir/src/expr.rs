@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn expression_arena() {
         let mut exprs = Arena::new();
-        let lit = exprs.append(Expression::Literal(Literal::F32(3.14)));
+        let lit = exprs.append(Expression::Literal(Literal::F32(3.125)));
         let neg = exprs.append(Expression::Unary {
             op: UnaryOp::Negate,
             expr: lit,

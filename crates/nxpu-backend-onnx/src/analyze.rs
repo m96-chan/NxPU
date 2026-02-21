@@ -216,12 +216,14 @@ pub enum KernelPattern {
         epsilon: f32,
     },
     /// Concatenation of multiple inputs along an axis.
+    // TODO: axis is always 0; infer actual concat axis from IR when possible.
     Concat {
         inputs: Vec<TensorBinding>,
         output: TensorBinding,
         axis: i64,
     },
     /// Split a single input into multiple outputs along an axis.
+    // TODO: axis is always 0; infer actual split axis from IR when possible.
     Split {
         input: TensorBinding,
         outputs: Vec<TensorBinding>,
@@ -382,7 +384,11 @@ pub fn classify_entry_point(
 
     // 3+ inputs: check for Attention before Normalization
     if num_inputs >= 3 {
-        // Attention: 3 inputs + has loop + contains Exp + contains Sqrt
+        // Attention heuristic: 3 inputs + has loop + contains Exp + Sqrt.
+        // NOTE: This is fragile — any 3-input kernel with loop + exp() + sqrt()
+        // will match. A false positive is possible for custom kernels that
+        // happen to use both functions. Consider adding more structural checks
+        // (e.g., nested loop depth, softmax pattern) if this becomes an issue.
         if has_loop
             && has_math_function_in_expressions(&ep.function.expressions, MathFunction::Exp)
             && has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sqrt)
@@ -560,9 +566,15 @@ fn has_math_function_in_expressions(exprs: &Arena<Expression>, target: MathFunct
         .any(|(_, expr)| matches!(expr, Expression::Math { fun, .. } if *fun == target))
 }
 
-/// Check if a block contains an If statement (non-recursive — top-level only).
+/// Check if a block (or any nested block) contains an If statement.
 fn has_if_statement(body: &[Statement]) -> bool {
-    body.iter().any(|stmt| matches!(stmt, Statement::If { .. }))
+    body.iter().any(|stmt| match stmt {
+        Statement::If { .. } => true,
+        Statement::Loop {
+            body, continuing, ..
+        } => has_if_statement(body) || has_if_statement(continuing),
+        _ => false,
+    })
 }
 
 /// Check if a block (or any nested block) contains a Loop statement.

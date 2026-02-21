@@ -53,16 +53,15 @@ impl FusedPattern {
 /// Scans the pattern list and merges compatible adjacent pairs:
 /// - Conv2D + Normalization → ConvBatchNorm
 /// - Any + Activation(Relu) → WithActivation { base, Relu }
-pub fn fuse_patterns(patterns: Vec<KernelPattern>) -> Vec<FusedPattern> {
-    let mut result: Vec<FusedPattern> = Vec::new();
-    let mut iter = patterns.into_iter().peekable();
+pub fn fuse_patterns(patterns: Vec<KernelPattern>) -> Vec<(FusedPattern, usize)> {
+    let mut result: Vec<(FusedPattern, usize)> = Vec::new();
+    let mut iter = patterns.into_iter().enumerate().peekable();
 
-    while let Some(pattern) = iter.next() {
+    while let Some((idx, pattern)) = iter.next() {
         let fused = match &pattern {
-            // Conv2D followed by Normalization → fuse
             KernelPattern::Conv2D { .. } => {
-                if let Some(KernelPattern::Normalization { .. }) = iter.peek() {
-                    let norm = iter.next().unwrap();
+                if let Some((_, KernelPattern::Normalization { .. })) = iter.peek() {
+                    let (_, norm) = iter.next().unwrap();
                     FusedPattern::ConvBatchNorm {
                         conv: pattern,
                         norm: Box::new(norm),
@@ -74,13 +73,15 @@ pub fn fuse_patterns(patterns: Vec<KernelPattern>) -> Vec<FusedPattern> {
             _ => FusedPattern::Single(pattern),
         };
 
-        // Check if next pattern is a ReLU activation → fuse
-        let fused = if let Some(KernelPattern::Activation {
-            op: crate::analyze::ActivationOp::Relu,
-            ..
-        }) = iter.peek()
+        let fused = if let Some((
+            _,
+            KernelPattern::Activation {
+                op: crate::analyze::ActivationOp::Relu,
+                ..
+            },
+        )) = iter.peek()
         {
-            let _ = iter.next(); // consume the ReLU
+            let _ = iter.next();
             FusedPattern::WithActivation {
                 base: Box::new(fused),
                 activation: FusedActivation::Relu,
@@ -89,7 +90,7 @@ pub fn fuse_patterns(patterns: Vec<KernelPattern>) -> Vec<FusedPattern> {
             fused
         };
 
-        result.push(fused);
+        result.push((fused, idx));
     }
 
     result
@@ -141,7 +142,9 @@ mod tests {
 
         let fused = fuse_patterns(patterns);
         assert_eq!(fused.len(), 1);
-        assert!(matches!(fused[0], FusedPattern::Single(_)));
+        let (ref fp, idx) = fused[0];
+        assert!(matches!(fp, FusedPattern::Single(_)));
+        assert_eq!(idx, 0);
     }
 
     #[test]
@@ -176,7 +179,9 @@ mod tests {
 
         let fused = fuse_patterns(patterns);
         assert_eq!(fused.len(), 1);
-        assert!(matches!(fused[0], FusedPattern::ConvBatchNorm { .. }));
+        let (ref fp, idx) = fused[0];
+        assert!(matches!(fp, FusedPattern::ConvBatchNorm { .. }));
+        assert_eq!(idx, 0);
     }
 
     #[test]
@@ -201,13 +206,15 @@ mod tests {
 
         let fused = fuse_patterns(patterns);
         assert_eq!(fused.len(), 1);
+        let (ref fp, idx) = fused[0];
         assert!(matches!(
-            fused[0],
+            fp,
             FusedPattern::WithActivation {
                 activation: FusedActivation::Relu,
                 ..
             }
         ));
+        assert_eq!(idx, 0);
     }
 
     #[test]
@@ -248,7 +255,9 @@ mod tests {
 
         let fused = fuse_patterns(patterns);
         assert_eq!(fused.len(), 1);
-        match &fused[0] {
+        let (ref fp, idx) = fused[0];
+        assert_eq!(idx, 0);
+        match fp {
             FusedPattern::WithActivation {
                 base,
                 activation: FusedActivation::Relu,
@@ -282,5 +291,7 @@ mod tests {
         let fused = fuse_patterns(patterns);
         // Tanh is not fused — remains as 2 separate patterns.
         assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].1, 0);
+        assert_eq!(fused[1].1, 1);
     }
 }

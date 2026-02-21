@@ -6,7 +6,7 @@ use prost::Message;
 
 fn decode_onnx(output: &nxpu_backend_core::BackendOutput) -> ModelProto {
     let bytes = common::first_binary(output);
-    ModelProto::decode(bytes.as_ref()).expect("failed to decode ONNX model")
+    ModelProto::decode(bytes).expect("failed to decode ONNX model")
 }
 
 // --- MatMul ---
@@ -201,8 +201,10 @@ fn attention_produces_attention_subgraph() {
     let model = decode_onnx(&output);
     let graph = model.graph.unwrap();
     // Attention subgraph: Transpose + MatMul + Div + Softmax + MatMul = 5 nodes
-    assert!(graph.node.len() >= 2);
+    assert_eq!(graph.node.len(), 5);
     let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
+    assert!(op_types.contains(&"Transpose"));
     assert!(op_types.contains(&"MatMul"));
+    assert!(op_types.contains(&"Div"));
     assert!(op_types.contains(&"Softmax"));
 }

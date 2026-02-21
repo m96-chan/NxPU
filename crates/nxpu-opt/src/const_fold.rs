@@ -219,8 +219,10 @@ fn fold_math(
         MathFunction::Pow => Some(a.powf(b?)),
         MathFunction::Atan2 => Some(a.atan2(b?)),
         MathFunction::Step => {
-            let edge = b?;
-            Some(if a < edge { 0.0 } else { 1.0 })
+            // step(edge, x) returns 0.0 if x < edge, else 1.0.
+            // In IR: arg=edge(a), arg1=x(b).
+            let x = b?;
+            Some(if x < a { 0.0 } else { 1.0 })
         }
         // 3-arg
         MathFunction::Clamp => {

@@ -344,6 +344,8 @@ fn build_attention<'a>(
     Vec<&'a TensorBinding>,
     Vec<MlOperation>,
 ) {
+    // scaled_dot_product_attention takes (query, key, value) and an optional
+    // scale parameter. When scale is omitted the runtime uses 1/sqrt(d_k).
     let op = MlOperation {
         r#type: "scaled_dot_product_attention".into(),
         name: "attention_0".into(),
@@ -414,9 +416,7 @@ mod tests {
         let model = build_model(&pattern, "matmul_kernel");
         assert_eq!(model.specification_version, SPECIFICATION_VERSION);
 
-        let prog = match model.r#type.as_ref().unwrap() {
-            model::Type::MlProgram(p) => p,
-        };
+        let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         assert_eq!(prog.functions.len(), 1);
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations.len(), 1);
@@ -436,9 +436,7 @@ mod tests {
         };
 
         let model = build_model(&pattern, "vecadd");
-        let prog = match model.r#type.as_ref().unwrap() {
-            model::Type::MlProgram(p) => p,
-        };
+        let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations[0].r#type, "add");
     }
@@ -452,9 +450,7 @@ mod tests {
             dim_name: "N".into(),
         };
         let model = build_model(&pattern, "relu");
-        let prog = match model.r#type.as_ref().unwrap() {
-            model::Type::MlProgram(p) => p,
-        };
+        let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations[0].r#type, "relu");
     }
@@ -473,9 +469,7 @@ mod tests {
             },
         };
         let model = build_model(&pattern, "maxpool");
-        let prog = match model.r#type.as_ref().unwrap() {
-            model::Type::MlProgram(p) => p,
-        };
+        let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations[0].r#type, "max_pool");
     }

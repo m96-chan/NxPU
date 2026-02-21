@@ -59,9 +59,9 @@ impl Backend for OnnxBackend {
         let mut files = Vec::new();
         let mut diagnostics = Vec::new();
 
-        for (i, fp) in fused.iter().enumerate() {
-            let ep_name = if i < module.entry_points.len() {
-                &module.entry_points[i].name
+        for (fp, ep_idx) in &fused {
+            let ep_name = if *ep_idx < module.entry_points.len() {
+                &module.entry_points[*ep_idx].name
             } else {
                 "fused"
             };
@@ -84,9 +84,7 @@ impl Backend for OnnxBackend {
                 message: format!("entry point '{ep_name}': classified as {summary}"),
             });
 
-            // ONNX keeps separate nodes — runtime handles fusion.
-            // Lower the primary pattern.
-            let model = lower::build_model(fp.primary_pattern(), ep_name);
+            let model = lower::build_fused_model(fp, ep_name);
             let bytes = model.encode_to_vec();
 
             let filename = if fused.len() == 1 {

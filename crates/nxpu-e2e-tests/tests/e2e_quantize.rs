@@ -8,7 +8,7 @@ use prost::Message;
 
 fn decode_onnx(output: &nxpu_backend_core::BackendOutput) -> ModelProto {
     let bytes = common::first_binary(output);
-    ModelProto::decode(bytes.as_ref()).expect("failed to decode ONNX model")
+    ModelProto::decode(bytes).expect("failed to decode ONNX model")
 }
 
 fn get_input_elem_types(model: &ModelProto) -> Vec<i32> {

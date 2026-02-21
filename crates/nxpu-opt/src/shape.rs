@@ -251,7 +251,7 @@ mod tests {
         let shapes = infer_shapes(&module);
         assert_eq!(shapes.len(), 2); // only storage buffers
 
-        for (_, shape) in &shapes {
+        for shape in shapes.values() {
             assert_eq!(shape.rank(), 1);
             assert_eq!(shape.dims[0], Dim::Symbolic("N".into()));
         }

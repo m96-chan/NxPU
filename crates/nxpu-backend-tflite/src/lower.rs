@@ -168,31 +168,14 @@ pub fn build_model(pattern: &KernelPattern) -> Vec<u8> {
                 "concat",
             )
         }
-        KernelPattern::Split { input, outputs, .. } => {
-            let out = outputs.first().expect("split must have outputs");
-            let shapes = [vec![-1i32], vec![-1]];
-            build_tflite_unary(
-                input,
-                out,
-                &shapes[0],
-                &shapes[1],
-                builtin_op::SPLIT,
-                "split",
-            )
-        }
+        KernelPattern::Split { input, outputs, .. } => build_tflite_split(input, outputs),
         KernelPattern::Attention {
-            query, key, output, ..
-        } => {
-            // Approximate attention as BATCH_MATMUL (Q * K^T).
-            let shapes = [vec![-1i32, -1], vec![-1, -1], vec![-1, -1]];
-            build_tflite(
-                &[query, key],
-                output,
-                &shapes,
-                builtin_op::BATCH_MATMUL,
-                "attention",
-            )
-        }
+            query,
+            key,
+            value,
+            output,
+            ..
+        } => build_tflite_attention(query, key, value, output),
     }
 }
 
@@ -397,6 +380,244 @@ fn build_tflite_unary(
     };
     let operators = fbb.create_vector(&[operator]);
 
+    let subgraph = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::sub_graph::TENSORS, tensors);
+        fbb.push_slot_always(vt::sub_graph::INPUTS, sg_inputs);
+        fbb.push_slot_always(vt::sub_graph::OUTPUTS, sg_outputs);
+        fbb.push_slot_always(vt::sub_graph::OPERATORS, operators);
+        fbb.push_slot_always(vt::sub_graph::NAME, sg_name);
+        fbb.end_table(start)
+    };
+    let subgraphs = fbb.create_vector(&[subgraph]);
+
+    let model = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::model::VERSION, 3, 0);
+        fbb.push_slot_always(vt::model::OPERATOR_CODES, operator_codes);
+        fbb.push_slot_always(vt::model::SUBGRAPHS, subgraphs);
+        fbb.push_slot_always(vt::model::DESCRIPTION, desc);
+        fbb.push_slot_always(vt::model::BUFFERS, buffers);
+        fbb.end_table(start)
+    };
+
+    fbb.finish(model, Some(TFLITE_FILE_ID));
+    fbb.finished_data().to_vec()
+}
+
+/// Build a TFLite model for attention: BATCH_MATMUL(Q,K) -> SOFTMAX -> BATCH_MATMUL(attn,V).
+fn build_tflite_attention(
+    query: &TensorBinding,
+    key: &TensorBinding,
+    value: &TensorBinding,
+    output: &TensorBinding,
+) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::with_capacity(2048);
+
+    // Strings
+    let name_q = fbb.create_string(&query.name);
+    let name_k = fbb.create_string(&key.name);
+    let name_v = fbb.create_string(&value.name);
+    let name_scores = fbb.create_string("scores");
+    let name_attn = fbb.create_string("attn_weights");
+    let name_out = fbb.create_string(&output.name);
+    let desc = fbb.create_string("nxpu");
+    let sg_name = fbb.create_string("attention");
+
+    // Shapes
+    let shape_2d = fbb.create_vector(&[-1i32, -1]);
+    let shape_1d = fbb.create_vector(&[-1i32]);
+
+    // Buffers (sentinel + 6 tensors)
+    let mut buffer_offsets = Vec::new();
+    for _ in 0..7 {
+        let start = fbb.start_table();
+        buffer_offsets.push(fbb.end_table(start));
+    }
+    let buffers = fbb.create_vector(&buffer_offsets);
+
+    let qtype = onnx_to_tflite_type(query.elem_type);
+
+    // Tensors: Q(0), K(1), V(2), scores(3), attn_weights(4), output(5)
+    let tensors_data = [
+        (shape_2d, name_q, qtype, 1u32),
+        (shape_2d, name_k, qtype, 2),
+        (shape_2d, name_v, qtype, 3),
+        (shape_2d, name_scores, qtype, 4),
+        (shape_1d, name_attn, qtype, 5),
+        (shape_2d, name_out, qtype, 6),
+    ];
+    let mut tensor_offsets = Vec::new();
+    for (shape, name, dtype, buf) in &tensors_data {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, *shape);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, *dtype, 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, *buf, 0);
+        fbb.push_slot_always(vt::tensor::NAME, *name);
+        tensor_offsets.push(fbb.end_table(start));
+    }
+    let tensors = fbb.create_vector(&tensor_offsets);
+
+    // Operator codes: BATCH_MATMUL(0), SOFTMAX(1)
+    let matmul_code = {
+        let start = fbb.start_table();
+        fbb.push_slot::<i8>(vt::operator_code::DEPRECATED_BUILTIN_CODE, 127, 0);
+        fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
+        fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, builtin_op::BATCH_MATMUL, 0);
+        fbb.end_table(start)
+    };
+    let softmax_code = {
+        let start = fbb.start_table();
+        let deprecated = if builtin_op::SOFTMAX <= 127 {
+            builtin_op::SOFTMAX as i8
+        } else {
+            127
+        };
+        fbb.push_slot::<i8>(vt::operator_code::DEPRECATED_BUILTIN_CODE, deprecated, 0);
+        fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
+        fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, builtin_op::SOFTMAX, 0);
+        fbb.end_table(start)
+    };
+    let operator_codes = fbb.create_vector(&[matmul_code, softmax_code]);
+
+    // Operators
+    // Op 0: BATCH_MATMUL(Q=0, K=1) -> scores=3
+    let op0_inputs = fbb.create_vector(&[0i32, 1]);
+    let op0_outputs = fbb.create_vector(&[3i32]);
+    let op0 = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 0, 0);
+        fbb.push_slot_always(vt::operator::INPUTS, op0_inputs);
+        fbb.push_slot_always(vt::operator::OUTPUTS, op0_outputs);
+        fbb.end_table(start)
+    };
+    // Op 1: SOFTMAX(scores=3) -> attn_weights=4
+    let op1_inputs = fbb.create_vector(&[3i32]);
+    let op1_outputs = fbb.create_vector(&[4i32]);
+    let op1 = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 1, 0);
+        fbb.push_slot_always(vt::operator::INPUTS, op1_inputs);
+        fbb.push_slot_always(vt::operator::OUTPUTS, op1_outputs);
+        fbb.end_table(start)
+    };
+    // Op 2: BATCH_MATMUL(attn_weights=4, V=2) -> output=5
+    let op2_inputs = fbb.create_vector(&[4i32, 2]);
+    let op2_outputs = fbb.create_vector(&[5i32]);
+    let op2 = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 0, 0);
+        fbb.push_slot_always(vt::operator::INPUTS, op2_inputs);
+        fbb.push_slot_always(vt::operator::OUTPUTS, op2_outputs);
+        fbb.end_table(start)
+    };
+    let operators = fbb.create_vector(&[op0, op1, op2]);
+
+    // Subgraph
+    let sg_inputs = fbb.create_vector(&[0i32, 1, 2]);
+    let sg_outputs = fbb.create_vector(&[5i32]);
+    let subgraph = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::sub_graph::TENSORS, tensors);
+        fbb.push_slot_always(vt::sub_graph::INPUTS, sg_inputs);
+        fbb.push_slot_always(vt::sub_graph::OUTPUTS, sg_outputs);
+        fbb.push_slot_always(vt::sub_graph::OPERATORS, operators);
+        fbb.push_slot_always(vt::sub_graph::NAME, sg_name);
+        fbb.end_table(start)
+    };
+    let subgraphs = fbb.create_vector(&[subgraph]);
+
+    let model = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::model::VERSION, 3, 0);
+        fbb.push_slot_always(vt::model::OPERATOR_CODES, operator_codes);
+        fbb.push_slot_always(vt::model::SUBGRAPHS, subgraphs);
+        fbb.push_slot_always(vt::model::DESCRIPTION, desc);
+        fbb.push_slot_always(vt::model::BUFFERS, buffers);
+        fbb.end_table(start)
+    };
+
+    fbb.finish(model, Some(TFLITE_FILE_ID));
+    fbb.finished_data().to_vec()
+}
+
+/// Build a TFLite model for Split: one input, multiple outputs.
+fn build_tflite_split(input: &TensorBinding, outputs: &[TensorBinding]) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::with_capacity(1024);
+
+    let name_in = fbb.create_string(&input.name);
+    let out_names: Vec<_> = outputs.iter().map(|o| fbb.create_string(&o.name)).collect();
+    let desc = fbb.create_string("nxpu");
+    let sg_name = fbb.create_string("split");
+
+    let shape_in = fbb.create_vector(&[-1i32]);
+    let shape_out = fbb.create_vector(&[-1i32]);
+
+    let num_tensors = 1 + outputs.len(); // input + outputs
+    let mut buffer_offsets = Vec::new();
+    for _ in 0..=num_tensors {
+        let start = fbb.start_table();
+        buffer_offsets.push(fbb.end_table(start));
+    }
+    let buffers = fbb.create_vector(&buffer_offsets);
+
+    // Tensors: input(0), outputs(1..N)
+    let mut tensor_offsets = Vec::new();
+    let tensor_in = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_in);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(input.elem_type), 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 1, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_in);
+        fbb.end_table(start)
+    };
+    tensor_offsets.push(tensor_in);
+
+    for (i, (o, name)) in outputs.iter().zip(out_names.iter()).enumerate() {
+        let t = {
+            let start = fbb.start_table();
+            fbb.push_slot_always(vt::tensor::SHAPE, shape_out);
+            fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(o.elem_type), 0);
+            fbb.push_slot::<u32>(vt::tensor::BUFFER, (i + 2) as u32, 0);
+            fbb.push_slot_always(vt::tensor::NAME, *name);
+            fbb.end_table(start)
+        };
+        tensor_offsets.push(t);
+    }
+    let tensors = fbb.create_vector(&tensor_offsets);
+
+    let deprecated_code = if builtin_op::SPLIT <= 127 {
+        builtin_op::SPLIT as i8
+    } else {
+        127
+    };
+    let opcode_table = {
+        let start = fbb.start_table();
+        fbb.push_slot::<i8>(
+            vt::operator_code::DEPRECATED_BUILTIN_CODE,
+            deprecated_code,
+            0,
+        );
+        fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
+        fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, builtin_op::SPLIT, 0);
+        fbb.end_table(start)
+    };
+    let operator_codes = fbb.create_vector(&[opcode_table]);
+
+    let op_inputs = fbb.create_vector(&[0i32]);
+    let output_indices: Vec<i32> = (1..=outputs.len() as i32).collect();
+    let op_outputs = fbb.create_vector(&output_indices);
+    let operator = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 0, 0);
+        fbb.push_slot_always(vt::operator::INPUTS, op_inputs);
+        fbb.push_slot_always(vt::operator::OUTPUTS, op_outputs);
+        fbb.end_table(start)
+    };
+    let operators = fbb.create_vector(&[operator]);
+
+    let sg_inputs = fbb.create_vector(&[0i32]);
+    let sg_outputs = fbb.create_vector(&output_indices);
     let subgraph = {
         let start = fbb.start_table();
         fbb.push_slot_always(vt::sub_graph::TENSORS, tensors);

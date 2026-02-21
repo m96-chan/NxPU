@@ -34,7 +34,7 @@ fn run_onnx_1d(wgsl_source: &str, inputs: Vec<Vec<f32>>) -> Vec<f32> {
             .map(|d| d.to_usize().unwrap_or(n))
             .collect();
         model
-            .set_input_fact(i, f32::fact(shape).into())
+            .set_input_fact(i, f32::fact(shape))
             .expect("failed to set input fact");
     }
 
@@ -79,10 +79,10 @@ fn run_onnx_matmul(wgsl_source: &str, a: Array2<f32>, b: Array2<f32>) -> Array2<
 
     let mut model = model.into_typed().expect("failed to type model");
     model
-        .set_input_fact(0, f32::fact([m, k]).into())
+        .set_input_fact(0, f32::fact([m, k]))
         .expect("set A shape");
     model
-        .set_input_fact(1, f32::fact([k, n]).into())
+        .set_input_fact(1, f32::fact([k, n]))
         .expect("set B shape");
 
     let model = model.into_optimized().expect("failed to optimize");
