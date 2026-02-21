@@ -1,0 +1,15 @@
+[package]
+name = "nxpu-backend-stablehlo"
+description = "StableHLO/XLA backend emitter for NxPU (Google Cloud TPU)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nxpu-ir = { path = "../nxpu-ir" }
+nxpu-backend-core = { path = "../nxpu-backend-core" }
+nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }
+thiserror = "2"
+
+[dev-dependencies]
+nxpu-parser = { path = "../nxpu-parser" }
