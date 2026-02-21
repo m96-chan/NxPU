@@ -1,20 +1,39 @@
 //! NxPU intermediate representation.
+//!
+//! An arena-based SSA IR for representing compute shader programs.
+//! Modeled after naga's architecture but tailored for NPU lowering.
+
+pub mod arena;
+mod display;
+mod error;
+mod expr;
+mod func;
+mod global;
+mod stmt;
+mod types;
+
+pub use arena::{Arena, Handle, Range, UniqueArena};
+pub use display::{dump_module, format_type, format_type_inner};
+pub use error::IrError;
+pub use expr::{
+    AtomicFunction, BinaryOp, Expression, Literal, MathFunction, SwizzleComponent, UnaryOp,
+};
+pub use func::{EntryPoint, Function, FunctionArgument, FunctionResult, LocalVariable};
+pub use global::{AddressSpace, Binding, BuiltIn, GlobalVariable, ResourceBinding, StorageAccess};
+pub use stmt::{Barrier, Block, Statement};
+pub use types::{ArraySize, Bytes, Scalar, ScalarKind, StructMember, Type, TypeInner, VectorSize};
 
 /// A compiled NxPU IR module.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Default)]
 pub struct Module {
-    pub functions: Vec<Function>,
-}
-
-/// An IR function.
-#[derive(Debug, Clone)]
-pub struct Function {
-    pub name: String,
-    pub body: Vec<Instruction>,
-}
-
-/// An IR instruction.
-#[derive(Debug, Clone)]
-pub enum Instruction {
-    // TODO: define IR instruction set
+    /// Deduplicated type arena.
+    pub types: UniqueArena<Type>,
+    /// Module-scope variables.
+    pub global_variables: Arena<GlobalVariable>,
+    /// Module-scope constant expressions.
+    pub global_expressions: Arena<Expression>,
+    /// Helper (non-entry-point) functions.
+    pub functions: Arena<Function>,
+    /// Compute entry points.
+    pub entry_points: Vec<EntryPoint>,
 }
