@@ -11,6 +11,7 @@ members = [
     "crates/nxpu-backend-stablehlo",
     "crates/nxpu-backend-samsung",
     "crates/nxpu-backend-mediatek",
+    "crates/nxpu-backend-intel",
     "crates/nxpu-cli",
 ]
 
