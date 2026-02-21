@@ -47,6 +47,12 @@ impl Backend for CoreMlBackend {
             let pattern = analyze::classify_entry_point(module, i).map_err(|e| {
                 BackendError::Unsupported(format!("entry point '{}': {e}", ep.name))
             })?;
+            if let analyze::KernelPattern::Unknown { reason } = &pattern {
+                return Err(BackendError::Unsupported(format!(
+                    "entry point '{}': unrecognized pattern: {reason}",
+                    ep.name
+                )));
+            }
 
             let summary = match &pattern {
                 analyze::KernelPattern::MatMul { .. } => "matmul",
@@ -64,6 +70,7 @@ impl Backend for CoreMlBackend {
                 analyze::KernelPattern::Concat { .. } => "concat",
                 analyze::KernelPattern::Split { .. } => "split",
                 analyze::KernelPattern::Attention { .. } => "scaled_dot_product_attention",
+                analyze::KernelPattern::Unknown { .. } => "Unknown",
             };
 
             diagnostics.push(Diagnostic {

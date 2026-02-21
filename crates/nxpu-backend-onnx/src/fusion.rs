@@ -58,6 +58,12 @@ pub fn fuse_patterns(patterns: Vec<KernelPattern>) -> Vec<(FusedPattern, usize)>
     let mut iter = patterns.into_iter().enumerate().peekable();
 
     while let Some((idx, pattern)) = iter.next() {
+        // Unknown patterns pass through as Single — skip fusion attempts.
+        if matches!(&pattern, KernelPattern::Unknown { .. }) {
+            result.push((FusedPattern::Single(pattern), idx));
+            continue;
+        }
+
         let fused = match &pattern {
             KernelPattern::Conv2D { .. } => {
                 if let Some((_, KernelPattern::Normalization { .. })) = iter.peek() {
@@ -163,6 +169,8 @@ mod tests {
                     width: "W".into(),
                     kernel_h: "KH".into(),
                     kernel_w: "KW".into(),
+                    kernel_h_val: 3,
+                    kernel_w_val: 3,
                     stride_h: 1,
                     stride_w: 1,
                     pad_h: 0,
@@ -233,6 +241,8 @@ mod tests {
                     width: "W".into(),
                     kernel_h: "KH".into(),
                     kernel_w: "KW".into(),
+                    kernel_h_val: 3,
+                    kernel_w_val: 3,
                     stride_h: 1,
                     stride_w: 1,
                     pad_h: 0,

@@ -76,6 +76,29 @@ pub fn first_text(output: &BackendOutput) -> &str {
     }
 }
 
+/// Like `compile_wgsl` but returns a Result instead of panicking.
+#[allow(dead_code)]
+pub fn try_compile_wgsl(
+    source: &str,
+    backend: &dyn Backend,
+    opt_level: u8,
+) -> Result<BackendOutput, nxpu_backend_core::BackendError> {
+    let mut module = nxpu_parser::parse(source).expect("WGSL parse failed");
+    let level = match opt_level {
+        0 => OptLevel::O0,
+        2 => OptLevel::O2,
+        _ => OptLevel::O1,
+    };
+    PassManager::for_level(level).run(&mut module);
+    backend.compile(
+        &module,
+        &BackendOptions {
+            opt_level,
+            ..Default::default()
+        },
+    )
+}
+
 /// Parse WGSL to Module (no optimization).
 #[allow(dead_code)]
 pub fn parse_wgsl(source: &str) -> Module {

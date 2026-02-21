@@ -79,19 +79,19 @@ fn reduce_sum_tflite_magic() {
 }
 
 #[test]
-fn transpose_tflite_magic() {
+fn transpose_tflite_unknown() {
+    // Transpose is now classified as Unknown (no silent fallback — #64).
     let source = common::load_example("transpose");
-    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
-    let bytes = common::first_binary(&output);
-    assert_eq!(&bytes[4..8], b"TFL3");
+    let result = common::try_compile_wgsl(&source, &TfLiteBackend, 1);
+    assert!(result.is_err(), "expected Unsupported error for transpose");
 }
 
 #[test]
-fn batchnorm_tflite_magic() {
+fn batchnorm_tflite_unknown() {
+    // BatchNorm is now classified as Unknown (no silent fallback — #64).
     let source = common::load_example("batchnorm");
-    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
-    let bytes = common::first_binary(&output);
-    assert_eq!(&bytes[4..8], b"TFL3");
+    let result = common::try_compile_wgsl(&source, &TfLiteBackend, 1);
+    assert!(result.is_err(), "expected Unsupported error for batchnorm");
 }
 
 #[test]

@@ -81,19 +81,19 @@ fn reduce_sum_stablehlo_reduce() {
 }
 
 #[test]
-fn transpose_stablehlo_transpose() {
+fn transpose_stablehlo_unknown() {
+    // Transpose is now classified as Unknown (no silent fallback — #64).
     let source = common::load_example("transpose");
-    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
-    let mlir = common::first_text(&output);
-    assert!(mlir.contains("stablehlo.transpose"));
+    let result = common::try_compile_wgsl(&source, &StableHloBackend, 1);
+    assert!(result.is_err(), "expected Unsupported error for transpose");
 }
 
 #[test]
-fn batchnorm_stablehlo_batchnorm() {
+fn batchnorm_stablehlo_unknown() {
+    // BatchNorm is now classified as Unknown (no silent fallback — #64).
     let source = common::load_example("batchnorm");
-    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
-    let mlir = common::first_text(&output);
-    assert!(mlir.contains("stablehlo.batch_norm_inference"));
+    let result = common::try_compile_wgsl(&source, &StableHloBackend, 1);
+    assert!(result.is_err(), "expected Unsupported error for batchnorm");
 }
 
 #[test]

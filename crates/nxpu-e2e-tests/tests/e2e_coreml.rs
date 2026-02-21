@@ -100,21 +100,19 @@ fn reduce_sum_coreml_reduce_op() {
 }
 
 #[test]
-fn transpose_coreml_transpose_op() {
+fn transpose_coreml_unknown() {
+    // Transpose is now classified as Unknown (no silent fallback — #64).
     let source = common::load_example("transpose");
-    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
-    let model = decode_coreml(&output);
-    let ops = get_mil_ops(&model);
-    assert_eq!(ops[0].r#type, "transpose");
+    let result = common::try_compile_wgsl(&source, &CoreMlBackend, 1);
+    assert!(result.is_err(), "expected Unsupported error for transpose");
 }
 
 #[test]
-fn batchnorm_coreml_batchnorm_op() {
+fn batchnorm_coreml_unknown() {
+    // BatchNorm is now classified as Unknown (no silent fallback — #64).
     let source = common::load_example("batchnorm");
-    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
-    let model = decode_coreml(&output);
-    let ops = get_mil_ops(&model);
-    assert_eq!(ops[0].r#type, "batch_norm");
+    let result = common::try_compile_wgsl(&source, &CoreMlBackend, 1);
+    assert!(result.is_err(), "expected Unsupported error for batchnorm");
 }
 
 #[test]

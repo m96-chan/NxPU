@@ -83,6 +83,9 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
             output,
             ..
         } => build_attention(query, key, value, output),
+        KernelPattern::Unknown { reason } => {
+            panic!("cannot lower Unknown pattern to CoreML: {reason}")
+        }
     };
 
     let feature_inputs: Vec<FeatureDescription> = inputs

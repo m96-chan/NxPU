@@ -73,6 +73,7 @@ pub struct NodeProto {
 
 /// ONNX attribute types.
 pub mod attribute_type {
+    pub const FLOAT: i32 = 1;
     pub const INT: i32 = 2;
     pub const INTS: i32 = 7;
 }
@@ -86,6 +87,8 @@ pub struct AttributeProto {
     pub r#type: i32,
     #[prost(int64, tag = "3")]
     pub i: i64,
+    #[prost(float, tag = "4")]
+    pub f: f32,
     #[prost(int64, repeated, tag = "8")]
     pub ints: Vec<i64>,
 }
@@ -97,6 +100,18 @@ impl AttributeProto {
             name: name.into(),
             r#type: attribute_type::INT,
             i: value,
+            f: 0.0,
+            ints: vec![],
+        }
+    }
+
+    /// Create a float attribute.
+    pub fn float(name: impl Into<String>, value: f32) -> Self {
+        Self {
+            name: name.into(),
+            r#type: attribute_type::FLOAT,
+            i: 0,
+            f: value,
             ints: vec![],
         }
     }
@@ -107,6 +122,7 @@ impl AttributeProto {
             name: name.into(),
             r#type: attribute_type::INTS,
             i: 0,
+            f: 0.0,
             ints: values,
         }
     }
@@ -304,6 +320,29 @@ mod tests {
             dim.value,
             Some(tensor_shape_dimension::Value::DimValue(128))
         );
+    }
+
+    #[test]
+    fn float_attribute_roundtrip() {
+        let attr = AttributeProto::float("epsilon", 1e-5);
+        assert_eq!(attr.r#type, attribute_type::FLOAT);
+        assert_eq!(attr.f, 1e-5);
+        assert_eq!(attr.i, 0);
+
+        // Roundtrip through protobuf encoding
+        let node = NodeProto::with_attrs(
+            "BatchNormalization",
+            "bn",
+            vec!["x".into()],
+            vec!["y".into()],
+            vec![attr],
+        );
+        let bytes = node.encode_to_vec();
+        let decoded = NodeProto::decode(bytes.as_slice()).unwrap();
+        let eps = &decoded.attribute[0];
+        assert_eq!(eps.name, "epsilon");
+        assert_eq!(eps.r#type, attribute_type::FLOAT);
+        assert!((eps.f - 1e-5).abs() < 1e-10);
     }
 
     #[test]

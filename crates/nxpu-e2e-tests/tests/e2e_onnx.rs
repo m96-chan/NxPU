@@ -140,23 +140,21 @@ fn reduce_sum_produces_reducesum_node() {
 // --- Transpose ---
 
 #[test]
-fn transpose_produces_transpose_node() {
+fn transpose_produces_unknown_pattern() {
+    // Transpose is now classified as Unknown (no silent fallback — #64).
     let source = common::load_example("transpose");
-    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
-    let model = decode_onnx(&output);
-    let graph = model.graph.unwrap();
-    assert_eq!(graph.node[0].op_type, "Transpose");
+    let result = common::try_compile_wgsl(&source, &OnnxBackend, 1);
+    assert!(result.is_err(), "expected Unsupported error for transpose");
 }
 
 // --- BatchNorm ---
 
 #[test]
-fn batchnorm_produces_batchnorm_node() {
+fn batchnorm_produces_unknown_pattern() {
+    // BatchNorm is now classified as Unknown (no silent fallback — #64).
     let source = common::load_example("batchnorm");
-    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
-    let model = decode_onnx(&output);
-    let graph = model.graph.unwrap();
-    assert_eq!(graph.node[0].op_type, "BatchNormalization");
+    let result = common::try_compile_wgsl(&source, &OnnxBackend, 1);
+    assert!(result.is_err(), "expected Unsupported error for batchnorm");
 }
 
 // --- MaxPool ---

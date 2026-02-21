@@ -41,6 +41,12 @@ impl Backend for StableHloBackend {
             let pattern = analyze::classify_entry_point(module, i).map_err(|e| {
                 BackendError::Unsupported(format!("entry point '{}': {e}", ep.name))
             })?;
+            if let analyze::KernelPattern::Unknown { reason } = &pattern {
+                return Err(BackendError::Unsupported(format!(
+                    "entry point '{}': unrecognized pattern: {reason}",
+                    ep.name
+                )));
+            }
 
             let summary = match &pattern {
                 analyze::KernelPattern::MatMul { .. } => "dot_general",
@@ -55,6 +61,7 @@ impl Backend for StableHloBackend {
                 analyze::KernelPattern::Concat { .. } => "concatenate",
                 analyze::KernelPattern::Split { .. } => "slice",
                 analyze::KernelPattern::Attention { .. } => "attention",
+                analyze::KernelPattern::Unknown { .. } => "Unknown",
             };
 
             diagnostics.push(Diagnostic {

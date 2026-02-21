@@ -76,6 +76,9 @@ pub fn build_mlir(pattern: &KernelPattern, ep_name: &str) -> String {
             output,
             ..
         } => build_attention_mlir(query, key, value, output, ep_name),
+        KernelPattern::Unknown { reason } => {
+            panic!("cannot lower Unknown pattern to StableHLO: {reason}")
+        }
     }
 }
 
@@ -682,6 +685,8 @@ mod tests {
                 width: "W".into(),
                 kernel_h: "KH".into(),
                 kernel_w: "KW".into(),
+                kernel_h_val: 3,
+                kernel_w_val: 3,
                 stride_h: 1,
                 stride_w: 1,
                 pad_h: 0,

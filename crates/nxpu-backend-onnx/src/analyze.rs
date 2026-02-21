@@ -137,6 +137,8 @@ pub struct Conv2DShape {
     pub width: String,
     pub kernel_h: String,
     pub kernel_w: String,
+    pub kernel_h_val: i64,
+    pub kernel_w_val: i64,
     pub stride_h: i64,
     pub stride_w: i64,
     pub pad_h: i64,
@@ -238,6 +240,8 @@ pub enum KernelPattern {
         d_k: String,
         seq_len: String,
     },
+    /// Unrecognized pattern — classification could not determine a known op.
+    Unknown { reason: String },
 }
 
 /// Classify an entry point into a known ONNX-mappable pattern.
@@ -324,18 +328,10 @@ pub fn classify_entry_point(
                 });
             }
 
-            // Try transpose (2+ params like rows, cols suggest reindexing)
-            if shape_names.len() >= 2 {
-                let perm: Vec<i64> = (0..shape_names.len() as i64).rev().collect();
-                return Ok(KernelPattern::Transpose {
-                    input,
-                    output,
-                    perm,
-                });
-            }
-
-            // Reshape (single input, no loop, 1 param)
-            return Ok(KernelPattern::Reshape { input, output });
+            // No recognized activation — unknown pattern.
+            return Ok(KernelPattern::Unknown {
+                reason: "single input, no loop, no recognized activation function".into(),
+            });
         }
 
         // Has loop + single input → Pool or Reduce
@@ -412,16 +408,9 @@ pub fn classify_entry_point(
             });
         }
 
-        let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
-        let scale = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
-        let bias = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
-        let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
-        return Ok(KernelPattern::Normalization {
-            input,
-            scale,
-            bias,
-            output,
-            epsilon: 1e-5,
+        // 3+ inputs but no recognized attention pattern — unknown.
+        return Ok(KernelPattern::Unknown {
+            reason: "3+ inputs but no recognized pattern (expected Attention)".into(),
         });
     }
 
@@ -508,6 +497,8 @@ fn extract_conv2d_shape(shape_names: &[String]) -> Conv2DShape {
         channels_out: get(4),
         kernel_h: get(5),
         kernel_w: get(6),
+        kernel_h_val: 3,
+        kernel_w_val: 3,
         stride_h: 1,
         stride_w: 1,
         pad_h: 0,
@@ -658,13 +649,18 @@ fn classify_activation_expr(
             ..
         } => Some(ActivationOp::Tanh),
         // 1/(1+exp(-x)) → Sigmoid: detected as Divide whose right is Add(1, Exp(Negate(x)))
+        // exp(x)/sum(exp(x)) → Softmax: detected as Divide with Exp on left
         Expression::Binary {
             op: BinaryOp::Divide,
+            left,
             right,
             ..
         } => {
-            // Check if right side contains an Exp
-            if contains_math_fun(exprs, *right, MathFunction::Exp) {
+            if contains_math_fun(exprs, *left, MathFunction::Exp) {
+                // Softmax: exp(x) / sum(exp(x))
+                Some(ActivationOp::Softmax)
+            } else if contains_math_fun(exprs, *right, MathFunction::Exp) {
+                // Sigmoid: 1 / (1 + exp(-x))
                 Some(ActivationOp::Sigmoid)
             } else {
                 None
@@ -733,10 +729,48 @@ fn detect_reduce_op(body: &[Statement], exprs: &Arena<Expression>) -> ReduceOp {
         ReduceOp::Max
     } else if find_store_math_fun(body, exprs, MathFunction::Min) {
         ReduceOp::Min
+    } else if find_store_binary_divide(body, exprs) {
+        // Sum followed by divide → Mean
+        ReduceOp::Mean
     } else {
         // Default: sum accumulation (binary add in loop)
         ReduceOp::Sum
     }
+}
+
+/// Check if a block contains a Store whose value is a Divide expression.
+fn find_store_binary_divide(body: &[Statement], exprs: &Arena<Expression>) -> bool {
+    for stmt in body {
+        match stmt {
+            Statement::Store { value, .. } => {
+                if let Some(Expression::Binary {
+                    op: BinaryOp::Divide,
+                    ..
+                }) = exprs.try_get(*value)
+                {
+                    return true;
+                }
+            }
+            Statement::If { accept, reject, .. } => {
+                if find_store_binary_divide(accept, exprs)
+                    || find_store_binary_divide(reject, exprs)
+                {
+                    return true;
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                if find_store_binary_divide(body, exprs)
+                    || find_store_binary_divide(continuing, exprs)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1262,6 +1296,139 @@ mod tests {
             }
             _ => panic!("expected Reduce pattern, got {pattern:?}"),
         }
+    }
+
+    #[test]
+    fn classify_single_input_no_activation_unknown() {
+        // 1 input, no loop, no recognized activation, 2+ params → Unknown.
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let array_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members: vec![
+                    StructMember {
+                        name: Some("rows".into()),
+                        ty: u32_ty,
+                        offset: 0,
+                    },
+                    StructMember {
+                        name: Some("cols".into()),
+                        ty: u32_ty,
+                        offset: 4,
+                    },
+                ],
+                span: 8,
+            },
+        });
+
+        module.global_variables.append(GlobalVariable {
+            name: Some("a".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        module.global_variables.append(GlobalVariable {
+            name: Some("c".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 1,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 2,
+            }),
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Body: just a store of a literal (no activation, no loop)
+        let mut func = Function::new("main");
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(42.0)));
+        let ptr = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "unknown_kernel".into(),
+            workgroup_size: [256, 1, 1],
+            function: func,
+        });
+
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        assert!(
+            matches!(&pattern, KernelPattern::Unknown { .. }),
+            "expected Unknown pattern, got {pattern:?}"
+        );
+    }
+
+    #[test]
+    fn detect_reduce_mean() {
+        // Loop body with a divide → ReduceOp::Mean
+        let mut func = Function::new("test");
+        let left = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        let right = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let div = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Divide,
+            left,
+            right,
+        });
+        let ptr = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        let body = vec![
+            Statement::Store {
+                pointer: ptr,
+                value: div,
+            },
+            Statement::Break,
+        ];
+        let result = super::detect_reduce_op(&body, &func.expressions);
+        assert_eq!(result, ReduceOp::Mean);
     }
 
     #[test]

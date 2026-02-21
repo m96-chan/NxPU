@@ -79,6 +79,9 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> ModelProto {
             d_k,
             seq_len,
         } => build_attention_graph(query, key, value, output, seq_len, d_k, ep_name),
+        KernelPattern::Unknown { reason } => {
+            panic!("cannot lower Unknown pattern to ONNX: {reason}")
+        }
     };
 
     ModelProto {
@@ -129,7 +132,7 @@ pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> Mod
                 vec![
                     AttributeProto::ints(
                         "kernel_shape",
-                        vec![shape.stride_h.max(1), shape.stride_w.max(1)],
+                        vec![shape.kernel_h_val.max(1), shape.kernel_w_val.max(1)],
                     ),
                     AttributeProto::ints(
                         "strides",
@@ -153,7 +156,7 @@ pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> Mod
                     "running_var".into(),
                 ],
                 vec![norm_output.name.clone()],
-                vec![AttributeProto::int("epsilon", 1065353216)],
+                vec![AttributeProto::float("epsilon", 1e-5)],
             );
 
             let graph = GraphProto {
@@ -356,7 +359,7 @@ fn build_conv2d_graph(
             vec![
                 AttributeProto::ints(
                     "kernel_shape",
-                    vec![shape.stride_h.max(1), shape.stride_w.max(1)],
+                    vec![shape.kernel_h_val.max(1), shape.kernel_w_val.max(1)],
                 ),
                 AttributeProto::ints(
                     "strides",
@@ -586,7 +589,7 @@ fn build_normalization_graph(
                 "running_var".into(),
             ],
             vec![output.name.clone()],
-            vec![AttributeProto::int("epsilon", 1065353216)], // IEEE float bit pattern for 1e-5 stored as int (convention)
+            vec![AttributeProto::float("epsilon", 1e-5)], // IEEE float bit pattern for 1e-5 stored as int (convention)
         )],
         input: vec![
             ValueInfoProto::tensor(
@@ -938,6 +941,8 @@ mod tests {
                 width: "W".into(),
                 kernel_h: "KH".into(),
                 kernel_w: "KW".into(),
+                kernel_h_val: 3,
+                kernel_w_val: 3,
                 stride_h: 1,
                 stride_w: 1,
                 pad_h: 0,
@@ -947,6 +952,14 @@ mod tests {
         let model = build_model(&pattern, "conv2d");
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "Conv");
+
+        // Verify kernel_shape uses kernel dimensions, not strides (#61).
+        let attrs = &graph.node[0].attribute;
+        let kernel_shape = attrs.iter().find(|a| a.name == "kernel_shape").unwrap();
+        let strides = attrs.iter().find(|a| a.name == "strides").unwrap();
+        assert_eq!(kernel_shape.ints, vec![3, 3]);
+        assert_eq!(strides.ints, vec![1, 1]);
+        assert_ne!(kernel_shape.ints, strides.ints);
     }
 
     #[test]

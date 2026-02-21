@@ -11,6 +11,8 @@ pub type Block = Vec<Statement>;
 pub struct Barrier(u32);
 
 impl Barrier {
+    /// Empty barrier (no flags set).
+    pub const EMPTY: Self = Self(0);
     /// Storage buffer barrier.
     pub const STORAGE: Self = Self(1);
     /// Workgroup memory barrier.

@@ -937,7 +937,7 @@ fn lower_barrier(barrier: naga::Barrier) -> nxpu_ir::Barrier {
         (true, false) => nxpu_ir::Barrier::STORAGE,
         (false, true) => nxpu_ir::Barrier::WORKGROUP,
         // Caller checks is_empty() and skips.
-        (false, false) => nxpu_ir::Barrier::STORAGE,
+        (false, false) => nxpu_ir::Barrier::EMPTY,
     }
 }
 
@@ -1074,6 +1074,14 @@ mod tests {
             nxpu_ir::Literal::Bool(v) => assert!(v),
             _ => panic!("expected Bool"),
         }
+    }
+
+    #[test]
+    fn lower_empty_barrier_is_empty() {
+        let barrier = lower_barrier(naga::Barrier::empty());
+        assert!(barrier.is_empty());
+        assert!(!barrier.contains(nxpu_ir::Barrier::STORAGE));
+        assert!(!barrier.contains(nxpu_ir::Barrier::WORKGROUP));
     }
 
     #[test]

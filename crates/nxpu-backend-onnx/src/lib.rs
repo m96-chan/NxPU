@@ -49,6 +49,12 @@ impl Backend for OnnxBackend {
             let pattern = analyze::classify_entry_point(module, i).map_err(|e| {
                 BackendError::Unsupported(format!("entry point '{}': {e}", ep.name))
             })?;
+            if let KernelPattern::Unknown { reason } = &pattern {
+                return Err(BackendError::Unsupported(format!(
+                    "entry point '{}': unrecognized pattern: {reason}",
+                    ep.name
+                )));
+            }
             patterns.push(pattern);
         }
 
@@ -117,6 +123,7 @@ fn pattern_summary(pattern: &KernelPattern) -> &'static str {
         KernelPattern::Concat { .. } => "Concat",
         KernelPattern::Split { .. } => "Split",
         KernelPattern::Attention { .. } => "Attention",
+        KernelPattern::Unknown { .. } => "Unknown",
     }
 }
 
