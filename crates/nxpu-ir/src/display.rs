@@ -259,6 +259,18 @@ pub fn format_type_inner(inner: &TypeInner, types: &UniqueArena<Type>) -> String
         TypeInner::Struct { members, span } => {
             format!("struct({} members, span {span})", members.len())
         }
+        TypeInner::Tensor { scalar, shape } => {
+            let dims: Vec<String> = shape
+                .dims
+                .iter()
+                .map(|d| match d {
+                    crate::Dimension::Fixed(n) => n.to_string(),
+                    crate::Dimension::Dynamic(Some(name)) => name.clone(),
+                    crate::Dimension::Dynamic(None) => "?".into(),
+                })
+                .collect();
+            format!("tensor<{scalar}>[{}]", dims.join(", "))
+        }
     }
 }
 

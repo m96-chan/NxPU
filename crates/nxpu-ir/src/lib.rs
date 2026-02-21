@@ -9,6 +9,7 @@ mod error;
 mod expr;
 mod func;
 mod global;
+pub mod graph;
 mod stmt;
 mod types;
 
@@ -21,7 +22,10 @@ pub use expr::{
 pub use func::{EntryPoint, Function, FunctionArgument, FunctionResult, LocalVariable};
 pub use global::{AddressSpace, Binding, BuiltIn, GlobalVariable, ResourceBinding, StorageAccess};
 pub use stmt::{Barrier, Block, Statement};
-pub use types::{ArraySize, Bytes, Scalar, ScalarKind, StructMember, Type, TypeInner, VectorSize};
+pub use types::{
+    ArraySize, Bytes, Dimension, MemoryLayout, Scalar, ScalarKind, StructMember, TensorShape, Type,
+    TypeInner, VectorSize,
+};
 
 /// A compiled NxPU IR module.
 #[derive(Clone, Debug, Default)]

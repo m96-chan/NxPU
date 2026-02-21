@@ -64,6 +64,7 @@ fn build_vector_add_module() {
         }),
         ty: array_f32_ty,
         init: None,
+        layout: None,
     });
     let gv_b = module.global_variables.append(GlobalVariable {
         name: Some("b".into()),
@@ -76,6 +77,7 @@ fn build_vector_add_module() {
         }),
         ty: array_f32_ty,
         init: None,
+        layout: None,
     });
     let gv_result = module.global_variables.append(GlobalVariable {
         name: Some("result".into()),
@@ -88,6 +90,7 @@ fn build_vector_add_module() {
         }),
         ty: array_f32_ty,
         init: None,
+        layout: None,
     });
 
     // ---- Entry Point Function ----
@@ -274,6 +277,7 @@ fn build_matmul_module() {
         }),
         ty: array_f32_ty,
         init: None,
+        layout: None,
     });
     let gv_b = module.global_variables.append(GlobalVariable {
         name: Some("b".into()),
@@ -286,6 +290,7 @@ fn build_matmul_module() {
         }),
         ty: array_f32_ty,
         init: None,
+        layout: None,
     });
     let gv_c = module.global_variables.append(GlobalVariable {
         name: Some("c".into()),
@@ -298,6 +303,7 @@ fn build_matmul_module() {
         }),
         ty: array_f32_ty,
         init: None,
+        layout: None,
     });
 
     // Entry point function
