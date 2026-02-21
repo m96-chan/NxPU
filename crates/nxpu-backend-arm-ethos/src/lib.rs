@@ -34,36 +34,45 @@ fn vela_available() -> bool {
 }
 
 /// Run the Vela compiler on a TFLite file, returning the optimized bytes.
+///
+/// Uses a unique temporary directory per invocation to avoid race conditions
+/// during parallel compilation.
 fn run_vela(tflite_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
-    let temp_dir = std::env::temp_dir().join("nxpu-vela");
+    let temp_dir = std::env::temp_dir().join(format!("nxpu-vela-{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir)
         .map_err(|e| BackendError::Other(format!("failed to create temp dir: {e}")))?;
 
-    let input_path = temp_dir.join("input.tflite");
-    std::fs::write(&input_path, tflite_bytes)
-        .map_err(|e| BackendError::Other(format!("failed to write temp tflite: {e}")))?;
+    // Use a closure to ensure cleanup on all exit paths.
+    let result = (|| {
+        let input_name = "input";
+        let input_path = temp_dir.join(format!("{input_name}.tflite"));
+        std::fs::write(&input_path, tflite_bytes)
+            .map_err(|e| BackendError::Other(format!("failed to write temp tflite: {e}")))?;
 
-    let output = Command::new("vela")
-        .arg(&input_path)
-        .arg("--output-dir")
-        .arg(&temp_dir)
-        .output()
-        .map_err(|e| BackendError::Other(format!("failed to run vela: {e}")))?;
+        let output = Command::new("vela")
+            .arg(&input_path)
+            .arg("--output-dir")
+            .arg(&temp_dir)
+            .output()
+            .map_err(|e| BackendError::Other(format!("failed to run vela: {e}")))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(BackendError::Other(format!("vela failed: {stderr}")));
-    }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(BackendError::Other(format!("vela failed: {stderr}")));
+        }
 
-    // Vela outputs to <output-dir>/output_vela.tflite (or <input_name>_vela.tflite)
-    let vela_output = temp_dir.join("input_vela.tflite");
-    let optimized = std::fs::read(&vela_output)
-        .map_err(|e| BackendError::Other(format!("failed to read vela output: {e}")))?;
+        // Vela outputs to <output-dir>/<input_name>_vela.tflite
+        let vela_output = temp_dir.join(format!("{input_name}_vela.tflite"));
+        let optimized = std::fs::read(&vela_output)
+            .map_err(|e| BackendError::Other(format!("failed to read vela output: {e}")))?;
 
-    // Clean up temp files
+        Ok(optimized)
+    })();
+
+    // Always clean up temp directory, regardless of success or failure.
     let _ = std::fs::remove_dir_all(&temp_dir);
 
-    Ok(optimized)
+    result
 }
 
 impl Backend for ArmEthosBackend {
@@ -90,6 +99,9 @@ impl Backend for ArmEthosBackend {
         let mut diagnostics = tflite_output.diagnostics;
         let mut files = Vec::new();
 
+        // Check Vela availability once, not per file.
+        let has_vela = vela_available();
+
         for file in &tflite_output.files {
             let tflite_bytes = match &file.content {
                 OutputContent::Binary(b) => b,
@@ -100,7 +112,7 @@ impl Backend for ArmEthosBackend {
             };
 
             // Step 2: Try to invoke Vela
-            if vela_available() {
+            if has_vela {
                 match run_vela(tflite_bytes) {
                     Ok(optimized) => {
                         diagnostics.push(Diagnostic {

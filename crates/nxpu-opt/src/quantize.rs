@@ -221,14 +221,17 @@ pub fn policy_from_sensitivity(
     }
 }
 
-/// Rewrite array element precision from F32 to a target scalar type.
+/// Rewrite element precision from F32 to a target scalar type.
+///
+/// Handles both `Array` types (adjusting base and stride) and `Tensor` types
+/// (replacing the scalar).
 ///
 /// 1. Insert the target scalar type into the module's type arena.
 /// 2. Find the existing F32 scalar handle.
-/// 3. For each Array type whose `base == f32_handle`, insert a new Array type
-///    with the target base and adjusted stride.
+/// 3. For each Array/Tensor type with F32 elements, insert a new type
+///    with the target scalar and adjusted stride.
 /// 4. Update `GlobalVariable.ty` handles via the remap.
-fn rewrite_array_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
+fn rewrite_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
     // Insert target scalar type.
     let target_scalar_handle = module.types.insert(Type {
         name: None,
@@ -260,7 +263,14 @@ fn rewrite_array_elem_precision(module: &mut Module, target_scalar: Scalar) -> b
 
     // Second pass: insert new array types and build remap.
     for (old_handle, size, old_stride) in array_types {
-        let new_stride = old_stride * (target_scalar.width as u32) / (Scalar::F32.width as u32);
+        let numerator = old_stride as u64 * target_scalar.width as u64;
+        let f32_width = Scalar::F32.width as u64;
+        debug_assert!(
+            numerator.is_multiple_of(f32_width),
+            "stride {old_stride} not evenly divisible when converting to {:?}",
+            target_scalar,
+        );
+        let new_stride = (numerator / f32_width) as u32;
         let new_handle = module.types.insert(Type {
             name: None,
             inner: TypeInner::Array {
@@ -339,12 +349,11 @@ impl Pass for MixedPrecisionPass {
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
 
-        // Collect (gv_index, target_scalar) pairs
-        let conversions: Vec<(usize, Scalar)> = module
+        // Collect (handle, target_scalar) pairs — O(n) via direct handle.
+        let conversions: Vec<(Handle<nxpu_ir::GlobalVariable>, Scalar)> = module
             .global_variables
             .iter()
-            .enumerate()
-            .filter_map(|(idx, (_handle, gv))| {
+            .filter_map(|(handle, gv)| {
                 let name = gv.name.as_deref()?;
                 let precision = self.policy.precision_for(name);
                 let target = match precision {
@@ -376,13 +385,12 @@ impl Pass for MixedPrecisionPass {
                     return None;
                 }
 
-                Some((idx, target))
+                Some((handle, target))
             })
             .collect();
 
-        for (idx, target_scalar) in conversions {
-            let gv = &module.global_variables.iter().nth(idx).unwrap().1;
-            let old_ty = gv.ty;
+        for (gv_handle, target_scalar) in conversions {
+            let old_ty = module.global_variables[gv_handle].ty;
 
             // Extract type info before mutating type arena.
             let type_info = match &module.types[old_ty].inner {
@@ -403,8 +411,14 @@ impl Pass for MixedPrecisionPass {
                         name: None,
                         inner: TypeInner::Scalar(target_scalar),
                     });
-                    let new_stride =
-                        stride * (target_scalar.width as u32) / (Scalar::F32.width as u32);
+                    let numerator = stride as u64 * target_scalar.width as u64;
+                    let f32_width = Scalar::F32.width as u64;
+                    debug_assert!(
+                        numerator.is_multiple_of(f32_width),
+                        "stride {stride} not evenly divisible when converting to {:?}",
+                        target_scalar,
+                    );
+                    let new_stride = (numerator / f32_width) as u32;
                     Some(module.types.insert(Type {
                         name: None,
                         inner: TypeInner::Array {
@@ -425,8 +439,7 @@ impl Pass for MixedPrecisionPass {
             };
 
             if let Some(new_ty_handle) = new_ty {
-                let gv_mut = &mut module.global_variables.iter_mut().nth(idx).unwrap().1;
-                gv_mut.ty = new_ty_handle;
+                module.global_variables[gv_handle].ty = new_ty_handle;
                 changed = true;
             }
         }
@@ -445,7 +458,7 @@ impl Pass for F32ToF16 {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        rewrite_array_elem_precision(module, Scalar::F16)
+        rewrite_elem_precision(module, Scalar::F16)
     }
 }
 
@@ -459,7 +472,7 @@ impl Pass for F32ToBf16 {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        rewrite_array_elem_precision(module, Scalar::BF16)
+        rewrite_elem_precision(module, Scalar::BF16)
     }
 }
 
@@ -512,7 +525,7 @@ impl Pass for F32ToInt8 {
     fn run(&self, module: &mut Module) -> bool {
         // Note: calibration data is used by downstream ONNX QDQ emission
         // and TFLite quantization metadata, not during type rewriting.
-        rewrite_array_elem_precision(module, Scalar::I8)
+        rewrite_elem_precision(module, Scalar::I8)
     }
 }
 

@@ -4,12 +4,12 @@
 //! of operations, enabling transpilation of production ML models with
 //! 50-500+ operations.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::types::{Scalar, TensorShape};
 
 /// A unique identifier for a node in the computation graph.
-#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct NodeId(pub u32);
 
 /// A unique identifier for an edge (tensor) in the computation graph.
@@ -141,6 +141,12 @@ impl ComputeGraph {
     }
 
     /// Add a node to the graph and return its id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any input or output [`EdgeId`] has not been previously
+    /// registered via [`add_edge`](Self::add_edge), or if an output edge
+    /// already has a producer node (each edge may have at most one producer).
     pub fn add_node(
         &mut self,
         op: GraphOp,
@@ -148,6 +154,28 @@ impl ComputeGraph {
         outputs: Vec<EdgeId>,
         name: impl Into<String>,
     ) -> NodeId {
+        let name = name.into();
+
+        // Validate that all referenced edges exist.
+        for &e in inputs.iter().chain(outputs.iter()) {
+            assert!(
+                self.edges.contains_key(&e),
+                "add_node({name}): EdgeId({}) not registered in graph",
+                e.0,
+            );
+        }
+
+        // Enforce single-producer-per-edge invariant.
+        for &out in &outputs {
+            let existing = self.nodes.iter().find(|n| n.outputs.contains(&out));
+            assert!(
+                existing.is_none(),
+                "add_node({name}): EdgeId({}) already produced by node {:?}",
+                out.0,
+                existing.unwrap().name,
+            );
+        }
+
         let id = NodeId(self.next_node_id);
         self.next_node_id += 1;
         self.nodes.push(GraphNode {
@@ -155,7 +183,7 @@ impl ComputeGraph {
             op,
             inputs,
             outputs,
-            name: name.into(),
+            name,
         });
         id
     }
@@ -172,57 +200,65 @@ impl ComputeGraph {
 
     /// Returns nodes in topological order.
     ///
-    /// Panics if the graph contains cycles (which it shouldn't for a DAG).
+    /// The ordering is deterministic: among nodes with the same in-degree,
+    /// the one with the smaller [`NodeId`] is emitted first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the graph contains a cycle.
     pub fn topological_order(&self) -> Vec<&GraphNode> {
         // Build adjacency: which node produces each edge?
-        let mut edge_producer: HashMap<EdgeId, NodeId> = HashMap::new();
-        for node in &self.nodes {
+        let mut edge_producer: HashMap<EdgeId, usize> = HashMap::new();
+        for (i, node) in self.nodes.iter().enumerate() {
             for &out in &node.outputs {
-                edge_producer.insert(out, node.id);
+                edge_producer.insert(out, i);
             }
         }
 
-        // Build in-degree
-        let mut in_degree: HashMap<NodeId, usize> = HashMap::new();
-        for node in &self.nodes {
-            in_degree.entry(node.id).or_insert(0);
+        // Build per-node consumer lists and in-degree (O(V+E))
+        let n = self.nodes.len();
+        let mut in_degree = vec![0usize; n];
+        let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+        for (ci, node) in self.nodes.iter().enumerate() {
             for &inp in &node.inputs {
-                if edge_producer.contains_key(&inp) {
-                    *in_degree.entry(node.id).or_insert(0) += 1;
+                if let Some(&pi) = edge_producer.get(&inp) {
+                    in_degree[ci] += 1;
+                    consumers[pi].push(ci);
                 }
             }
         }
 
-        // Kahn's algorithm
-        let mut queue: Vec<NodeId> = in_degree
-            .iter()
-            .filter(|(_, deg)| **deg == 0)
-            .map(|(id, _)| *id)
-            .collect();
+        // Kahn's algorithm with deterministic BTreeSet (ordered by NodeId)
+        let mut ready: BTreeSet<(NodeId, usize)> = BTreeSet::new();
+        for (i, &deg) in in_degree.iter().enumerate() {
+            if deg == 0 {
+                ready.insert((self.nodes[i].id, i));
+            }
+        }
 
-        let mut result: Vec<NodeId> = Vec::new();
+        let mut result: Vec<&GraphNode> = Vec::with_capacity(n);
 
-        while let Some(nid) = queue.pop() {
-            result.push(nid);
-            let node = self.nodes.iter().find(|n| n.id == nid).unwrap();
-            for &out_edge in &node.outputs {
-                // Find consumers of this edge
-                for consumer in &self.nodes {
-                    if consumer.inputs.contains(&out_edge) {
-                        let deg = in_degree.get_mut(&consumer.id).unwrap();
-                        *deg -= 1;
-                        if *deg == 0 {
-                            queue.push(consumer.id);
-                        }
-                    }
+        while let Some(&(_, idx)) = ready.iter().next() {
+            ready.remove(&(self.nodes[idx].id, idx));
+            result.push(&self.nodes[idx]);
+
+            for &ci in &consumers[idx] {
+                in_degree[ci] -= 1;
+                if in_degree[ci] == 0 {
+                    ready.insert((self.nodes[ci].id, ci));
                 }
             }
         }
+
+        assert!(
+            result.len() == n,
+            "topological_order: graph contains a cycle ({} of {} nodes visited)",
+            result.len(),
+            n,
+        );
 
         result
-            .iter()
-            .map(|nid| self.nodes.iter().find(|n| n.id == *nid).unwrap())
-            .collect()
     }
 
     /// Find all nodes that consume the given edge.
@@ -361,5 +397,89 @@ mod tests {
         let gm = GraphModule::default();
         assert!(gm.graph.is_none());
         assert!(gm.module.entry_points.is_empty());
+    }
+
+    #[test]
+    fn topological_order_empty_graph() {
+        let graph = ComputeGraph::new();
+        let order = graph.topological_order();
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn topological_order_diamond_dag() {
+        // A → B, A → C, B → D, C → D
+        let mut graph = ComputeGraph::new();
+
+        let e_in = graph.add_edge(make_tensor_info("in", &[10]));
+        let e_ab = graph.add_edge(make_tensor_info("ab", &[10]));
+        let e_ac = graph.add_edge(make_tensor_info("ac", &[10]));
+        let e_bd = graph.add_edge(make_tensor_info("bd", &[10]));
+        let e_cd = graph.add_edge(make_tensor_info("cd", &[10]));
+        let e_out = graph.add_edge(make_tensor_info("out", &[10]));
+
+        graph.add_node(GraphOp::Relu, vec![e_in], vec![e_ab, e_ac], "A");
+        graph.add_node(GraphOp::Relu, vec![e_ab], vec![e_bd], "B");
+        graph.add_node(GraphOp::Relu, vec![e_ac], vec![e_cd], "C");
+        graph.add_node(GraphOp::Add, vec![e_bd, e_cd], vec![e_out], "D");
+
+        let order = graph.topological_order();
+        assert_eq!(order.len(), 4);
+        assert_eq!(order[0].name, "A");
+        // B before C (deterministic by NodeId)
+        assert_eq!(order[1].name, "B");
+        assert_eq!(order[2].name, "C");
+        assert_eq!(order[3].name, "D");
+    }
+
+    #[test]
+    #[should_panic(expected = "graph contains a cycle")]
+    fn topological_order_detects_cycle() {
+        let mut graph = ComputeGraph::new();
+
+        let e0 = graph.add_edge(make_tensor_info("e0", &[10]));
+        let e1 = graph.add_edge(make_tensor_info("e1", &[10]));
+
+        // Manually build a cycle by pushing nodes directly
+        // (bypassing add_node validation which checks single-producer)
+        graph.nodes.push(GraphNode {
+            id: NodeId(0),
+            op: GraphOp::Relu,
+            inputs: vec![e1],
+            outputs: vec![e0],
+            name: "A".into(),
+        });
+        graph.nodes.push(GraphNode {
+            id: NodeId(1),
+            op: GraphOp::Relu,
+            inputs: vec![e0],
+            outputs: vec![e1],
+            name: "B".into(),
+        });
+        graph.next_node_id = 2;
+
+        graph.topological_order(); // should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "not registered in graph")]
+    fn add_node_rejects_unknown_edge() {
+        let mut graph = ComputeGraph::new();
+        let fake_edge = EdgeId(999);
+        let out = graph.add_edge(make_tensor_info("out", &[10]));
+        graph.add_node(GraphOp::Relu, vec![fake_edge], vec![out], "bad");
+    }
+
+    #[test]
+    #[should_panic(expected = "already produced by node")]
+    fn add_node_rejects_duplicate_producer() {
+        let mut graph = ComputeGraph::new();
+        let a = graph.add_edge(make_tensor_info("a", &[10]));
+        let b = graph.add_edge(make_tensor_info("b", &[10]));
+        let c = graph.add_edge(make_tensor_info("c", &[10]));
+
+        graph.add_node(GraphOp::Relu, vec![a], vec![b], "first");
+        // b already has a producer — should panic
+        graph.add_node(GraphOp::Relu, vec![c], vec![b], "second");
     }
 }
