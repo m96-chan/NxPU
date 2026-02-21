@@ -14,6 +14,8 @@ members = [
     "crates/nxpu-backend-intel",
     "crates/nxpu-backend-amd",
     "crates/nxpu-backend-qualcomm",
+    "crates/nxpu-backend-arm-ethos",
+    "crates/nxpu-backend-ceva",
     "crates/nxpu-cli",
 ]
 
