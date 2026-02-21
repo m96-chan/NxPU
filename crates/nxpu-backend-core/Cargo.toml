@@ -1,0 +1,10 @@
+[package]
+name = "nxpu-backend-core"
+description = "Backend trait and plugin architecture for NxPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nxpu-ir = { path = "../nxpu-ir" }
+thiserror = "2"
