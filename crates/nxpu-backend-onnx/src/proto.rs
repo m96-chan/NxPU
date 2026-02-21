@@ -8,10 +8,13 @@ use prost::Message;
 /// ONNX data type constants from `TensorProto.DataType`.
 pub mod data_type {
     pub const FLOAT: i32 = 1;
+    pub const UINT8: i32 = 2;
+    pub const INT8: i32 = 3;
     pub const FLOAT16: i32 = 10;
     pub const INT32: i32 = 6;
     pub const UINT32: i32 = 12;
     pub const BOOL: i32 = 9;
+    pub const BFLOAT16: i32 = 16;
 }
 
 /// Top-level ONNX model container.

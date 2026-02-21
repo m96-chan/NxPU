@@ -4,7 +4,7 @@
 //! and emits `.onnx` files suitable for AMD XDNA / Vitis AI.
 
 use nxpu_backend_core::{
-    Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
+    Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel, Precision,
 };
 use nxpu_backend_onnx::OnnxBackend;
 use nxpu_ir::Module;
@@ -20,6 +20,10 @@ impl Backend for AmdBackend {
 
     fn targets(&self) -> &[&str] {
         &["amd-xdna", "amd-npu"]
+    }
+
+    fn preferred_precision(&self) -> Precision {
+        Precision::Int8
     }
 
     fn compile(

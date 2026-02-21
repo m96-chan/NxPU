@@ -64,6 +64,7 @@ fn onnx_to_tflite_type(onnx_dt: i32) -> i8 {
         data_type::INT32 => tensor_type::INT32,
         data_type::UINT32 => tensor_type::UINT32,
         data_type::BOOL => tensor_type::BOOL,
+        data_type::INT8 => tensor_type::INT8,
         _ => tensor_type::FLOAT32,
     }
 }

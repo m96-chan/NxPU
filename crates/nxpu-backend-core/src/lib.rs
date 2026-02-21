@@ -8,6 +8,31 @@ use std::fmt::Debug;
 
 use nxpu_ir::Module;
 
+/// Target precision for NPU compilation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    /// 32-bit floating point (no conversion).
+    F32,
+    /// 16-bit floating point.
+    F16,
+    /// Brain floating point (16-bit).
+    BF16,
+    /// 8-bit integer (quantized).
+    Int8,
+}
+
+/// Policy for choosing precision during compilation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrecisionPolicy {
+    /// Keep the original precision from the WGSL source.
+    Keep,
+    /// Use a specific precision regardless of backend preference.
+    Explicit(Precision),
+    /// Automatically select based on the backend's preferred precision.
+    #[default]
+    Auto,
+}
+
 /// A backend that compiles NxPU IR to target-specific output.
 pub trait Backend: Debug + Send + Sync {
     /// Human-readable name (e.g. "apple-ane").
@@ -22,6 +47,11 @@ pub trait Backend: Debug + Send + Sync {
         module: &Module,
         opts: &BackendOptions,
     ) -> Result<BackendOutput, BackendError>;
+
+    /// The precision this backend prefers for optimal NPU execution.
+    fn preferred_precision(&self) -> Precision {
+        Precision::F32
+    }
 }
 
 /// Options passed to a backend during compilation.
@@ -29,6 +59,8 @@ pub trait Backend: Debug + Send + Sync {
 pub struct BackendOptions {
     /// Optimization level (0 = none, 1 = basic, 2 = aggressive).
     pub opt_level: u8,
+    /// Precision policy for quantization.
+    pub precision: PrecisionPolicy,
 }
 
 /// The output produced by a backend.

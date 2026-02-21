@@ -219,8 +219,11 @@ fn scalar_to_onnx_data_type(scalar: &Scalar) -> i32 {
     match (scalar.kind, scalar.width) {
         (ScalarKind::Float, 4) => data_type::FLOAT,
         (ScalarKind::Float, 2) => data_type::FLOAT16,
+        (ScalarKind::BFloat, 2) => data_type::BFLOAT16,
         (ScalarKind::Sint, 4) => data_type::INT32,
+        (ScalarKind::Sint, 1) => data_type::INT8,
         (ScalarKind::Uint, 4) => data_type::UINT32,
+        (ScalarKind::Uint, 1) => data_type::UINT8,
         (ScalarKind::Bool, _) => data_type::BOOL,
         _ => data_type::FLOAT,
     }

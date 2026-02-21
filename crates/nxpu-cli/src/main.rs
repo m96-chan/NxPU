@@ -4,7 +4,9 @@ use std::process::ExitCode;
 use clap::Parser;
 use miette::{Context, IntoDiagnostic};
 
-use nxpu_backend_core::{BackendOptions, BackendRegistry, OutputContent};
+use nxpu_backend_core::{
+    BackendOptions, BackendRegistry, OutputContent, Precision, PrecisionPolicy,
+};
 use nxpu_opt::{OptLevel, PassManager};
 
 /// NxPU — WGSL to NPU transpiler
@@ -33,6 +35,23 @@ struct Cli {
     /// Validate and optimize without producing output
     #[arg(long)]
     dry_run: bool,
+
+    /// Precision policy: keep, f16, bf16, int8, or auto (default: auto)
+    #[arg(long, default_value = "auto", value_parser = parse_precision)]
+    precision: PrecisionPolicy,
+}
+
+fn parse_precision(s: &str) -> Result<PrecisionPolicy, String> {
+    match s {
+        "keep" => Ok(PrecisionPolicy::Keep),
+        "f16" => Ok(PrecisionPolicy::Explicit(Precision::F16)),
+        "bf16" => Ok(PrecisionPolicy::Explicit(Precision::BF16)),
+        "int8" => Ok(PrecisionPolicy::Explicit(Precision::Int8)),
+        "auto" => Ok(PrecisionPolicy::Auto),
+        _ => Err(format!(
+            "invalid precision '{s}', expected keep, f16, bf16, int8, or auto"
+        )),
+    }
 }
 
 fn parse_opt_level(s: &str) -> Result<OptLevel, String> {
@@ -101,12 +120,43 @@ fn run() -> miette::Result<()> {
         miette::miette!("unknown target '{}' (available: {})", cli.target, available)
     })?;
 
+    // 6b. Resolve precision and run quantization pass.
+    let resolved_precision = match cli.precision {
+        PrecisionPolicy::Keep => None,
+        PrecisionPolicy::Explicit(p) => Some(p),
+        PrecisionPolicy::Auto => {
+            let pref = backend.preferred_precision();
+            if pref == Precision::F32 {
+                None
+            } else {
+                Some(pref)
+            }
+        }
+    };
+
+    if let Some(precision) = resolved_precision {
+        use nxpu_opt::Pass;
+        match precision {
+            Precision::F16 => {
+                nxpu_opt::F32ToF16.run(&mut module);
+            }
+            Precision::BF16 => {
+                nxpu_opt::F32ToBf16.run(&mut module);
+            }
+            Precision::Int8 => {
+                nxpu_opt::F32ToInt8::default().run(&mut module);
+            }
+            Precision::F32 => {}
+        }
+    }
+
     let opts = BackendOptions {
         opt_level: match cli.opt_level {
             OptLevel::O0 => 0,
             OptLevel::O1 => 1,
             OptLevel::O2 => 2,
         },
+        precision: cli.precision,
     };
 
     let output = backend

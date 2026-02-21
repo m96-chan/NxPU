@@ -27,7 +27,9 @@ fn onnx_to_mlir_type(onnx_dt: i32) -> &'static str {
     match onnx_dt {
         data_type::FLOAT => "f32",
         data_type::FLOAT16 => "f16",
+        data_type::BFLOAT16 => "bf16",
         data_type::INT32 => "i32",
+        data_type::INT8 => "i8",
         data_type::UINT32 => "ui32",
         data_type::BOOL => "i1",
         _ => "f32",
