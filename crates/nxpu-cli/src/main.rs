@@ -91,6 +91,7 @@ fn run() -> miette::Result<()> {
     registry.register(Box::new(nxpu_backend_samsung::SamsungBackend));
     registry.register(Box::new(nxpu_backend_mediatek::MediaTekBackend));
     registry.register(Box::new(nxpu_backend_intel::IntelBackend));
+    registry.register(Box::new(nxpu_backend_amd::AmdBackend));
     let backend = registry.find(&cli.target).ok_or_else(|| {
         let available = registry.list_targets().join(", ");
         miette::miette!("unknown target '{}' (available: {})", cli.target, available)
