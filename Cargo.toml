@@ -4,6 +4,7 @@ members = [
     "crates/nxpu-parser",
     "crates/nxpu-ir",
     "crates/nxpu-opt",
+    "crates/nxpu-backend-core",
     "crates/nxpu-cli",
 ]
 
