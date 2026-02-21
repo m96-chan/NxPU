@@ -513,9 +513,7 @@ mod tests {
 
         // Verify A shape = [M, K].
         let a_type = graph.input[0].r#type.as_ref().unwrap();
-        let a_tensor = match a_type.value.as_ref().unwrap() {
-            type_proto::Value::TensorType(t) => t,
-        };
+        let type_proto::Value::TensorType(a_tensor) = a_type.value.as_ref().unwrap();
         assert_eq!(a_tensor.elem_type, data_type::FLOAT);
         let a_dims = &a_tensor.shape.as_ref().unwrap().dim;
         assert_eq!(a_dims.len(), 2);
@@ -530,9 +528,7 @@ mod tests {
 
         // Verify C shape = [M, N].
         let c_type = graph.output[0].r#type.as_ref().unwrap();
-        let c_tensor = match c_type.value.as_ref().unwrap() {
-            type_proto::Value::TensorType(t) => t,
-        };
+        let type_proto::Value::TensorType(c_tensor) = c_type.value.as_ref().unwrap();
         let c_dims = &c_tensor.shape.as_ref().unwrap().dim;
         assert_eq!(c_dims.len(), 2);
         assert_eq!(
@@ -568,9 +564,8 @@ mod tests {
 
         // All tensors are 1D with symbolic dim "N".
         for vi in graph.input.iter().chain(graph.output.iter()) {
-            let tensor = match vi.r#type.as_ref().unwrap().value.as_ref().unwrap() {
-                type_proto::Value::TensorType(t) => t,
-            };
+            let type_proto::Value::TensorType(tensor) =
+                vi.r#type.as_ref().unwrap().value.as_ref().unwrap();
             let dims = &tensor.shape.as_ref().unwrap().dim;
             assert_eq!(dims.len(), 1);
             assert_eq!(

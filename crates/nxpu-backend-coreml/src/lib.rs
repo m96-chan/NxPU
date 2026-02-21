@@ -122,9 +122,7 @@ mod tests {
 
         let model = proto::Model::decode(bytes.as_slice()).unwrap();
         assert_eq!(model.specification_version, proto::SPECIFICATION_VERSION);
-        let prog = match model.r#type.as_ref().unwrap() {
-            proto::model::Type::MlProgram(p) => p,
-        };
+        let proto::model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         assert_eq!(
             prog.functions[0].block.as_ref().unwrap().operations[0].r#type,
             "matmul"
@@ -156,9 +154,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             _ => panic!("expected binary"),
         };
         let model = proto::Model::decode(bytes.as_slice()).unwrap();
-        let prog = match model.r#type.as_ref().unwrap() {
-            proto::model::Type::MlProgram(p) => p,
-        };
+        let proto::model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         assert_eq!(
             prog.functions[0].block.as_ref().unwrap().operations[0].r#type,
             "add"

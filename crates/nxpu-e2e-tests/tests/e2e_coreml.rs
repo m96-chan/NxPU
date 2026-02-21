@@ -6,13 +6,11 @@ use prost::Message;
 
 fn decode_coreml(output: &nxpu_backend_core::BackendOutput) -> Model {
     let bytes = common::first_binary(output);
-    Model::decode(bytes.as_ref()).expect("failed to decode CoreML model")
+    Model::decode(bytes).expect("failed to decode CoreML model")
 }
 
 fn get_mil_ops(model: &Model) -> &[proto::MlOperation] {
-    let prog = match model.r#type.as_ref().unwrap() {
-        model::Type::MlProgram(p) => p,
-    };
+    let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
     &prog.functions[0].block.as_ref().unwrap().operations
 }
 
