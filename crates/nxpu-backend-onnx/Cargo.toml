@@ -1,0 +1,15 @@
+[package]
+name = "nxpu-backend-onnx"
+description = "ONNX backend emitter for NxPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nxpu-ir = { path = "../nxpu-ir" }
+nxpu-backend-core = { path = "../nxpu-backend-core" }
+prost = "0.13"
+thiserror = "2"
+
+[dev-dependencies]
+nxpu-parser = { path = "../nxpu-parser" }

@@ -14,6 +14,7 @@ nxpu-parser = { path = "../nxpu-parser" }
 nxpu-ir = { path = "../nxpu-ir" }
 nxpu-opt = { path = "../nxpu-opt" }
 nxpu-backend-core = { path = "../nxpu-backend-core" }
+nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }
 clap = { version = "4", features = ["derive"] }
 miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
