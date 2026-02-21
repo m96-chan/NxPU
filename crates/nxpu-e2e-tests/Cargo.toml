@@ -18,3 +18,5 @@ nxpu-backend-tflite = { path = "../nxpu-backend-tflite" }
 nxpu-backend-coreml = { path = "../nxpu-backend-coreml" }
 nxpu-backend-stablehlo = { path = "../nxpu-backend-stablehlo" }
 prost = "0.13"
+tract-onnx = "0.21"
+ndarray = "0.16"

@@ -61,6 +61,9 @@ impl Backend for CoreMlBackend {
                 analyze::KernelPattern::Transpose { .. } => "transpose",
                 analyze::KernelPattern::Reshape { .. } => "reshape",
                 analyze::KernelPattern::Normalization { .. } => "batch_norm",
+                analyze::KernelPattern::Concat { .. } => "concat",
+                analyze::KernelPattern::Split { .. } => "split",
+                analyze::KernelPattern::Attention { .. } => "scaled_dot_product_attention",
             };
 
             diagnostics.push(Diagnostic {

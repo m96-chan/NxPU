@@ -103,3 +103,27 @@ fn maxpool_stablehlo_reduce_window() {
     let mlir = common::first_text(&output);
     assert!(mlir.contains("stablehlo.reduce_window"));
 }
+
+#[test]
+fn concat_stablehlo_concatenate() {
+    let source = common::load_example("concat");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(mlir.contains("stablehlo.concatenate"));
+}
+
+#[test]
+fn split_stablehlo_slice() {
+    let source = common::load_example("split");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(mlir.contains("stablehlo.slice"));
+}
+
+#[test]
+fn attention_stablehlo_dot_general() {
+    let source = common::load_example("attention");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(mlir.contains("stablehlo.dot_general"));
+}

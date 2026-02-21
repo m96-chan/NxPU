@@ -34,6 +34,8 @@ pub mod builtin_op {
     pub const REDUCE_MAX: i32 = 82;
     pub const REDUCE_MIN: i32 = 83;
     pub const SUM: i32 = 74;
+    pub const CONCATENATION: i32 = 2;
+    pub const SPLIT: i32 = 49;
     pub const BATCH_MATMUL: i32 = 126;
 }
 

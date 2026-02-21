@@ -52,6 +52,9 @@ impl Backend for StableHloBackend {
                 analyze::KernelPattern::Transpose { .. } => "transpose",
                 analyze::KernelPattern::Reshape { .. } => "reshape",
                 analyze::KernelPattern::Normalization { .. } => "batch_norm_inference",
+                analyze::KernelPattern::Concat { .. } => "concatenate",
+                analyze::KernelPattern::Split { .. } => "slice",
+                analyze::KernelPattern::Attention { .. } => "attention",
             };
 
             diagnostics.push(Diagnostic {

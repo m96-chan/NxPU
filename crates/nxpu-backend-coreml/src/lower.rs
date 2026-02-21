@@ -72,6 +72,17 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
             output,
             ..
         } => build_normalization(input, scale, bias, output),
+        KernelPattern::Concat { inputs, output, .. } => {
+            build_nary_op("concat", inputs.iter().collect(), output)
+        }
+        KernelPattern::Split { input, outputs, .. } => build_split(input, outputs),
+        KernelPattern::Attention {
+            query,
+            key,
+            value,
+            output,
+            ..
+        } => build_attention(query, key, value, output),
     };
 
     let feature_inputs: Vec<FeatureDescription> = inputs
@@ -271,6 +282,87 @@ fn build_normalization<'a>(
         }],
     };
     (vec![input, scale, bias], vec![output], vec![op])
+}
+
+fn build_nary_op<'a>(
+    mil_op: &str,
+    inputs: Vec<&'a TensorBinding>,
+    output: &'a TensorBinding,
+) -> (
+    Vec<&'a TensorBinding>,
+    Vec<&'a TensorBinding>,
+    Vec<MlOperation>,
+) {
+    let op = MlOperation {
+        r#type: mil_op.into(),
+        name: format!("{mil_op}_0"),
+        inputs: inputs
+            .iter()
+            .map(|i| MlOperand {
+                name: i.name.clone(),
+            })
+            .collect(),
+        outputs: vec![MlOperand {
+            name: output.name.clone(),
+        }],
+    };
+    (inputs, vec![output], vec![op])
+}
+
+fn build_split<'a>(
+    input: &'a TensorBinding,
+    outputs: &'a [TensorBinding],
+) -> (
+    Vec<&'a TensorBinding>,
+    Vec<&'a TensorBinding>,
+    Vec<MlOperation>,
+) {
+    let op = MlOperation {
+        r#type: "split".into(),
+        name: "split_0".into(),
+        inputs: vec![MlOperand {
+            name: input.name.clone(),
+        }],
+        outputs: outputs
+            .iter()
+            .map(|o| MlOperand {
+                name: o.name.clone(),
+            })
+            .collect(),
+    };
+    let out_refs: Vec<&TensorBinding> = outputs.iter().collect();
+    (vec![input], out_refs, vec![op])
+}
+
+fn build_attention<'a>(
+    query: &'a TensorBinding,
+    key: &'a TensorBinding,
+    value: &'a TensorBinding,
+    output: &'a TensorBinding,
+) -> (
+    Vec<&'a TensorBinding>,
+    Vec<&'a TensorBinding>,
+    Vec<MlOperation>,
+) {
+    let op = MlOperation {
+        r#type: "scaled_dot_product_attention".into(),
+        name: "attention_0".into(),
+        inputs: vec![
+            MlOperand {
+                name: query.name.clone(),
+            },
+            MlOperand {
+                name: key.name.clone(),
+            },
+            MlOperand {
+                name: value.name.clone(),
+            },
+        ],
+        outputs: vec![MlOperand {
+            name: output.name.clone(),
+        }],
+    };
+    (vec![query, key, value], vec![output], vec![op])
 }
 
 #[cfg(test)]

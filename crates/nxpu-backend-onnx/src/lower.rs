@@ -60,6 +60,24 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> ModelProto {
             output,
             ..
         } => build_normalization_graph(input, scale, bias, output, ep_name),
+        KernelPattern::Concat {
+            inputs,
+            output,
+            axis,
+        } => build_concat_graph(inputs, output, *axis, ep_name),
+        KernelPattern::Split {
+            input,
+            outputs,
+            axis,
+        } => build_split_graph(input, outputs, *axis, ep_name),
+        KernelPattern::Attention {
+            query,
+            key,
+            value,
+            output,
+            d_k,
+            seq_len,
+        } => build_attention_graph(query, key, value, output, seq_len, d_k, ep_name),
     };
 
     ModelProto {
@@ -440,6 +458,149 @@ fn build_normalization_graph(
                 TensorShapeDimension::symbolic("H"),
                 TensorShapeDimension::symbolic("W"),
             ],
+        )],
+    }
+}
+
+fn build_concat_graph(
+    inputs: &[TensorBinding],
+    output: &TensorBinding,
+    axis: i64,
+    ep_name: &str,
+) -> GraphProto {
+    let input_names: Vec<String> = inputs.iter().map(|i| i.name.clone()).collect();
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::with_attrs(
+            "Concat",
+            "concat_0",
+            input_names.clone(),
+            vec![output.name.clone()],
+            vec![AttributeProto::int("axis", axis)],
+        )],
+        input: inputs
+            .iter()
+            .map(|i| {
+                ValueInfoProto::tensor(
+                    &i.name,
+                    i.elem_type,
+                    vec![TensorShapeDimension::symbolic("N")],
+                )
+            })
+            .collect(),
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic("N_out")],
+        )],
+    }
+}
+
+fn build_split_graph(
+    input: &TensorBinding,
+    outputs: &[TensorBinding],
+    axis: i64,
+    ep_name: &str,
+) -> GraphProto {
+    let output_names: Vec<String> = outputs.iter().map(|o| o.name.clone()).collect();
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::with_attrs(
+            "Split",
+            "split_0",
+            vec![input.name.clone()],
+            output_names,
+            vec![AttributeProto::int("axis", axis)],
+        )],
+        input: vec![ValueInfoProto::tensor(
+            &input.name,
+            input.elem_type,
+            vec![TensorShapeDimension::symbolic("N")],
+        )],
+        output: outputs
+            .iter()
+            .map(|o| {
+                ValueInfoProto::tensor(
+                    &o.name,
+                    o.elem_type,
+                    vec![TensorShapeDimension::symbolic("N_part")],
+                )
+            })
+            .collect(),
+    }
+}
+
+fn build_attention_graph(
+    query: &TensorBinding,
+    key: &TensorBinding,
+    value: &TensorBinding,
+    output: &TensorBinding,
+    seq_len: &str,
+    d_k: &str,
+    ep_name: &str,
+) -> GraphProto {
+    // Emit a subgraph: Transpose(K) → MatMul(Q,K^T) → Div(sqrt_dk) → Softmax → MatMul(attn,V)
+    let kt_name = "key_transposed";
+    let scores_name = "scores";
+    let scaled_name = "scaled_scores";
+    let attn_name = "attn_weights";
+
+    let q_shape = vec![
+        TensorShapeDimension::symbolic(seq_len),
+        TensorShapeDimension::symbolic(d_k),
+    ];
+    let k_shape = q_shape.clone();
+    let v_shape = q_shape.clone();
+    let out_shape = q_shape.clone();
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![
+            // Transpose K
+            NodeProto::with_attrs(
+                "Transpose",
+                "transpose_k",
+                vec![key.name.clone()],
+                vec![kt_name.into()],
+                vec![AttributeProto::ints("perm", vec![1, 0])],
+            ),
+            // MatMul(Q, K^T) → scores
+            NodeProto::simple(
+                "MatMul",
+                "matmul_qk",
+                vec![query.name.clone(), kt_name.into()],
+                vec![scores_name.into()],
+            ),
+            // Div by sqrt(d_k)
+            NodeProto::simple(
+                "Div",
+                "scale_scores",
+                vec![scores_name.into(), "sqrt_dk".into()],
+                vec![scaled_name.into()],
+            ),
+            // Softmax
+            NodeProto::simple(
+                "Softmax",
+                "softmax_0",
+                vec![scaled_name.into()],
+                vec![attn_name.into()],
+            ),
+            // MatMul(attn, V) → output
+            NodeProto::simple(
+                "MatMul",
+                "matmul_av",
+                vec![attn_name.into(), value.name.clone()],
+                vec![output.name.clone()],
+            ),
+        ],
+        input: vec![
+            ValueInfoProto::tensor(&query.name, query.elem_type, q_shape),
+            ValueInfoProto::tensor(&key.name, key.elem_type, k_shape),
+            ValueInfoProto::tensor(&value.name, value.elem_type, v_shape),
+        ],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            out_shape,
         )],
     }
 }

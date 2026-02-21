@@ -157,6 +157,42 @@ pub fn build_model(pattern: &KernelPattern) -> Vec<u8> {
                 "batchnorm_approx",
             )
         }
+        KernelPattern::Concat { inputs, output, .. } => {
+            let input_refs: Vec<&TensorBinding> = inputs.iter().collect();
+            let shapes = [vec![-1i32], vec![-1], vec![-1]];
+            build_tflite(
+                &input_refs,
+                output,
+                &shapes,
+                builtin_op::CONCATENATION,
+                "concat",
+            )
+        }
+        KernelPattern::Split { input, outputs, .. } => {
+            let out = outputs.first().expect("split must have outputs");
+            let shapes = [vec![-1i32], vec![-1]];
+            build_tflite_unary(
+                input,
+                out,
+                &shapes[0],
+                &shapes[1],
+                builtin_op::SPLIT,
+                "split",
+            )
+        }
+        KernelPattern::Attention {
+            query, key, output, ..
+        } => {
+            // Approximate attention as BATCH_MATMUL (Q * K^T).
+            let shapes = [vec![-1i32, -1], vec![-1, -1], vec![-1, -1]];
+            build_tflite(
+                &[query, key],
+                output,
+                &shapes,
+                builtin_op::BATCH_MATMUL,
+                "attention",
+            )
+        }
     }
 }
 
