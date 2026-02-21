@@ -13,6 +13,7 @@ members = [
     "crates/nxpu-backend-mediatek",
     "crates/nxpu-backend-intel",
     "crates/nxpu-backend-amd",
+    "crates/nxpu-backend-qualcomm",
     "crates/nxpu-cli",
 ]
 
