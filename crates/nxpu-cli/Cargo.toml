@@ -16,6 +16,8 @@ nxpu-opt = { path = "../nxpu-opt" }
 nxpu-backend-core = { path = "../nxpu-backend-core" }
 nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }
 nxpu-backend-tflite = { path = "../nxpu-backend-tflite" }
+nxpu-backend-coreml = { path = "../nxpu-backend-coreml" }
+nxpu-backend-stablehlo = { path = "../nxpu-backend-stablehlo" }
 clap = { version = "4", features = ["derive"] }
 miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
