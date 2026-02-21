@@ -65,8 +65,51 @@ pub struct NodeProto {
     pub name: String,
     #[prost(string, tag = "4")]
     pub op_type: String,
+    #[prost(message, repeated, tag = "5")]
+    pub attribute: Vec<AttributeProto>,
     #[prost(string, tag = "7")]
     pub domain: String,
+}
+
+/// ONNX attribute types.
+pub mod attribute_type {
+    pub const INT: i32 = 2;
+    pub const INTS: i32 = 7;
+}
+
+/// An attribute of an operator node.
+#[derive(Clone, PartialEq, Message)]
+pub struct AttributeProto {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(int32, tag = "20")]
+    pub r#type: i32,
+    #[prost(int64, tag = "3")]
+    pub i: i64,
+    #[prost(int64, repeated, tag = "8")]
+    pub ints: Vec<i64>,
+}
+
+impl AttributeProto {
+    /// Create an integer attribute.
+    pub fn int(name: impl Into<String>, value: i64) -> Self {
+        Self {
+            name: name.into(),
+            r#type: attribute_type::INT,
+            i: value,
+            ints: vec![],
+        }
+    }
+
+    /// Create a list-of-integers attribute.
+    pub fn ints(name: impl Into<String>, values: Vec<i64>) -> Self {
+        Self {
+            name: name.into(),
+            r#type: attribute_type::INTS,
+            i: 0,
+            ints: values,
+        }
+    }
 }
 
 /// Typed tensor name declaration.
@@ -145,6 +188,43 @@ pub mod tensor_shape_dimension {
     }
 }
 
+impl NodeProto {
+    /// Create a node with no attributes.
+    pub fn simple(
+        op_type: impl Into<String>,
+        name: impl Into<String>,
+        input: Vec<String>,
+        output: Vec<String>,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            name: name.into(),
+            op_type: op_type.into(),
+            attribute: vec![],
+            domain: String::new(),
+        }
+    }
+
+    /// Create a node with attributes.
+    pub fn with_attrs(
+        op_type: impl Into<String>,
+        name: impl Into<String>,
+        input: Vec<String>,
+        output: Vec<String>,
+        attribute: Vec<AttributeProto>,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            name: name.into(),
+            op_type: op_type.into(),
+            attribute,
+            domain: String::new(),
+        }
+    }
+}
+
 impl TensorShapeDimension {
     /// Create a symbolic (named) dimension.
     pub fn symbolic(name: impl Into<String>) -> Self {
@@ -174,13 +254,12 @@ mod tests {
             producer_version: "0.1.0".into(),
             graph: Some(GraphProto {
                 name: "test".into(),
-                node: vec![NodeProto {
-                    input: vec!["A".into(), "B".into()],
-                    output: vec!["C".into()],
-                    name: "matmul_0".into(),
-                    op_type: "MatMul".into(),
-                    domain: String::new(),
-                }],
+                node: vec![NodeProto::simple(
+                    "MatMul",
+                    "matmul_0",
+                    vec!["A".into(), "B".into()],
+                    vec!["C".into()],
+                )],
                 input: vec![ValueInfoProto::tensor(
                     "A",
                     data_type::FLOAT,

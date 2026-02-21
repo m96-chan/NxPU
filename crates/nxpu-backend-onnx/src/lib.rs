@@ -16,7 +16,8 @@ mod lower;
 pub mod proto;
 
 pub use analyze::{
-    AnalysisError, ElementWiseOp, KernelPattern, TensorBinding, classify_entry_point,
+    ActivationOp, AnalysisError, Conv2DShape, ElementWiseOp, KernelPattern, MatMulShape, PoolKind,
+    PoolShape, ReduceOp, TensorBinding, classify_entry_point,
 };
 
 /// ONNX backend that compiles NxPU IR into `.onnx` model files.
@@ -81,6 +82,13 @@ fn pattern_summary(pattern: &KernelPattern) -> &'static str {
     match pattern {
         KernelPattern::MatMul { .. } => "MatMul",
         KernelPattern::ElementWise { op, .. } => op.onnx_op_type(),
+        KernelPattern::Conv2D { .. } => "Conv",
+        KernelPattern::Pool { kind, .. } => kind.onnx_op_type(),
+        KernelPattern::Activation { op, .. } => op.onnx_op_type(),
+        KernelPattern::Reduce { op, .. } => op.onnx_op_type(),
+        KernelPattern::Transpose { .. } => "Transpose",
+        KernelPattern::Reshape { .. } => "Reshape",
+        KernelPattern::Normalization { .. } => "BatchNormalization",
     }
 }
 

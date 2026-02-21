@@ -15,11 +15,25 @@ pub mod tensor_type {
 }
 
 /// TFLite `BuiltinOperator` enum values.
+#[allow(dead_code)]
 pub mod builtin_op {
     pub const ADD: i32 = 0;
+    pub const AVERAGE_POOL_2D: i32 = 1;
+    pub const CONV_2D: i32 = 3;
+    pub const MAX_POOL_2D: i32 = 17;
     pub const MUL: i32 = 18;
+    pub const RELU: i32 = 19;
+    pub const RESHAPE: i32 = 22;
+    pub const SOFTMAX: i32 = 25;
+    pub const LOGISTIC: i32 = 14;
+    pub const TANH: i32 = 28;
+    pub const TRANSPOSE: i32 = 39;
+    pub const MEAN: i32 = 40;
     pub const SUB: i32 = 41;
     pub const DIV: i32 = 42;
+    pub const REDUCE_MAX: i32 = 82;
+    pub const REDUCE_MIN: i32 = 83;
+    pub const SUM: i32 = 74;
     pub const BATCH_MATMUL: i32 = 126;
 }
 

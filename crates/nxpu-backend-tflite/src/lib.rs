@@ -46,6 +46,13 @@ impl Backend for TfLiteBackend {
             let summary = match &pattern {
                 analyze::KernelPattern::MatMul { .. } => "BATCH_MATMUL",
                 analyze::KernelPattern::ElementWise { op, .. } => op.onnx_op_type(),
+                analyze::KernelPattern::Conv2D { .. } => "CONV_2D",
+                analyze::KernelPattern::Pool { kind, .. } => kind.onnx_op_type(),
+                analyze::KernelPattern::Activation { op, .. } => op.onnx_op_type(),
+                analyze::KernelPattern::Reduce { op, .. } => op.onnx_op_type(),
+                analyze::KernelPattern::Transpose { .. } => "TRANSPOSE",
+                analyze::KernelPattern::Reshape { .. } => "RESHAPE",
+                analyze::KernelPattern::Normalization { .. } => "BatchNormalization",
             };
 
             diagnostics.push(Diagnostic {
