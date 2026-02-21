@@ -70,6 +70,8 @@ fn onnx_to_coreml_type(onnx_dt: i32) -> ArrayDataType {
     match onnx_dt {
         data_type::FLOAT16 => ArrayDataType::Float16,
         data_type::INT32 => ArrayDataType::Int32,
+        // INT8 not natively supported on ANE — fall back to FP16.
+        data_type::INT8 => ArrayDataType::Float16,
         // ANE operates at FP16; promote FP32 to FP16.
         _ => ArrayDataType::Float16,
     }

@@ -18,6 +18,7 @@ impl fmt::Display for ScalarKind {
             Self::Sint => write!(f, "sint"),
             Self::Uint => write!(f, "uint"),
             Self::Float => write!(f, "float"),
+            Self::BFloat => write!(f, "bfloat"),
         }
     }
 }
@@ -29,6 +30,7 @@ impl fmt::Display for Scalar {
             ScalarKind::Sint => write!(f, "i{}", self.width * 8),
             ScalarKind::Uint => write!(f, "u{}", self.width * 8),
             ScalarKind::Float => write!(f, "f{}", self.width * 8),
+            ScalarKind::BFloat => write!(f, "bf{}", self.width * 8),
         }
     }
 }

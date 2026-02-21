@@ -5,7 +5,7 @@
 
 use nxpu_backend_core::{
     Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
-    OutputContent, OutputFile,
+    OutputContent, OutputFile, Precision,
 };
 use nxpu_backend_onnx::analyze;
 use nxpu_ir::Module;
@@ -25,6 +25,10 @@ impl Backend for CoreMlBackend {
 
     fn targets(&self) -> &[&str] {
         &["coreml", "apple-ane"]
+    }
+
+    fn preferred_precision(&self) -> Precision {
+        Precision::F16
     }
 
     fn compile(

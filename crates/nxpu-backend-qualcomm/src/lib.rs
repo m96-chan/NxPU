@@ -4,7 +4,7 @@
 //! and emits `.onnx` files suitable for the Qualcomm QNN toolchain.
 
 use nxpu_backend_core::{
-    Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
+    Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel, Precision,
 };
 use nxpu_backend_onnx::OnnxBackend;
 use nxpu_ir::Module;
@@ -20,6 +20,10 @@ impl Backend for QualcommBackend {
 
     fn targets(&self) -> &[&str] {
         &["qualcomm", "hexagon-npu"]
+    }
+
+    fn preferred_precision(&self) -> Precision {
+        Precision::Int8
     }
 
     fn compile(

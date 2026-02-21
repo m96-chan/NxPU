@@ -4,7 +4,7 @@
 //! and emits `.onnx` files suitable for OpenVINO / Intel NPU.
 
 use nxpu_backend_core::{
-    Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
+    Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel, Precision,
 };
 use nxpu_backend_onnx::OnnxBackend;
 use nxpu_ir::Module;
@@ -20,6 +20,10 @@ impl Backend for IntelBackend {
 
     fn targets(&self) -> &[&str] {
         &["intel-npu", "openvino"]
+    }
+
+    fn preferred_precision(&self) -> Precision {
+        Precision::F16
     }
 
     fn compile(

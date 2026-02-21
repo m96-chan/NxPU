@@ -16,6 +16,8 @@ pub enum ScalarKind {
     Uint,
     /// Floating point.
     Float,
+    /// Brain floating point.
+    BFloat,
 }
 
 /// A scalar type: kind + byte width.
@@ -45,6 +47,18 @@ impl Scalar {
     pub const F32: Self = Self {
         kind: ScalarKind::Float,
         width: 4,
+    };
+    pub const I8: Self = Self {
+        kind: ScalarKind::Sint,
+        width: 1,
+    };
+    pub const U8: Self = Self {
+        kind: ScalarKind::Uint,
+        width: 1,
+    };
+    pub const BF16: Self = Self {
+        kind: ScalarKind::BFloat,
+        width: 2,
     };
 }
 

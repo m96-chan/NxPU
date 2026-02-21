@@ -1,0 +1,20 @@
+[package]
+name = "nxpu-e2e-tests"
+description = "End-to-end integration tests for NxPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+nxpu-parser = { path = "../nxpu-parser" }
+nxpu-ir = { path = "../nxpu-ir" }
+nxpu-opt = { path = "../nxpu-opt" }
+nxpu-backend-core = { path = "../nxpu-backend-core" }
+nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }
+nxpu-backend-tflite = { path = "../nxpu-backend-tflite" }
+nxpu-backend-coreml = { path = "../nxpu-backend-coreml" }
+nxpu-backend-stablehlo = { path = "../nxpu-backend-stablehlo" }
+prost = "0.13"

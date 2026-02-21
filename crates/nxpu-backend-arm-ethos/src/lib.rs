@@ -4,7 +4,7 @@
 //! and emits `.tflite` files suitable for the Arm Ethos-U / Vela toolchain.
 
 use nxpu_backend_core::{
-    Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
+    Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel, Precision,
 };
 use nxpu_backend_tflite::TfLiteBackend;
 use nxpu_ir::Module;
@@ -20,6 +20,10 @@ impl Backend for ArmEthosBackend {
 
     fn targets(&self) -> &[&str] {
         &["arm-ethos", "ethos-u"]
+    }
+
+    fn preferred_precision(&self) -> Precision {
+        Precision::Int8
     }
 
     fn compile(
