@@ -92,3 +92,80 @@ fn vecadd_all_opt_levels() {
         );
     }
 }
+
+// --- Conv2D ---
+
+#[test]
+fn conv2d_produces_conv_node() {
+    let source = common::load_example("conv2d");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.unwrap();
+    assert_eq!(graph.node[0].op_type, "Conv");
+}
+
+// --- ReLU ---
+
+#[test]
+fn relu_produces_relu_node() {
+    let source = common::load_example("relu");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.unwrap();
+    assert_eq!(graph.node[0].op_type, "Relu");
+}
+
+// --- Tanh ---
+
+#[test]
+fn tanh_produces_tanh_node() {
+    let source = common::load_example("tanh_act");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.unwrap();
+    assert_eq!(graph.node[0].op_type, "Tanh");
+}
+
+// --- Reduce Sum ---
+
+#[test]
+fn reduce_sum_produces_reducesum_node() {
+    let source = common::load_example("reduce_sum");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.unwrap();
+    assert_eq!(graph.node[0].op_type, "ReduceSum");
+}
+
+// --- Transpose ---
+
+#[test]
+fn transpose_produces_transpose_node() {
+    let source = common::load_example("transpose");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.unwrap();
+    assert_eq!(graph.node[0].op_type, "Transpose");
+}
+
+// --- BatchNorm ---
+
+#[test]
+fn batchnorm_produces_batchnorm_node() {
+    let source = common::load_example("batchnorm");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.unwrap();
+    assert_eq!(graph.node[0].op_type, "BatchNormalization");
+}
+
+// --- MaxPool ---
+
+#[test]
+fn maxpool_produces_maxpool_node() {
+    let source = common::load_example("maxpool");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.unwrap();
+    assert_eq!(graph.node[0].op_type, "MaxPool");
+}
