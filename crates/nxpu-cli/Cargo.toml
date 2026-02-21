@@ -18,6 +18,7 @@ nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }
 nxpu-backend-tflite = { path = "../nxpu-backend-tflite" }
 nxpu-backend-coreml = { path = "../nxpu-backend-coreml" }
 nxpu-backend-stablehlo = { path = "../nxpu-backend-stablehlo" }
+nxpu-backend-samsung = { path = "../nxpu-backend-samsung" }
 clap = { version = "4", features = ["derive"] }
 miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
