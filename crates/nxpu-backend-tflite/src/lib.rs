@@ -1,35 +1,29 @@
-//! ONNX backend emitter for NxPU.
+//! TFLite/LiteRT backend emitter for NxPU.
 //!
-//! Analyzes NxPU IR to recognize high-level tensor operations (MatMul,
-//! element-wise ops) and emits ONNX (`.onnx`) model files using protobuf
-//! serialization via prost.
+//! Emits TFLite FlatBuffer (`.tflite`) models from NxPU IR.
+//! Targets: MediaTek APU (NeuroPilot), Google Edge TPU, Arm Ethos NPU (Vela).
 
 use nxpu_backend_core::{
     Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
     OutputContent, OutputFile,
 };
+use nxpu_backend_onnx::analyze;
 use nxpu_ir::Module;
-use prost::Message;
 
-pub mod analyze;
 mod lower;
-pub mod proto;
+mod schema;
 
-pub use analyze::{
-    AnalysisError, ElementWiseOp, KernelPattern, TensorBinding, classify_entry_point,
-};
-
-/// ONNX backend that compiles NxPU IR into `.onnx` model files.
+/// TFLite backend that compiles NxPU IR into `.tflite` FlatBuffer files.
 #[derive(Debug)]
-pub struct OnnxBackend;
+pub struct TfLiteBackend;
 
-impl Backend for OnnxBackend {
+impl Backend for TfLiteBackend {
     fn name(&self) -> &str {
-        "ONNX"
+        "TFLite"
     }
 
     fn targets(&self) -> &[&str] {
-        &["onnx"]
+        &["tflite", "litert"]
     }
 
     fn compile(
@@ -49,22 +43,22 @@ impl Backend for OnnxBackend {
                 BackendError::Unsupported(format!("entry point '{}': {e}", ep.name))
             })?;
 
+            let summary = match &pattern {
+                analyze::KernelPattern::MatMul { .. } => "BATCH_MATMUL",
+                analyze::KernelPattern::ElementWise { op, .. } => op.onnx_op_type(),
+            };
+
             diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Info,
-                message: format!(
-                    "entry point '{}': classified as {}",
-                    ep.name,
-                    pattern_summary(&pattern)
-                ),
+                message: format!("entry point '{}': classified as {}", ep.name, summary),
             });
 
-            let model = lower::build_model(&pattern, &ep.name);
-            let bytes = model.encode_to_vec();
+            let bytes = lower::build_model(&pattern);
 
             let filename = if module.entry_points.len() == 1 {
-                "output.onnx".into()
+                "output.tflite".into()
             } else {
-                format!("{}.onnx", ep.name)
+                format!("{}.tflite", ep.name)
             };
 
             files.push(OutputFile {
@@ -77,13 +71,6 @@ impl Backend for OnnxBackend {
     }
 }
 
-fn pattern_summary(pattern: &KernelPattern) -> &'static str {
-    match pattern {
-        KernelPattern::MatMul { .. } => "MatMul",
-        KernelPattern::ElementWise { op, .. } => op.onnx_op_type(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,14 +78,15 @@ mod tests {
 
     #[test]
     fn backend_metadata() {
-        let backend = OnnxBackend;
-        assert_eq!(backend.name(), "ONNX");
-        assert!(backend.targets().contains(&"onnx"));
+        let backend = TfLiteBackend;
+        assert_eq!(backend.name(), "TFLite");
+        assert!(backend.targets().contains(&"tflite"));
+        assert!(backend.targets().contains(&"litert"));
     }
 
     #[test]
     fn compile_empty_module_fails() {
-        let backend = OnnxBackend;
+        let backend = TfLiteBackend;
         let module = Module::default();
         let result = backend.compile(&module, &BackendOptions::default());
         assert!(result.is_err());
@@ -113,30 +101,21 @@ mod tests {
         .unwrap();
         let module = nxpu_parser::parse(&source).unwrap();
 
-        let backend = OnnxBackend;
+        let backend = TfLiteBackend;
         let output = backend
             .compile(&module, &BackendOptions::default())
             .unwrap();
 
         assert_eq!(output.files.len(), 1);
-        assert_eq!(output.files[0].name, "output.onnx");
+        assert_eq!(output.files[0].name, "output.tflite");
 
         let bytes = match &output.files[0].content {
             OutputContent::Binary(b) => b,
             _ => panic!("expected binary output"),
         };
 
-        // Decode and verify the ONNX model.
-        let model = proto::ModelProto::decode(bytes.as_slice()).unwrap();
-        assert_eq!(model.ir_version, 7);
-        assert_eq!(model.producer_name, "nxpu");
-        assert_eq!(model.opset_import[0].version, 13);
-
-        let graph = model.graph.as_ref().unwrap();
-        assert_eq!(graph.node.len(), 1);
-        assert_eq!(graph.node[0].op_type, "MatMul");
-        assert_eq!(graph.input.len(), 2);
-        assert_eq!(graph.output.len(), 1);
+        // Verify TFLite file identifier
+        assert_eq!(&bytes[4..8], b"TFL3");
     }
 
     #[test]
@@ -159,23 +138,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let module = nxpu_parser::parse(source).unwrap();
 
-        let backend = OnnxBackend;
+        let backend = TfLiteBackend;
         let output = backend
             .compile(&module, &BackendOptions::default())
             .unwrap();
 
         assert_eq!(output.files.len(), 1);
-
         let bytes = match &output.files[0].content {
             OutputContent::Binary(b) => b,
             _ => panic!("expected binary output"),
         };
-
-        let model = proto::ModelProto::decode(bytes.as_slice()).unwrap();
-        let graph = model.graph.as_ref().unwrap();
-        assert_eq!(graph.node.len(), 1);
-        assert_eq!(graph.node[0].op_type, "Add");
-        assert_eq!(graph.input.len(), 2);
-        assert_eq!(graph.output.len(), 1);
+        assert_eq!(&bytes[4..8], b"TFL3");
     }
 }
