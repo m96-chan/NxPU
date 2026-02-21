@@ -7,13 +7,18 @@
 mod const_fold;
 mod dce;
 mod fma_fusion;
+pub mod layout;
 pub mod quantize;
 pub mod shape;
 
 pub use const_fold::ConstantFolding;
 pub use dce::DeadCodeElimination;
 pub use fma_fusion::FmaFusion;
-pub use quantize::{CalibrationData, F32ToBf16, F32ToF16, F32ToInt8, QuantizationParams};
+pub use layout::LayoutTransform;
+pub use quantize::{
+    CalibrationData, F32ToBf16, F32ToF16, F32ToInt8, MixedPrecisionPass, MixedPrecisionPolicy,
+    QuantizationParams,
+};
 pub use shape::ShapeInference;
 
 use std::fmt::Debug;

@@ -194,6 +194,7 @@ impl LowerCtx<'_> {
                     binding,
                     ty,
                     init,
+                    layout: None,
                 });
             self.global_var_map.insert(naga_handle, ir_handle);
         }

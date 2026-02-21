@@ -533,13 +533,14 @@ fn make_binding(
     }
 }
 
-/// Resolve an array type to its element's ONNX data type.
+/// Resolve an array or tensor type to its element's ONNX data type.
 fn resolve_array_elem_type(module: &Module, ty: nxpu_ir::Handle<nxpu_ir::Type>) -> Option<i32> {
     match &module.types[ty].inner {
         TypeInner::Array { base, .. } => match &module.types[*base].inner {
             TypeInner::Scalar(s) => Some(scalar_to_onnx_data_type(s)),
             _ => None,
         },
+        TypeInner::Tensor { scalar, .. } => Some(scalar_to_onnx_data_type(scalar)),
         _ => None,
     }
 }
@@ -797,6 +798,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("b".into()),
@@ -809,6 +811,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("result".into()),
@@ -821,6 +824,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("params".into()),
@@ -831,6 +835,7 @@ mod tests {
             }),
             ty: params_ty,
             init: None,
+            layout: None,
         });
 
         // Entry point with a loop in the body (triggers MatMul detection).
@@ -892,6 +897,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("b".into()),
@@ -904,6 +910,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("c".into()),
@@ -916,6 +923,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("params".into()),
@@ -926,6 +934,7 @@ mod tests {
             }),
             ty: params_ty,
             init: None,
+            layout: None,
         });
 
         // Entry point with Store of Binary (no loop → ElementWise).
@@ -999,6 +1008,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         // Single output
         module.global_variables.append(GlobalVariable {
@@ -1012,6 +1022,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("params".into()),
@@ -1022,6 +1033,7 @@ mod tests {
             }),
             ty: params_ty,
             init: None,
+            layout: None,
         });
 
         let mut func = Function::new("main");
@@ -1097,6 +1109,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("c".into()),
@@ -1109,6 +1122,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("params".into()),
@@ -1119,6 +1133,7 @@ mod tests {
             }),
             ty: params_ty,
             init: None,
+            layout: None,
         });
 
         let mut func = Function::new("main");
@@ -1321,6 +1336,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("a".into()),
@@ -1333,6 +1349,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("result".into()),
@@ -1345,6 +1362,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("params".into()),
@@ -1355,6 +1373,7 @@ mod tests {
             }),
             ty: params_ty,
             init: None,
+            layout: None,
         });
 
         let mut func = Function::new("main");

@@ -347,6 +347,7 @@ mod tests {
             binding: None,
             ty: dummy_type_handle(),
             init: None,
+            layout: None,
         })
     }
 

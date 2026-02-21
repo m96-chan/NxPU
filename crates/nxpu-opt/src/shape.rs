@@ -218,6 +218,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("c".into()),
@@ -230,6 +231,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("params".into()),
@@ -240,6 +242,7 @@ mod tests {
             }),
             ty: params_ty,
             init: None,
+            layout: None,
         });
 
         module
@@ -312,6 +315,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("result".into()),
@@ -324,6 +328,7 @@ mod tests {
             }),
             ty: array_f32,
             init: None,
+            layout: None,
         });
         module.global_variables.append(GlobalVariable {
             name: Some("params".into()),
@@ -334,6 +339,7 @@ mod tests {
             }),
             ty: params_ty,
             init: None,
+            layout: None,
         });
 
         let shapes = infer_shapes(&module);
@@ -390,6 +396,7 @@ mod tests {
             binding: None,
             ty: array_fixed,
             init: None,
+            layout: None,
         });
 
         let shapes = infer_shapes(&module);

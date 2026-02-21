@@ -386,6 +386,7 @@ mod tests {
                 })
             },
             init: None,
+            layout: None,
         })
     }
 

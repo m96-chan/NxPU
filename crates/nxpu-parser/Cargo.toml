@@ -4,6 +4,7 @@ description = "WGSL parser for NxPU"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 naga = { version = "28", features = ["wgsl-in"] }

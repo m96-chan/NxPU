@@ -93,6 +93,8 @@ pub struct GlobalVariable {
     pub binding: Option<ResourceBinding>,
     pub ty: Handle<Type>,
     pub init: Option<Handle<crate::Expression>>,
+    /// Optional memory layout annotation for tensor data.
+    pub layout: Option<crate::types::MemoryLayout>,
 }
 
 #[cfg(test)]
