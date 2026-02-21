@@ -21,6 +21,8 @@ nxpu-backend-stablehlo = { path = "../nxpu-backend-stablehlo" }
 nxpu-backend-samsung = { path = "../nxpu-backend-samsung" }
 nxpu-backend-mediatek = { path = "../nxpu-backend-mediatek" }
 nxpu-backend-intel = { path = "../nxpu-backend-intel" }
+nxpu-backend-amd = { path = "../nxpu-backend-amd" }
+nxpu-backend-qualcomm = { path = "../nxpu-backend-qualcomm" }
 clap = { version = "4", features = ["derive"] }
 miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
