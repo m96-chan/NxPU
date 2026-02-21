@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn display_literal() {
-        assert_eq!(format!("{}", Literal::F32(2.75)), "2.75f");
+        assert_eq!(format!("{}", Literal::F32(3.125)), "3.125f");
         assert_eq!(format!("{}", Literal::U32(42)), "42u");
         assert_eq!(format!("{}", Literal::Bool(true)), "true");
     }

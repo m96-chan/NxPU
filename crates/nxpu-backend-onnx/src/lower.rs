@@ -7,6 +7,7 @@ use crate::analyze::{
     ActivationOp, Conv2DShape, ElementWiseOp, KernelPattern, MatMulShape, PoolKind, PoolShape,
     ReduceOp, TensorBinding,
 };
+use crate::fusion::{FusedActivation, FusedPattern};
 use crate::proto::*;
 
 /// Build an ONNX model from a classified kernel pattern.
@@ -60,6 +61,24 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> ModelProto {
             output,
             ..
         } => build_normalization_graph(input, scale, bias, output, ep_name),
+        KernelPattern::Concat {
+            inputs,
+            output,
+            axis,
+        } => build_concat_graph(inputs, output, *axis, ep_name),
+        KernelPattern::Split {
+            input,
+            outputs,
+            axis,
+        } => build_split_graph(input, outputs, *axis, ep_name),
+        KernelPattern::Attention {
+            query,
+            key,
+            value,
+            output,
+            d_k,
+            seq_len,
+        } => build_attention_graph(query, key, value, output, seq_len, d_k, ep_name),
     };
 
     ModelProto {
@@ -71,6 +90,166 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> ModelProto {
             domain: String::new(),
             version: 13,
         }],
+    }
+}
+
+/// Build an ONNX model from a fused pattern.
+///
+/// Handles single patterns, Conv+BatchNorm fusion, and activation fusion.
+pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> ModelProto {
+    match fp {
+        FusedPattern::Single(p) => build_model(p, ep_name),
+        FusedPattern::ConvBatchNorm { conv, norm } => {
+            let (input, weight, shape) = match conv {
+                KernelPattern::Conv2D {
+                    input,
+                    weight,
+                    shape,
+                    ..
+                } => (input, weight, shape),
+                _ => unreachable!("ConvBatchNorm conv must be Conv2D"),
+            };
+            let (scale, bias, norm_output) = match norm.as_ref() {
+                KernelPattern::Normalization {
+                    scale,
+                    bias,
+                    output,
+                    ..
+                } => (scale, bias, output),
+                _ => unreachable!("ConvBatchNorm norm must be Normalization"),
+            };
+
+            let intermediate = "conv_out_intermediate";
+
+            let conv_node = NodeProto::with_attrs(
+                "Conv",
+                "conv_0",
+                vec![input.name.clone(), weight.name.clone()],
+                vec![intermediate.into()],
+                vec![
+                    AttributeProto::ints(
+                        "kernel_shape",
+                        vec![shape.stride_h.max(1), shape.stride_w.max(1)],
+                    ),
+                    AttributeProto::ints(
+                        "strides",
+                        vec![shape.stride_h.max(1), shape.stride_w.max(1)],
+                    ),
+                    AttributeProto::ints(
+                        "pads",
+                        vec![shape.pad_h, shape.pad_w, shape.pad_h, shape.pad_w],
+                    ),
+                ],
+            );
+
+            let bn_node = NodeProto::with_attrs(
+                "BatchNormalization",
+                "batchnorm_0",
+                vec![
+                    intermediate.into(),
+                    scale.name.clone(),
+                    bias.name.clone(),
+                    "running_mean".into(),
+                    "running_var".into(),
+                ],
+                vec![norm_output.name.clone()],
+                vec![AttributeProto::int("epsilon", 1065353216)],
+            );
+
+            let graph = GraphProto {
+                name: ep_name.into(),
+                node: vec![conv_node, bn_node],
+                input: vec![
+                    ValueInfoProto::tensor(
+                        &input.name,
+                        input.elem_type,
+                        vec![
+                            TensorShapeDimension::symbolic(&shape.batch),
+                            TensorShapeDimension::symbolic(&shape.channels_in),
+                            TensorShapeDimension::symbolic(&shape.height),
+                            TensorShapeDimension::symbolic(&shape.width),
+                        ],
+                    ),
+                    ValueInfoProto::tensor(
+                        &weight.name,
+                        weight.elem_type,
+                        vec![
+                            TensorShapeDimension::symbolic(&shape.channels_out),
+                            TensorShapeDimension::symbolic(&shape.channels_in),
+                            TensorShapeDimension::symbolic(&shape.kernel_h),
+                            TensorShapeDimension::symbolic(&shape.kernel_w),
+                        ],
+                    ),
+                    ValueInfoProto::tensor(
+                        &scale.name,
+                        scale.elem_type,
+                        vec![TensorShapeDimension::symbolic(&shape.channels_out)],
+                    ),
+                    ValueInfoProto::tensor(
+                        &bias.name,
+                        bias.elem_type,
+                        vec![TensorShapeDimension::symbolic(&shape.channels_out)],
+                    ),
+                ],
+                output: vec![ValueInfoProto::tensor(
+                    &norm_output.name,
+                    norm_output.elem_type,
+                    vec![
+                        TensorShapeDimension::symbolic(&shape.batch),
+                        TensorShapeDimension::symbolic(&shape.channels_out),
+                        TensorShapeDimension::symbolic("OH"),
+                        TensorShapeDimension::symbolic("OW"),
+                    ],
+                )],
+            };
+
+            ModelProto {
+                ir_version: 7,
+                producer_name: "nxpu".into(),
+                producer_version: env!("CARGO_PKG_VERSION").into(),
+                graph: Some(graph),
+                opset_import: vec![OperatorSetIdProto {
+                    domain: String::new(),
+                    version: 13,
+                }],
+            }
+        }
+        FusedPattern::WithActivation { base, activation } => {
+            let mut model = build_fused_model(base, ep_name);
+            if let (Some(graph), FusedActivation::Relu) = (model.graph.as_mut(), activation) {
+                // Rename the last output to an intermediate and add a Relu node.
+                if let Some(last_output) = graph.output.last_mut() {
+                    let original_name = last_output.name.clone();
+                    let intermediate_name = format!("{original_name}_pre_relu");
+
+                    // Rename graph output to intermediate.
+                    last_output.name = intermediate_name.clone();
+
+                    // Rename the last node's output to the intermediate.
+                    if let Some(last_node) = graph.node.last_mut() {
+                        for out in &mut last_node.output {
+                            if *out == original_name {
+                                *out = intermediate_name.clone();
+                            }
+                        }
+                    }
+
+                    // Add the Relu node.
+                    graph.node.push(NodeProto::simple(
+                        "Relu",
+                        "relu_0",
+                        vec![intermediate_name],
+                        vec![original_name.clone()],
+                    ));
+
+                    // Restore the original output name.
+                    if let Some(last_output) = graph.output.last_mut() {
+                        last_output.name = original_name;
+                    }
+                }
+            }
+            model
+        }
     }
 }
 
@@ -440,6 +619,154 @@ fn build_normalization_graph(
                 TensorShapeDimension::symbolic("H"),
                 TensorShapeDimension::symbolic("W"),
             ],
+        )],
+    }
+}
+
+fn build_concat_graph(
+    inputs: &[TensorBinding],
+    output: &TensorBinding,
+    axis: i64,
+    ep_name: &str,
+) -> GraphProto {
+    let input_names: Vec<String> = inputs.iter().map(|i| i.name.clone()).collect();
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::with_attrs(
+            "Concat",
+            "concat_0",
+            input_names.clone(),
+            vec![output.name.clone()],
+            vec![AttributeProto::int("axis", axis)],
+        )],
+        input: inputs
+            .iter()
+            .map(|i| {
+                ValueInfoProto::tensor(
+                    &i.name,
+                    i.elem_type,
+                    vec![TensorShapeDimension::symbolic("N")],
+                )
+            })
+            .collect(),
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic("N_out")],
+        )],
+    }
+}
+
+fn build_split_graph(
+    input: &TensorBinding,
+    outputs: &[TensorBinding],
+    axis: i64,
+    ep_name: &str,
+) -> GraphProto {
+    let output_names: Vec<String> = outputs.iter().map(|o| o.name.clone()).collect();
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::with_attrs(
+            "Split",
+            "split_0",
+            vec![input.name.clone()],
+            output_names,
+            vec![AttributeProto::int("axis", axis)],
+        )],
+        input: vec![ValueInfoProto::tensor(
+            &input.name,
+            input.elem_type,
+            vec![TensorShapeDimension::symbolic("N")],
+        )],
+        output: outputs
+            .iter()
+            .map(|o| {
+                ValueInfoProto::tensor(
+                    &o.name,
+                    o.elem_type,
+                    vec![TensorShapeDimension::symbolic("N_part")],
+                )
+            })
+            .collect(),
+    }
+}
+
+fn build_attention_graph(
+    query: &TensorBinding,
+    key: &TensorBinding,
+    value: &TensorBinding,
+    output: &TensorBinding,
+    seq_len: &str,
+    d_k: &str,
+    ep_name: &str,
+) -> GraphProto {
+    // Emit a subgraph: Transpose(K) → MatMul(Q,K^T) → Div(sqrt_dk) → Softmax → MatMul(attn,V)
+    let kt_name = "key_transposed";
+    let scores_name = "scores";
+    let scaled_name = "scaled_scores";
+    let attn_name = "attn_weights";
+
+    let q_shape = vec![
+        TensorShapeDimension::symbolic(seq_len),
+        TensorShapeDimension::symbolic(d_k),
+    ];
+    let k_shape = q_shape.clone();
+    let v_shape = q_shape.clone();
+    let out_shape = q_shape.clone();
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![
+            // Transpose K
+            NodeProto::with_attrs(
+                "Transpose",
+                "transpose_k",
+                vec![key.name.clone()],
+                vec![kt_name.into()],
+                vec![AttributeProto::ints("perm", vec![1, 0])],
+            ),
+            // MatMul(Q, K^T) → scores
+            NodeProto::simple(
+                "MatMul",
+                "matmul_qk",
+                vec![query.name.clone(), kt_name.into()],
+                vec![scores_name.into()],
+            ),
+            // Div by sqrt(d_k)
+            NodeProto::simple(
+                "Div",
+                "scale_scores",
+                vec![scores_name.into(), "sqrt_dk".into()],
+                vec![scaled_name.into()],
+            ),
+            // Softmax
+            NodeProto::simple(
+                "Softmax",
+                "softmax_0",
+                vec![scaled_name.into()],
+                vec![attn_name.into()],
+            ),
+            // MatMul(attn, V) → output
+            NodeProto::simple(
+                "MatMul",
+                "matmul_av",
+                vec![attn_name.into(), value.name.clone()],
+                vec![output.name.clone()],
+            ),
+        ],
+        input: vec![
+            ValueInfoProto::tensor(&query.name, query.elem_type, q_shape),
+            ValueInfoProto::tensor(&key.name, key.elem_type, k_shape),
+            ValueInfoProto::tensor(&value.name, value.elem_type, v_shape),
+            ValueInfoProto::tensor(
+                "sqrt_dk",
+                query.elem_type,
+                vec![TensorShapeDimension::fixed(1)],
+            ),
+        ],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            out_shape,
         )],
     }
 }

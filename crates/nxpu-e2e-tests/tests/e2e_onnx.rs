@@ -169,3 +169,42 @@ fn maxpool_produces_maxpool_node() {
     let graph = model.graph.unwrap();
     assert_eq!(graph.node[0].op_type, "MaxPool");
 }
+
+// --- Concat ---
+
+#[test]
+fn concat_produces_concat_node() {
+    let source = common::load_example("concat");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.unwrap();
+    assert_eq!(graph.node[0].op_type, "Concat");
+}
+
+// --- Split ---
+
+#[test]
+fn split_produces_split_node() {
+    let source = common::load_example("split");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.unwrap();
+    assert_eq!(graph.node[0].op_type, "Split");
+}
+
+// --- Attention ---
+
+#[test]
+fn attention_produces_attention_subgraph() {
+    let source = common::load_example("attention");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.unwrap();
+    // Attention subgraph: Transpose + MatMul + Div + Softmax + MatMul = 5 nodes
+    assert_eq!(graph.node.len(), 5);
+    let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
+    assert!(op_types.contains(&"Transpose"));
+    assert!(op_types.contains(&"MatMul"));
+    assert!(op_types.contains(&"Div"));
+    assert!(op_types.contains(&"Softmax"));
+}

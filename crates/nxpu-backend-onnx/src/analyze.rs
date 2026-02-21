@@ -215,6 +215,29 @@ pub enum KernelPattern {
         output: TensorBinding,
         epsilon: f32,
     },
+    /// Concatenation of multiple inputs along an axis.
+    // TODO: axis is always 0; infer actual concat axis from IR when possible.
+    Concat {
+        inputs: Vec<TensorBinding>,
+        output: TensorBinding,
+        axis: i64,
+    },
+    /// Split a single input into multiple outputs along an axis.
+    // TODO: axis is always 0; infer actual split axis from IR when possible.
+    Split {
+        input: TensorBinding,
+        outputs: Vec<TensorBinding>,
+        axis: i64,
+    },
+    /// Scaled dot-product attention.
+    Attention {
+        query: TensorBinding,
+        key: TensorBinding,
+        value: TensorBinding,
+        output: TensorBinding,
+        d_k: String,
+        seq_len: String,
+    },
 }
 
 /// Classify an entry point into a known ONNX-mappable pattern.
@@ -272,6 +295,20 @@ pub fn classify_entry_point(
     // Single input patterns
     if num_inputs == 1 {
         let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
+
+        // Split: 1 input + 2+ outputs + has If
+        if outputs.len() >= 2 && has_if_statement(&ep.function.body) {
+            let out_bindings: Vec<TensorBinding> = outputs
+                .iter()
+                .map(|(h, gv)| make_binding(module, *h, gv, TensorRole::Output))
+                .collect();
+            return Ok(KernelPattern::Split {
+                input,
+                outputs: out_bindings,
+                axis: 0,
+            });
+        }
+
         let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
 
         if !has_loop {
@@ -345,8 +382,36 @@ pub fn classify_entry_point(
         ));
     }
 
-    // 3+ inputs → Normalization (input + scale + bias)
+    // 3+ inputs: check for Attention before Normalization
     if num_inputs >= 3 {
+        // Attention heuristic: 3 inputs + has loop + contains Exp + Sqrt.
+        // NOTE: This is fragile — any 3-input kernel with loop + exp() + sqrt()
+        // will match. A false positive is possible for custom kernels that
+        // happen to use both functions. Consider adding more structural checks
+        // (e.g., nested loop depth, softmax pattern) if this becomes an issue.
+        if has_loop
+            && has_math_function_in_expressions(&ep.function.expressions, MathFunction::Exp)
+            && has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sqrt)
+        {
+            let query = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
+            let key = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
+            let value = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
+            let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
+            let seq_len = shape_names
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "seq_len".into());
+            let d_k = shape_names.get(1).cloned().unwrap_or_else(|| "d_k".into());
+            return Ok(KernelPattern::Attention {
+                query,
+                key,
+                value,
+                output,
+                d_k,
+                seq_len,
+            });
+        }
+
         let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
         let scale = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
         let bias = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
@@ -366,6 +431,17 @@ pub fn classify_entry_point(
     let output_c = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
 
     if !has_loop {
+        let has_if = has_if_statement(&ep.function.body);
+
+        // Concat: 2 inputs + no loop + has If + no binary store op
+        if has_if && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none() {
+            return Ok(KernelPattern::Concat {
+                inputs: vec![input_a, input_b],
+                output: output_c,
+                axis: 0,
+            });
+        }
+
         // ElementWise: store of binary operation.
         let op =
             find_store_binary_op(&ep.function.body, &ep.function.expressions).ok_or_else(|| {
@@ -482,6 +558,24 @@ fn scalar_to_onnx_data_type(scalar: &Scalar) -> i32 {
         (ScalarKind::Bool, _) => data_type::BOOL,
         _ => data_type::FLOAT,
     }
+}
+
+/// Check if any expression in the arena uses a specific math function.
+fn has_math_function_in_expressions(exprs: &Arena<Expression>, target: MathFunction) -> bool {
+    exprs
+        .iter()
+        .any(|(_, expr)| matches!(expr, Expression::Math { fun, .. } if *fun == target))
+}
+
+/// Check if a block (or any nested block) contains an If statement.
+fn has_if_statement(body: &[Statement]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Statement::If { .. } => true,
+        Statement::Loop {
+            body, continuing, ..
+        } => has_if_statement(body) || has_if_statement(continuing),
+        _ => false,
+    })
 }
 
 /// Check if a block (or any nested block) contains a Loop statement.

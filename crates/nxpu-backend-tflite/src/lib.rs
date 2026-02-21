@@ -53,6 +53,9 @@ impl Backend for TfLiteBackend {
                 analyze::KernelPattern::Transpose { .. } => "TRANSPOSE",
                 analyze::KernelPattern::Reshape { .. } => "RESHAPE",
                 analyze::KernelPattern::Normalization { .. } => "BatchNormalization",
+                analyze::KernelPattern::Concat { .. } => "CONCATENATION",
+                analyze::KernelPattern::Split { .. } => "SPLIT",
+                analyze::KernelPattern::Attention { .. } => "Attention",
             };
 
             diagnostics.push(Diagnostic {

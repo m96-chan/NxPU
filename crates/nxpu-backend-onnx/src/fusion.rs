@@ -1,0 +1,298 @@
+//! Kernel fusion: merges adjacent classified patterns into fused operations.
+//!
+//! After pattern classification, `fuse_patterns()` scans adjacent patterns
+//! and merges compatible sequences (e.g., Conv+BatchNorm, Add+ReLU).
+
+use crate::analyze::KernelPattern;
+
+/// Fused activation function appended to a base operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusedActivation {
+    None,
+    Relu,
+}
+
+/// A pattern that may be fused from one or more classified patterns.
+#[derive(Debug, Clone)]
+pub enum FusedPattern {
+    /// A single unfused pattern.
+    Single(KernelPattern),
+    /// Conv2D followed by BatchNormalization.
+    ConvBatchNorm {
+        conv: KernelPattern,
+        norm: Box<KernelPattern>,
+    },
+    /// A base pattern followed by an activation function.
+    WithActivation {
+        base: Box<FusedPattern>,
+        activation: FusedActivation,
+    },
+}
+
+impl FusedPattern {
+    /// Return a reference to the primary pattern (for lowering).
+    pub fn primary_pattern(&self) -> &KernelPattern {
+        match self {
+            FusedPattern::Single(p) => p,
+            FusedPattern::ConvBatchNorm { conv, .. } => conv,
+            FusedPattern::WithActivation { base, .. } => base.primary_pattern(),
+        }
+    }
+
+    /// Return the fused activation, if any.
+    pub fn fused_activation(&self) -> FusedActivation {
+        match self {
+            FusedPattern::WithActivation { activation, .. } => *activation,
+            _ => FusedActivation::None,
+        }
+    }
+}
+
+/// Greedy adjacent fusion of classified kernel patterns.
+///
+/// Scans the pattern list and merges compatible adjacent pairs:
+/// - Conv2D + Normalization → ConvBatchNorm
+/// - Any + Activation(Relu) → WithActivation { base, Relu }
+pub fn fuse_patterns(patterns: Vec<KernelPattern>) -> Vec<(FusedPattern, usize)> {
+    let mut result: Vec<(FusedPattern, usize)> = Vec::new();
+    let mut iter = patterns.into_iter().enumerate().peekable();
+
+    while let Some((idx, pattern)) = iter.next() {
+        let fused = match &pattern {
+            KernelPattern::Conv2D { .. } => {
+                if let Some((_, KernelPattern::Normalization { .. })) = iter.peek() {
+                    let (_, norm) = iter.next().unwrap();
+                    FusedPattern::ConvBatchNorm {
+                        conv: pattern,
+                        norm: Box::new(norm),
+                    }
+                } else {
+                    FusedPattern::Single(pattern)
+                }
+            }
+            _ => FusedPattern::Single(pattern),
+        };
+
+        let fused = if let Some((
+            _,
+            KernelPattern::Activation {
+                op: crate::analyze::ActivationOp::Relu,
+                ..
+            },
+        )) = iter.peek()
+        {
+            let _ = iter.next();
+            FusedPattern::WithActivation {
+                base: Box::new(fused),
+                activation: FusedActivation::Relu,
+            }
+        } else {
+            fused
+        };
+
+        result.push((fused, idx));
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyze::*;
+    use crate::proto::data_type;
+
+    fn dummy_handle() -> nxpu_ir::Handle<nxpu_ir::GlobalVariable> {
+        let mut arena = nxpu_ir::Arena::new();
+        arena.append(nxpu_ir::GlobalVariable {
+            name: None,
+            space: nxpu_ir::AddressSpace::Uniform,
+            binding: None,
+            ty: {
+                let mut types = nxpu_ir::UniqueArena::new();
+                types.insert(nxpu_ir::Type {
+                    name: None,
+                    inner: nxpu_ir::TypeInner::Scalar(nxpu_ir::Scalar::F32),
+                })
+            },
+            init: None,
+            layout: None,
+        })
+    }
+
+    fn make_tensor(name: &str, role: TensorRole) -> TensorBinding {
+        TensorBinding {
+            handle: dummy_handle(),
+            name: name.into(),
+            elem_type: data_type::FLOAT,
+            role,
+        }
+    }
+
+    #[test]
+    fn single_pattern_no_fusion() {
+        let patterns = vec![KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        }];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 1);
+        let (ref fp, idx) = fused[0];
+        assert!(matches!(fp, FusedPattern::Single(_)));
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn conv_batchnorm_fusion() {
+        let patterns = vec![
+            KernelPattern::Conv2D {
+                input: make_tensor("x", TensorRole::Input),
+                weight: make_tensor("w", TensorRole::Input),
+                output: make_tensor("conv_out", TensorRole::Output),
+                shape: Conv2DShape {
+                    batch: "N".into(),
+                    channels_in: "IC".into(),
+                    channels_out: "OC".into(),
+                    height: "H".into(),
+                    width: "W".into(),
+                    kernel_h: "KH".into(),
+                    kernel_w: "KW".into(),
+                    stride_h: 1,
+                    stride_w: 1,
+                    pad_h: 0,
+                    pad_w: 0,
+                },
+            },
+            KernelPattern::Normalization {
+                input: make_tensor("conv_out", TensorRole::Input),
+                scale: make_tensor("gamma", TensorRole::Input),
+                bias: make_tensor("beta", TensorRole::Input),
+                output: make_tensor("bn_out", TensorRole::Output),
+                epsilon: 1e-5,
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 1);
+        let (ref fp, idx) = fused[0];
+        assert!(matches!(fp, FusedPattern::ConvBatchNorm { .. }));
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn add_relu_fusion() {
+        let patterns = vec![
+            KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("a", TensorRole::Input),
+                    make_tensor("b", TensorRole::Input),
+                ],
+                output: make_tensor("c", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+            KernelPattern::Activation {
+                op: ActivationOp::Relu,
+                input: make_tensor("c", TensorRole::Input),
+                output: make_tensor("d", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 1);
+        let (ref fp, idx) = fused[0];
+        assert!(matches!(
+            fp,
+            FusedPattern::WithActivation {
+                activation: FusedActivation::Relu,
+                ..
+            }
+        ));
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn conv_bn_relu_fusion() {
+        let patterns = vec![
+            KernelPattern::Conv2D {
+                input: make_tensor("x", TensorRole::Input),
+                weight: make_tensor("w", TensorRole::Input),
+                output: make_tensor("conv_out", TensorRole::Output),
+                shape: Conv2DShape {
+                    batch: "N".into(),
+                    channels_in: "IC".into(),
+                    channels_out: "OC".into(),
+                    height: "H".into(),
+                    width: "W".into(),
+                    kernel_h: "KH".into(),
+                    kernel_w: "KW".into(),
+                    stride_h: 1,
+                    stride_w: 1,
+                    pad_h: 0,
+                    pad_w: 0,
+                },
+            },
+            KernelPattern::Normalization {
+                input: make_tensor("conv_out", TensorRole::Input),
+                scale: make_tensor("gamma", TensorRole::Input),
+                bias: make_tensor("beta", TensorRole::Input),
+                output: make_tensor("bn_out", TensorRole::Output),
+                epsilon: 1e-5,
+            },
+            KernelPattern::Activation {
+                op: ActivationOp::Relu,
+                input: make_tensor("bn_out", TensorRole::Input),
+                output: make_tensor("relu_out", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 1);
+        let (ref fp, idx) = fused[0];
+        assert_eq!(idx, 0);
+        match fp {
+            FusedPattern::WithActivation {
+                base,
+                activation: FusedActivation::Relu,
+            } => {
+                assert!(matches!(**base, FusedPattern::ConvBatchNorm { .. }));
+            }
+            other => panic!("expected WithActivation(ConvBatchNorm, Relu), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_fusion_for_non_relu_activation() {
+        let patterns = vec![
+            KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("a", TensorRole::Input),
+                    make_tensor("b", TensorRole::Input),
+                ],
+                output: make_tensor("c", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+            KernelPattern::Activation {
+                op: ActivationOp::Tanh,
+                input: make_tensor("c", TensorRole::Input),
+                output: make_tensor("d", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        // Tanh is not fused — remains as 2 separate patterns.
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].1, 0);
+        assert_eq!(fused[1].1, 1);
+    }
+}

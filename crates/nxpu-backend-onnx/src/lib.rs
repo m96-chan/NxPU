@@ -12,6 +12,7 @@ use nxpu_ir::Module;
 use prost::Message;
 
 pub mod analyze;
+pub mod fusion;
 mod lower;
 pub mod proto;
 
@@ -42,30 +43,54 @@ impl Backend for OnnxBackend {
             return Err(BackendError::Other("no entry points in module".into()));
         }
 
-        let mut files = Vec::new();
-        let mut diagnostics = Vec::new();
-
+        // 1. Classify all entry points.
+        let mut patterns = Vec::new();
         for (i, ep) in module.entry_points.iter().enumerate() {
             let pattern = analyze::classify_entry_point(module, i).map_err(|e| {
                 BackendError::Unsupported(format!("entry point '{}': {e}", ep.name))
             })?;
+            patterns.push(pattern);
+        }
+
+        // 2. Fuse adjacent patterns.
+        let fused = fusion::fuse_patterns(patterns);
+
+        // 3. Lower each fused pattern.
+        let mut files = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        for (fp, ep_idx) in &fused {
+            let ep_name = if *ep_idx < module.entry_points.len() {
+                &module.entry_points[*ep_idx].name
+            } else {
+                "fused"
+            };
+
+            let summary = match fp {
+                fusion::FusedPattern::Single(p) => pattern_summary(p).to_string(),
+                fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm (fused)".into(),
+                fusion::FusedPattern::WithActivation { base, activation } => {
+                    let base_name = match base.as_ref() {
+                        fusion::FusedPattern::Single(p) => pattern_summary(p),
+                        fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",
+                        _ => "fused",
+                    };
+                    format!("{base_name}+{activation:?}")
+                }
+            };
 
             diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Info,
-                message: format!(
-                    "entry point '{}': classified as {}",
-                    ep.name,
-                    pattern_summary(&pattern)
-                ),
+                message: format!("entry point '{ep_name}': classified as {summary}"),
             });
 
-            let model = lower::build_model(&pattern, &ep.name);
+            let model = lower::build_fused_model(fp, ep_name);
             let bytes = model.encode_to_vec();
 
-            let filename = if module.entry_points.len() == 1 {
+            let filename = if fused.len() == 1 {
                 "output.onnx".into()
             } else {
-                format!("{}.onnx", ep.name)
+                format!("{ep_name}.onnx")
             };
 
             files.push(OutputFile {
@@ -89,6 +114,9 @@ fn pattern_summary(pattern: &KernelPattern) -> &'static str {
         KernelPattern::Transpose { .. } => "Transpose",
         KernelPattern::Reshape { .. } => "Reshape",
         KernelPattern::Normalization { .. } => "BatchNormalization",
+        KernelPattern::Concat { .. } => "Concat",
+        KernelPattern::Split { .. } => "Split",
+        KernelPattern::Attention { .. } => "Attention",
     }
 }
 
