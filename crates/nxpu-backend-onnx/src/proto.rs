@@ -315,9 +315,7 @@ mod tests {
         );
         assert_eq!(vi.name, "X");
         let ty = vi.r#type.unwrap();
-        let tensor = match ty.value.unwrap() {
-            type_proto::Value::TensorType(t) => t,
-        };
+        let type_proto::Value::TensorType(tensor) = ty.value.unwrap();
         assert_eq!(tensor.elem_type, data_type::FLOAT);
         assert_eq!(tensor.shape.unwrap().dim.len(), 1);
     }

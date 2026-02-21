@@ -72,6 +72,17 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
             output,
             ..
         } => build_normalization(input, scale, bias, output),
+        KernelPattern::Concat { inputs, output, .. } => {
+            build_nary_op("concat", inputs.iter().collect(), output)
+        }
+        KernelPattern::Split { input, outputs, .. } => build_split(input, outputs),
+        KernelPattern::Attention {
+            query,
+            key,
+            value,
+            output,
+            ..
+        } => build_attention(query, key, value, output),
     };
 
     let feature_inputs: Vec<FeatureDescription> = inputs
@@ -273,6 +284,89 @@ fn build_normalization<'a>(
     (vec![input, scale, bias], vec![output], vec![op])
 }
 
+fn build_nary_op<'a>(
+    mil_op: &str,
+    inputs: Vec<&'a TensorBinding>,
+    output: &'a TensorBinding,
+) -> (
+    Vec<&'a TensorBinding>,
+    Vec<&'a TensorBinding>,
+    Vec<MlOperation>,
+) {
+    let op = MlOperation {
+        r#type: mil_op.into(),
+        name: format!("{mil_op}_0"),
+        inputs: inputs
+            .iter()
+            .map(|i| MlOperand {
+                name: i.name.clone(),
+            })
+            .collect(),
+        outputs: vec![MlOperand {
+            name: output.name.clone(),
+        }],
+    };
+    (inputs, vec![output], vec![op])
+}
+
+fn build_split<'a>(
+    input: &'a TensorBinding,
+    outputs: &'a [TensorBinding],
+) -> (
+    Vec<&'a TensorBinding>,
+    Vec<&'a TensorBinding>,
+    Vec<MlOperation>,
+) {
+    let op = MlOperation {
+        r#type: "split".into(),
+        name: "split_0".into(),
+        inputs: vec![MlOperand {
+            name: input.name.clone(),
+        }],
+        outputs: outputs
+            .iter()
+            .map(|o| MlOperand {
+                name: o.name.clone(),
+            })
+            .collect(),
+    };
+    let out_refs: Vec<&TensorBinding> = outputs.iter().collect();
+    (vec![input], out_refs, vec![op])
+}
+
+fn build_attention<'a>(
+    query: &'a TensorBinding,
+    key: &'a TensorBinding,
+    value: &'a TensorBinding,
+    output: &'a TensorBinding,
+) -> (
+    Vec<&'a TensorBinding>,
+    Vec<&'a TensorBinding>,
+    Vec<MlOperation>,
+) {
+    // scaled_dot_product_attention takes (query, key, value) and an optional
+    // scale parameter. When scale is omitted the runtime uses 1/sqrt(d_k).
+    let op = MlOperation {
+        r#type: "scaled_dot_product_attention".into(),
+        name: "attention_0".into(),
+        inputs: vec![
+            MlOperand {
+                name: query.name.clone(),
+            },
+            MlOperand {
+                name: key.name.clone(),
+            },
+            MlOperand {
+                name: value.name.clone(),
+            },
+        ],
+        outputs: vec![MlOperand {
+            name: output.name.clone(),
+        }],
+    };
+    (vec![query, key, value], vec![output], vec![op])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,9 +416,7 @@ mod tests {
         let model = build_model(&pattern, "matmul_kernel");
         assert_eq!(model.specification_version, SPECIFICATION_VERSION);
 
-        let prog = match model.r#type.as_ref().unwrap() {
-            model::Type::MlProgram(p) => p,
-        };
+        let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         assert_eq!(prog.functions.len(), 1);
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations.len(), 1);
@@ -344,9 +436,7 @@ mod tests {
         };
 
         let model = build_model(&pattern, "vecadd");
-        let prog = match model.r#type.as_ref().unwrap() {
-            model::Type::MlProgram(p) => p,
-        };
+        let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations[0].r#type, "add");
     }
@@ -360,9 +450,7 @@ mod tests {
             dim_name: "N".into(),
         };
         let model = build_model(&pattern, "relu");
-        let prog = match model.r#type.as_ref().unwrap() {
-            model::Type::MlProgram(p) => p,
-        };
+        let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations[0].r#type, "relu");
     }
@@ -381,9 +469,7 @@ mod tests {
             },
         };
         let model = build_model(&pattern, "maxpool");
-        let prog = match model.r#type.as_ref().unwrap() {
-            model::Type::MlProgram(p) => p,
-        };
+        let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations[0].r#type, "max_pool");
     }

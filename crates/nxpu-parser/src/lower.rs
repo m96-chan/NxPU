@@ -1065,8 +1065,8 @@ mod tests {
 
     #[test]
     fn test_lower_literal() {
-        match lower_literal(naga::Literal::F32(3.14)).unwrap() {
-            nxpu_ir::Literal::F32(v) => assert_eq!(v, 3.14),
+        match lower_literal(naga::Literal::F32(3.125)).unwrap() {
+            nxpu_ir::Literal::F32(v) => assert_eq!(v, 3.125),
             _ => panic!("expected F32"),
         }
         match lower_literal(naga::Literal::Bool(true)).unwrap() {

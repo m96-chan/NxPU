@@ -101,3 +101,27 @@ fn maxpool_tflite_magic() {
     let bytes = common::first_binary(&output);
     assert_eq!(&bytes[4..8], b"TFL3");
 }
+
+#[test]
+fn concat_tflite_magic() {
+    let source = common::load_example("concat");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
+
+#[test]
+fn split_tflite_magic() {
+    let source = common::load_example("split");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
+
+#[test]
+fn attention_tflite_magic() {
+    let source = common::load_example("attention");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
