@@ -64,3 +64,66 @@ fn matmul_all_opt_levels() {
         assert_eq!(ops[0].r#type, "matmul", "failed at opt level {level}");
     }
 }
+
+#[test]
+fn conv2d_coreml_conv_op() {
+    let source = common::load_example("conv2d");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "conv");
+}
+
+#[test]
+fn relu_coreml_relu_op() {
+    let source = common::load_example("relu");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "relu");
+}
+
+#[test]
+fn tanh_coreml_tanh_op() {
+    let source = common::load_example("tanh_act");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "tanh");
+}
+
+#[test]
+fn reduce_sum_coreml_reduce_op() {
+    let source = common::load_example("reduce_sum");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "reduce_sum");
+}
+
+#[test]
+fn transpose_coreml_transpose_op() {
+    let source = common::load_example("transpose");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "transpose");
+}
+
+#[test]
+fn batchnorm_coreml_batchnorm_op() {
+    let source = common::load_example("batchnorm");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "batch_norm");
+}
+
+#[test]
+fn maxpool_coreml_maxpool_op() {
+    let source = common::load_example("maxpool");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "max_pool");
+}

@@ -1,9 +1,12 @@
 //! ONNX graph construction from classified kernel patterns.
 //!
 //! Converts a [`KernelPattern`] into an ONNX [`ModelProto`] with the
-//! appropriate graph topology (MatMul or element-wise op).
+//! appropriate graph topology.
 
-use crate::analyze::{ElementWiseOp, KernelPattern, MatMulShape, TensorBinding};
+use crate::analyze::{
+    ActivationOp, Conv2DShape, ElementWiseOp, KernelPattern, MatMulShape, PoolKind, PoolShape,
+    ReduceOp, TensorBinding,
+};
 use crate::proto::*;
 
 /// Build an ONNX model from a classified kernel pattern.
@@ -20,6 +23,43 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> ModelProto {
             output,
             dim_name,
         } => build_elementwise_graph(*op, inputs, output, dim_name, ep_name),
+        KernelPattern::Conv2D {
+            input,
+            weight,
+            output,
+            shape,
+        } => build_conv2d_graph(input, weight, output, shape, ep_name),
+        KernelPattern::Pool {
+            kind,
+            input,
+            output,
+            shape,
+        } => build_pool_graph(*kind, input, output, shape, ep_name),
+        KernelPattern::Activation {
+            op,
+            input,
+            output,
+            dim_name,
+        } => build_activation_graph(*op, input, output, dim_name, ep_name),
+        KernelPattern::Reduce {
+            op,
+            input,
+            output,
+            axis,
+        } => build_reduce_graph(*op, input, output, *axis, ep_name),
+        KernelPattern::Transpose {
+            input,
+            output,
+            perm,
+        } => build_transpose_graph(input, output, perm, ep_name),
+        KernelPattern::Reshape { input, output } => build_reshape_graph(input, output, ep_name),
+        KernelPattern::Normalization {
+            input,
+            scale,
+            bias,
+            output,
+            ..
+        } => build_normalization_graph(input, scale, bias, output, ep_name),
     };
 
     ModelProto {
@@ -46,13 +86,12 @@ fn build_matmul_graph(
 
     GraphProto {
         name: ep_name.into(),
-        node: vec![NodeProto {
-            input: vec![a_name.clone(), b_name.clone()],
-            output: vec![c_name.clone()],
-            name: "matmul_0".into(),
-            op_type: "MatMul".into(),
-            domain: String::new(),
-        }],
+        node: vec![NodeProto::simple(
+            "MatMul",
+            "matmul_0",
+            vec![a_name.clone(), b_name.clone()],
+            vec![c_name.clone()],
+        )],
         input: vec![
             ValueInfoProto::tensor(
                 a_name,
@@ -95,13 +134,12 @@ fn build_elementwise_graph(
 
     GraphProto {
         name: ep_name.into(),
-        node: vec![NodeProto {
-            input: vec![a_name.clone(), b_name.clone()],
-            output: vec![c_name.clone()],
-            name: format!("{}_0", op.onnx_op_type().to_lowercase()),
-            op_type: op.onnx_op_type().into(),
-            domain: String::new(),
-        }],
+        node: vec![NodeProto::simple(
+            op.onnx_op_type(),
+            format!("{}_0", op.onnx_op_type().to_lowercase()),
+            vec![a_name.clone(), b_name.clone()],
+            vec![c_name.clone()],
+        )],
         input: vec![
             ValueInfoProto::tensor(
                 a_name,
@@ -118,6 +156,290 @@ fn build_elementwise_graph(
             c_name,
             output.elem_type,
             vec![TensorShapeDimension::symbolic(dim_name)],
+        )],
+    }
+}
+
+fn build_conv2d_graph(
+    input: &TensorBinding,
+    weight: &TensorBinding,
+    output: &TensorBinding,
+    shape: &Conv2DShape,
+    ep_name: &str,
+) -> GraphProto {
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::with_attrs(
+            "Conv",
+            "conv_0",
+            vec![input.name.clone(), weight.name.clone()],
+            vec![output.name.clone()],
+            vec![
+                AttributeProto::ints(
+                    "kernel_shape",
+                    vec![shape.stride_h.max(1), shape.stride_w.max(1)],
+                ),
+                AttributeProto::ints(
+                    "strides",
+                    vec![shape.stride_h.max(1), shape.stride_w.max(1)],
+                ),
+                AttributeProto::ints(
+                    "pads",
+                    vec![shape.pad_h, shape.pad_w, shape.pad_h, shape.pad_w],
+                ),
+            ],
+        )],
+        input: vec![
+            ValueInfoProto::tensor(
+                &input.name,
+                input.elem_type,
+                vec![
+                    TensorShapeDimension::symbolic(&shape.batch),
+                    TensorShapeDimension::symbolic(&shape.channels_in),
+                    TensorShapeDimension::symbolic(&shape.height),
+                    TensorShapeDimension::symbolic(&shape.width),
+                ],
+            ),
+            ValueInfoProto::tensor(
+                &weight.name,
+                weight.elem_type,
+                vec![
+                    TensorShapeDimension::symbolic(&shape.channels_out),
+                    TensorShapeDimension::symbolic(&shape.channels_in),
+                    TensorShapeDimension::symbolic(&shape.kernel_h),
+                    TensorShapeDimension::symbolic(&shape.kernel_w),
+                ],
+            ),
+        ],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![
+                TensorShapeDimension::symbolic(&shape.batch),
+                TensorShapeDimension::symbolic(&shape.channels_out),
+                TensorShapeDimension::symbolic("OH"),
+                TensorShapeDimension::symbolic("OW"),
+            ],
+        )],
+    }
+}
+
+fn build_pool_graph(
+    kind: PoolKind,
+    input: &TensorBinding,
+    output: &TensorBinding,
+    shape: &PoolShape,
+    ep_name: &str,
+) -> GraphProto {
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::with_attrs(
+            kind.onnx_op_type(),
+            format!("{}_0", kind.onnx_op_type().to_lowercase()),
+            vec![input.name.clone()],
+            vec![output.name.clone()],
+            vec![
+                AttributeProto::ints("kernel_shape", vec![shape.kernel_h, shape.kernel_w]),
+                AttributeProto::ints("strides", vec![shape.stride_h, shape.stride_w]),
+            ],
+        )],
+        input: vec![ValueInfoProto::tensor(
+            &input.name,
+            input.elem_type,
+            vec![
+                TensorShapeDimension::symbolic("N"),
+                TensorShapeDimension::symbolic("C"),
+                TensorShapeDimension::symbolic("H"),
+                TensorShapeDimension::symbolic("W"),
+            ],
+        )],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![
+                TensorShapeDimension::symbolic("N"),
+                TensorShapeDimension::symbolic("C"),
+                TensorShapeDimension::symbolic("OH"),
+                TensorShapeDimension::symbolic("OW"),
+            ],
+        )],
+    }
+}
+
+fn build_activation_graph(
+    op: ActivationOp,
+    input: &TensorBinding,
+    output: &TensorBinding,
+    dim_name: &str,
+    ep_name: &str,
+) -> GraphProto {
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::simple(
+            op.onnx_op_type(),
+            format!("{}_0", op.onnx_op_type().to_lowercase()),
+            vec![input.name.clone()],
+            vec![output.name.clone()],
+        )],
+        input: vec![ValueInfoProto::tensor(
+            &input.name,
+            input.elem_type,
+            vec![TensorShapeDimension::symbolic(dim_name)],
+        )],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic(dim_name)],
+        )],
+    }
+}
+
+fn build_reduce_graph(
+    op: ReduceOp,
+    input: &TensorBinding,
+    output: &TensorBinding,
+    axis: i64,
+    ep_name: &str,
+) -> GraphProto {
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::with_attrs(
+            op.onnx_op_type(),
+            format!("{}_0", op.onnx_op_type().to_lowercase()),
+            vec![input.name.clone()],
+            vec![output.name.clone()],
+            vec![AttributeProto::ints("axes", vec![axis])],
+        )],
+        input: vec![ValueInfoProto::tensor(
+            &input.name,
+            input.elem_type,
+            vec![
+                TensorShapeDimension::symbolic("N"),
+                TensorShapeDimension::symbolic("D"),
+            ],
+        )],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic("N")],
+        )],
+    }
+}
+
+fn build_transpose_graph(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    perm: &[i64],
+    ep_name: &str,
+) -> GraphProto {
+    let ndim = perm.len();
+    let in_dims: Vec<_> = (0..ndim)
+        .map(|i| TensorShapeDimension::symbolic(format!("d{i}")))
+        .collect();
+    let out_dims: Vec<_> = perm
+        .iter()
+        .map(|&p| TensorShapeDimension::symbolic(format!("d{p}")))
+        .collect();
+
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::with_attrs(
+            "Transpose",
+            "transpose_0",
+            vec![input.name.clone()],
+            vec![output.name.clone()],
+            vec![AttributeProto::ints("perm", perm.to_vec())],
+        )],
+        input: vec![ValueInfoProto::tensor(
+            &input.name,
+            input.elem_type,
+            in_dims,
+        )],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            out_dims,
+        )],
+    }
+}
+
+fn build_reshape_graph(input: &TensorBinding, output: &TensorBinding, ep_name: &str) -> GraphProto {
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::simple(
+            "Reshape",
+            "reshape_0",
+            vec![input.name.clone()],
+            vec![output.name.clone()],
+        )],
+        input: vec![ValueInfoProto::tensor(
+            &input.name,
+            input.elem_type,
+            vec![TensorShapeDimension::symbolic("N")],
+        )],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic("N")],
+        )],
+    }
+}
+
+fn build_normalization_graph(
+    input: &TensorBinding,
+    scale: &TensorBinding,
+    bias: &TensorBinding,
+    output: &TensorBinding,
+    ep_name: &str,
+) -> GraphProto {
+    // mean → empty string (runtime computed)
+    // var → empty string (runtime computed)
+    GraphProto {
+        name: ep_name.into(),
+        node: vec![NodeProto::with_attrs(
+            "BatchNormalization",
+            "batchnorm_0",
+            vec![
+                input.name.clone(),
+                scale.name.clone(),
+                bias.name.clone(),
+                "running_mean".into(),
+                "running_var".into(),
+            ],
+            vec![output.name.clone()],
+            vec![AttributeProto::int("epsilon", 1065353216)], // IEEE float bit pattern for 1e-5 stored as int (convention)
+        )],
+        input: vec![
+            ValueInfoProto::tensor(
+                &input.name,
+                input.elem_type,
+                vec![
+                    TensorShapeDimension::symbolic("N"),
+                    TensorShapeDimension::symbolic("C"),
+                    TensorShapeDimension::symbolic("H"),
+                    TensorShapeDimension::symbolic("W"),
+                ],
+            ),
+            ValueInfoProto::tensor(
+                &scale.name,
+                scale.elem_type,
+                vec![TensorShapeDimension::symbolic("C")],
+            ),
+            ValueInfoProto::tensor(
+                &bias.name,
+                bias.elem_type,
+                vec![TensorShapeDimension::symbolic("C")],
+            ),
+        ],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![
+                TensorShapeDimension::symbolic("N"),
+                TensorShapeDimension::symbolic("C"),
+                TensorShapeDimension::symbolic("H"),
+                TensorShapeDimension::symbolic("W"),
+            ],
         )],
     }
 }
@@ -277,5 +599,106 @@ mod tests {
             let graph = model.graph.as_ref().unwrap();
             assert_eq!(graph.node[0].op_type, expected);
         }
+    }
+
+    #[test]
+    fn conv2d_model_structure() {
+        let pattern = KernelPattern::Conv2D {
+            input: make_tensor("input", TensorRole::Input),
+            weight: make_tensor("weight", TensorRole::Input),
+            output: make_tensor("output", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "IC".into(),
+                channels_out: "OC".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 0,
+                pad_w: 0,
+            },
+        };
+        let model = build_model(&pattern, "conv2d");
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node[0].op_type, "Conv");
+    }
+
+    #[test]
+    fn pool_model_structure() {
+        let pattern = KernelPattern::Pool {
+            kind: PoolKind::Max,
+            input: make_tensor("input", TensorRole::Input),
+            output: make_tensor("output", TensorRole::Output),
+            shape: PoolShape {
+                kernel_h: 2,
+                kernel_w: 2,
+                stride_h: 2,
+                stride_w: 2,
+            },
+        };
+        let model = build_model(&pattern, "maxpool");
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node[0].op_type, "MaxPool");
+    }
+
+    #[test]
+    fn activation_model_structure() {
+        for (op, expected) in [
+            (ActivationOp::Relu, "Relu"),
+            (ActivationOp::Sigmoid, "Sigmoid"),
+            (ActivationOp::Tanh, "Tanh"),
+        ] {
+            let pattern = KernelPattern::Activation {
+                op,
+                input: make_tensor("x", TensorRole::Input),
+                output: make_tensor("y", TensorRole::Output),
+                dim_name: "N".into(),
+            };
+            let model = build_model(&pattern, "test");
+            let graph = model.graph.as_ref().unwrap();
+            assert_eq!(graph.node[0].op_type, expected);
+        }
+    }
+
+    #[test]
+    fn reduce_model_structure() {
+        let pattern = KernelPattern::Reduce {
+            op: ReduceOp::Sum,
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            axis: 1,
+        };
+        let model = build_model(&pattern, "reduce");
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node[0].op_type, "ReduceSum");
+    }
+
+    #[test]
+    fn transpose_model_structure() {
+        let pattern = KernelPattern::Transpose {
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            perm: vec![1, 0],
+        };
+        let model = build_model(&pattern, "transpose");
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node[0].op_type, "Transpose");
+    }
+
+    #[test]
+    fn normalization_model_structure() {
+        let pattern = KernelPattern::Normalization {
+            input: make_tensor("x", TensorRole::Input),
+            scale: make_tensor("gamma", TensorRole::Input),
+            bias: make_tensor("beta", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            epsilon: 1e-5,
+        };
+        let model = build_model(&pattern, "batchnorm");
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node[0].op_type, "BatchNormalization");
     }
 }

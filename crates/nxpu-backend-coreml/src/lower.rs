@@ -3,7 +3,9 @@
 //! Builds a CoreML ML Program model with MIL operations targeting
 //! Apple Neural Engine (FP16 precision).
 
-use nxpu_backend_onnx::analyze::{ElementWiseOp, KernelPattern, TensorBinding};
+use nxpu_backend_onnx::analyze::{
+    ActivationOp, ElementWiseOp, KernelPattern, PoolKind, ReduceOp, TensorBinding,
+};
 use nxpu_backend_onnx::proto::data_type;
 
 use crate::proto::*;
@@ -19,6 +21,57 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
         KernelPattern::ElementWise {
             op, inputs, output, ..
         } => build_elementwise(*op, &inputs[0], &inputs[1], output),
+        KernelPattern::Conv2D {
+            input,
+            weight,
+            output,
+            ..
+        } => build_binary_op("conv", input, weight, output),
+        KernelPattern::Pool {
+            kind,
+            input,
+            output,
+            ..
+        } => {
+            let mil_op = match kind {
+                PoolKind::Max => "max_pool",
+                PoolKind::Avg => "avg_pool",
+            };
+            build_unary_op(mil_op, input, output)
+        }
+        KernelPattern::Activation {
+            op, input, output, ..
+        } => {
+            let mil_op = match op {
+                ActivationOp::Relu => "relu",
+                ActivationOp::Sigmoid => "sigmoid",
+                ActivationOp::Tanh => "tanh",
+                ActivationOp::Softmax => "softmax",
+            };
+            build_unary_op(mil_op, input, output)
+        }
+        KernelPattern::Reduce {
+            op, input, output, ..
+        } => {
+            let mil_op = match op {
+                ReduceOp::Sum => "reduce_sum",
+                ReduceOp::Mean => "reduce_mean",
+                ReduceOp::Max => "reduce_max",
+                ReduceOp::Min => "reduce_min",
+            };
+            build_unary_op(mil_op, input, output)
+        }
+        KernelPattern::Transpose { input, output, .. } => {
+            build_unary_op("transpose", input, output)
+        }
+        KernelPattern::Reshape { input, output, .. } => build_unary_op("reshape", input, output),
+        KernelPattern::Normalization {
+            input,
+            scale,
+            bias,
+            output,
+            ..
+        } => build_normalization(input, scale, bias, output),
     };
 
     let feature_inputs: Vec<FeatureDescription> = inputs
@@ -139,10 +192,91 @@ fn build_elementwise<'a>(
     (vec![a, b], vec![c], vec![op])
 }
 
+fn build_unary_op<'a>(
+    mil_op: &str,
+    input: &'a TensorBinding,
+    output: &'a TensorBinding,
+) -> (
+    Vec<&'a TensorBinding>,
+    Vec<&'a TensorBinding>,
+    Vec<MlOperation>,
+) {
+    let op = MlOperation {
+        r#type: mil_op.into(),
+        name: format!("{mil_op}_0"),
+        inputs: vec![MlOperand {
+            name: input.name.clone(),
+        }],
+        outputs: vec![MlOperand {
+            name: output.name.clone(),
+        }],
+    };
+    (vec![input], vec![output], vec![op])
+}
+
+fn build_binary_op<'a>(
+    mil_op: &str,
+    a: &'a TensorBinding,
+    b: &'a TensorBinding,
+    c: &'a TensorBinding,
+) -> (
+    Vec<&'a TensorBinding>,
+    Vec<&'a TensorBinding>,
+    Vec<MlOperation>,
+) {
+    let op = MlOperation {
+        r#type: mil_op.into(),
+        name: format!("{mil_op}_0"),
+        inputs: vec![
+            MlOperand {
+                name: a.name.clone(),
+            },
+            MlOperand {
+                name: b.name.clone(),
+            },
+        ],
+        outputs: vec![MlOperand {
+            name: c.name.clone(),
+        }],
+    };
+    (vec![a, b], vec![c], vec![op])
+}
+
+fn build_normalization<'a>(
+    input: &'a TensorBinding,
+    scale: &'a TensorBinding,
+    bias: &'a TensorBinding,
+    output: &'a TensorBinding,
+) -> (
+    Vec<&'a TensorBinding>,
+    Vec<&'a TensorBinding>,
+    Vec<MlOperation>,
+) {
+    let op = MlOperation {
+        r#type: "batch_norm".into(),
+        name: "batch_norm_0".into(),
+        inputs: vec![
+            MlOperand {
+                name: input.name.clone(),
+            },
+            MlOperand {
+                name: scale.name.clone(),
+            },
+            MlOperand {
+                name: bias.name.clone(),
+            },
+        ],
+        outputs: vec![MlOperand {
+            name: output.name.clone(),
+        }],
+    };
+    (vec![input, scale, bias], vec![output], vec![op])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nxpu_backend_onnx::analyze::{MatMulShape, TensorRole};
+    use nxpu_backend_onnx::analyze::{ActivationOp, MatMulShape, PoolKind, PoolShape, TensorRole};
 
     fn dummy_handle() -> nxpu_ir::Handle<nxpu_ir::GlobalVariable> {
         let mut arena = nxpu_ir::Arena::new();
@@ -215,5 +349,42 @@ mod tests {
         };
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations[0].r#type, "add");
+    }
+
+    #[test]
+    fn activation_relu_model() {
+        let pattern = KernelPattern::Activation {
+            op: ActivationOp::Relu,
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let model = build_model(&pattern, "relu");
+        let prog = match model.r#type.as_ref().unwrap() {
+            model::Type::MlProgram(p) => p,
+        };
+        let block = prog.functions[0].block.as_ref().unwrap();
+        assert_eq!(block.operations[0].r#type, "relu");
+    }
+
+    #[test]
+    fn pool_max_model() {
+        let pattern = KernelPattern::Pool {
+            kind: PoolKind::Max,
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            shape: PoolShape {
+                kernel_h: 2,
+                kernel_w: 2,
+                stride_h: 2,
+                stride_w: 2,
+            },
+        };
+        let model = build_model(&pattern, "maxpool");
+        let prog = match model.r#type.as_ref().unwrap() {
+            model::Type::MlProgram(p) => p,
+        };
+        let block = prog.functions[0].block.as_ref().unwrap();
+        assert_eq!(block.operations[0].r#type, "max_pool");
     }
 }
