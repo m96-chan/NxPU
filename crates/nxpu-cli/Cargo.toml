@@ -23,6 +23,7 @@ nxpu-backend-mediatek = { path = "../nxpu-backend-mediatek" }
 nxpu-backend-intel = { path = "../nxpu-backend-intel" }
 nxpu-backend-amd = { path = "../nxpu-backend-amd" }
 nxpu-backend-qualcomm = { path = "../nxpu-backend-qualcomm" }
+nxpu-backend-arm-ethos = { path = "../nxpu-backend-arm-ethos" }
 clap = { version = "4", features = ["derive"] }
 miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
