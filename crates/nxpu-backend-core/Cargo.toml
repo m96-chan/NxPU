@@ -9,3 +9,6 @@ repository.workspace = true
 [dependencies]
 nxpu-ir = { path = "../nxpu-ir" }
 thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -10,3 +10,6 @@ repository.workspace = true
 nxpu-ir = { path = "../nxpu-ir" }
 nxpu-backend-core = { path = "../nxpu-backend-core" }
 thiserror.workspace = true
+
+[lints]
+workspace = true

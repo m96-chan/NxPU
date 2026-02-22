@@ -76,7 +76,7 @@ fn run_on_function(func: &mut Function) -> bool {
 /// Skips fusion if the multiply expression is referenced more than once,
 /// since replacing it would change semantics for other users.
 fn try_fuse_fma(
-    exprs: &nxpu_ir::Arena<Expression>,
+    exprs: &Arena<Expression>,
     left: Handle<Expression>,
     right: Handle<Expression>,
     ref_counts: &HashMap<Handle<Expression>, usize>,

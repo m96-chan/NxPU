@@ -10,3 +10,6 @@ repository.workspace = true
 naga.workspace = true
 nxpu-ir = { path = "../nxpu-ir" }
 thiserror.workspace = true
+
+[lints]
+workspace = true

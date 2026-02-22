@@ -484,7 +484,7 @@ mod tests {
 
         let err = graph.topological_order().unwrap_err();
         assert!(
-            matches!(err, crate::IrError::CycleDetected { .. }),
+            matches!(err, IrError::CycleDetected { .. }),
             "expected CycleDetected, got {err:?}"
         );
     }
@@ -498,7 +498,7 @@ mod tests {
             .add_node(GraphOp::Relu, vec![fake_edge], vec![out], "bad")
             .unwrap_err();
         assert!(
-            matches!(err, crate::IrError::UnknownEdge { .. }),
+            matches!(err, IrError::UnknownEdge { .. }),
             "expected UnknownEdge, got {err:?}"
         );
     }
@@ -517,7 +517,7 @@ mod tests {
             .add_node(GraphOp::Relu, vec![c], vec![b], "second")
             .unwrap_err();
         assert!(
-            matches!(err, crate::IrError::DuplicateEdgeProducer { .. }),
+            matches!(err, IrError::DuplicateEdgeProducer { .. }),
             "expected DuplicateEdgeProducer, got {err:?}"
         );
     }

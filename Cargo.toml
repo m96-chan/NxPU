@@ -34,6 +34,46 @@ keywords = ["wgsl", "npu", "transpiler", "machine-learning", "compiler"]
 categories = ["compilers", "hardware-support"]
 rust-version = "1.87"
 
+[workspace.lints.rust]
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Allow noisy pedantic sublints
+assigning_clones = "allow"
+bool_to_int_with_if = "allow"
+cast_lossless = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+doc_markdown = "allow"
+explicit_iter_loop = "allow"
+float_cmp = "allow"
+format_push_string = "allow"
+manual_let_else = "allow"
+map_unwrap_or = "allow"
+many_single_char_names = "allow"
+match_same_arms = "allow"
+match_wildcard_for_single_variants = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+needless_raw_string_hashes = "allow"
+redundant_closure_for_method_calls = "allow"
+return_self_not_must_use = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+trivially_copy_pass_by_ref = "allow"
+uninlined_format_args = "allow"
+unnecessary_literal_bound = "allow"
+unnecessary_wraps = "allow"
+unreadable_literal = "allow"
+unused_self = "allow"
+used_underscore_binding = "allow"
+wildcard_imports = "allow"
+
 [workspace.dependencies]
 thiserror = "2"
 prost = "0.13"

@@ -13,3 +13,6 @@ nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }
 
 [dev-dependencies]
 nxpu-parser = { path = "../nxpu-parser" }
+
+[lints]
+workspace = true

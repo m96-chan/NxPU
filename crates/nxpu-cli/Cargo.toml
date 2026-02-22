@@ -52,3 +52,6 @@ log.workspace = true
 env_logger.workspace = true
 miette = { workspace = true, features = ["fancy"] }
 thiserror.workspace = true
+
+[lints]
+workspace = true

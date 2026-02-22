@@ -13,3 +13,6 @@ nxpu-backend-tflite = { path = "../nxpu-backend-tflite" }
 
 [dev-dependencies]
 nxpu-parser = { path = "../nxpu-parser" }
+
+[lints]
+workspace = true

@@ -379,7 +379,7 @@ mod tests {
         assert!(!changed);
     }
 
-    fn dummy_type_handle() -> nxpu_ir::Handle<nxpu_ir::Type> {
+    fn dummy_type_handle() -> Handle<nxpu_ir::Type> {
         let mut types = nxpu_ir::UniqueArena::new();
         types.insert(nxpu_ir::Type {
             name: None,
@@ -387,8 +387,8 @@ mod tests {
         })
     }
 
-    fn dummy_gv_handle() -> nxpu_ir::Handle<nxpu_ir::GlobalVariable> {
-        let mut arena = nxpu_ir::Arena::new();
+    fn dummy_gv_handle() -> Handle<nxpu_ir::GlobalVariable> {
+        let mut arena = Arena::new();
         arena.append(nxpu_ir::GlobalVariable {
             name: None,
             space: nxpu_ir::AddressSpace::Storage {
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn removes_dead_store_to_unread_local() {
         let mut func = Function::new("test");
-        let lv = func.local_variables.append(nxpu_ir::LocalVariable {
+        let lv = func.local_variables.append(LocalVariable {
             name: Some("temp".into()),
             ty: dummy_type_handle(),
             init: None,
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn keeps_store_to_read_local() {
         let mut func = Function::new("test");
-        let lv = func.local_variables.append(nxpu_ir::LocalVariable {
+        let lv = func.local_variables.append(LocalVariable {
             name: Some("temp".into()),
             ty: dummy_type_handle(),
             init: None,
@@ -491,12 +491,12 @@ mod tests {
     fn removes_unreferenced_local() {
         let mut func = Function::new("test");
         // Add two locals; only reference one in expressions.
-        let _lv_unused = func.local_variables.append(nxpu_ir::LocalVariable {
+        let _lv_unused = func.local_variables.append(LocalVariable {
             name: Some("unused".into()),
             ty: dummy_type_handle(),
             init: None,
         });
-        let lv_used = func.local_variables.append(nxpu_ir::LocalVariable {
+        let lv_used = func.local_variables.append(LocalVariable {
             name: Some("used".into()),
             ty: dummy_type_handle(),
             init: None,
@@ -513,12 +513,12 @@ mod tests {
     #[test]
     fn keeps_all_referenced_locals() {
         let mut func = Function::new("test");
-        let lv_a = func.local_variables.append(nxpu_ir::LocalVariable {
+        let lv_a = func.local_variables.append(LocalVariable {
             name: Some("a".into()),
             ty: dummy_type_handle(),
             init: None,
         });
-        let lv_b = func.local_variables.append(nxpu_ir::LocalVariable {
+        let lv_b = func.local_variables.append(LocalVariable {
             name: Some("b".into()),
             ty: dummy_type_handle(),
             init: None,

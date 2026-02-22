@@ -388,8 +388,8 @@ pub fn classify_entry_point(
         .ok_or(AnalysisError::EntryPointOutOfRange(ep_index))?;
 
     // 1. Classify globals by address space.
-    let mut inputs: Vec<(Handle<GlobalVariable>, &nxpu_ir::GlobalVariable)> = Vec::new();
-    let mut outputs: Vec<(Handle<GlobalVariable>, &nxpu_ir::GlobalVariable)> = Vec::new();
+    let mut inputs: Vec<(Handle<GlobalVariable>, &GlobalVariable)> = Vec::new();
+    let mut outputs: Vec<(Handle<GlobalVariable>, &GlobalVariable)> = Vec::new();
     let mut params_members: Option<&[nxpu_ir::StructMember]> = None;
 
     for (handle, gv) in module.global_variables.iter() {
@@ -639,7 +639,7 @@ fn extract_conv2d_shape(shape_names: &[String]) -> Conv2DShape {
 fn make_binding(
     module: &Module,
     handle: Handle<GlobalVariable>,
-    gv: &nxpu_ir::GlobalVariable,
+    gv: &GlobalVariable,
     role: TensorRole,
 ) -> TensorBinding {
     let elem_type = resolve_array_elem_type(module, gv.ty).unwrap_or(data_type::FLOAT);
@@ -655,7 +655,7 @@ fn make_binding(
 }
 
 /// Resolve an array or tensor type to its element's ONNX data type.
-fn resolve_array_elem_type(module: &Module, ty: nxpu_ir::Handle<nxpu_ir::Type>) -> Option<i32> {
+fn resolve_array_elem_type(module: &Module, ty: Handle<nxpu_ir::Type>) -> Option<i32> {
     match &module.types[ty].inner {
         TypeInner::Array { base, .. } => match &module.types[*base].inner {
             TypeInner::Scalar(s) => Some(scalar_to_onnx_data_type(s)),
@@ -1557,7 +1557,7 @@ mod tests {
             },
             Statement::Break,
         ];
-        let result = super::detect_reduce_op(&body, &func.expressions);
+        let result = detect_reduce_op(&body, &func.expressions);
         assert_eq!(result, ReduceOp::Mean);
     }
 

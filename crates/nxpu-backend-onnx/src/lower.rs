@@ -103,7 +103,7 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<ModelProto,
 ///
 /// Handles single patterns, Conv+BatchNorm fusion, and activation fusion.
 pub fn build_fused_model(
-    fp: &nxpu_analysis::fusion::FusedPattern,
+    fp: &FusedPattern,
     ep_name: &str,
 ) -> Result<ModelProto, BackendError> {
     match fp {

@@ -94,7 +94,7 @@ fn extract_param_names(module: &Module) -> Vec<String> {
 /// Infer shape for a single storage global variable.
 fn infer_global_shape(
     module: &Module,
-    gv: &nxpu_ir::GlobalVariable,
+    gv: &GlobalVariable,
     param_names: &[String],
     access: StorageAccess,
 ) -> Shape {

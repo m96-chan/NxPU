@@ -18,7 +18,7 @@ fn run_onnx_1d(wgsl_source: &str, inputs: Vec<Vec<f32>>) -> Vec<f32> {
         _ => panic!("expected binary ONNX output"),
     };
 
-    let model = tract_onnx::onnx()
+    let model = onnx()
         .model_for_read(&mut std::io::Cursor::new(bytes))
         .expect("failed to load ONNX model in tract");
 
@@ -70,7 +70,7 @@ fn run_onnx_matmul(wgsl_source: &str, a: Array2<f32>, b: Array2<f32>) -> Array2<
         _ => panic!("expected binary ONNX output"),
     };
 
-    let model = tract_onnx::onnx()
+    let model = onnx()
         .model_for_read(&mut std::io::Cursor::new(bytes))
         .expect("failed to load ONNX model in tract");
 

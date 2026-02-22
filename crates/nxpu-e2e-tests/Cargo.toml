@@ -28,3 +28,6 @@ nxpu-backend-rockchip = { path = "../nxpu-backend-rockchip" }
 prost.workspace = true
 tract-onnx.workspace = true
 ndarray.workspace = true
+
+[lints]
+workspace = true

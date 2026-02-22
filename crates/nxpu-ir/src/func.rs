@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn function_with_local_vars() {
         let mut types = crate::arena::UniqueArena::new();
-        let f32_ty = types.insert(crate::types::Type {
+        let f32_ty = types.insert(Type {
             name: None,
             inner: TypeInner::Scalar(Scalar::F32),
         });
