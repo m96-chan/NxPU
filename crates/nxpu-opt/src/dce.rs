@@ -275,7 +275,12 @@ fn remove_dead_locals(func: &mut Function) -> bool {
     }
 
     let old_len = func.local_variables.len();
-    if referenced.len() == old_len {
+    // Check if every local variable in the arena is referenced.
+    let all_referenced = func
+        .local_variables
+        .iter()
+        .all(|(h, _)| referenced.contains(&h));
+    if all_referenced {
         return false;
     }
 

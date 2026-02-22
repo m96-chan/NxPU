@@ -42,3 +42,5 @@ env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
 miette = { version = "7", features = ["fancy"] }
 naga = { version = "28", features = ["wgsl-in"] }
+tract-onnx = "0.21"
+ndarray = "0.16"

@@ -21,7 +21,7 @@ pub use quantize::{
     QuantizationParams,
 };
 pub use shape::ShapeInference;
-pub use validation::IrValidation;
+pub use validation::{IrValidation, ValidationWarning, collect_warnings};
 
 use std::fmt::Debug;
 
@@ -52,6 +52,9 @@ const MAX_ITERATIONS: usize = 10;
 
 /// Runs passes in sequence with fixed-point iteration.
 pub struct PassManager {
+    /// Passes run once before the fixed-point loop (e.g. validation).
+    pre_passes: Vec<Box<dyn Pass>>,
+    /// Passes run in the fixed-point loop.
     passes: Vec<Box<dyn Pass>>,
 }
 
@@ -64,7 +67,10 @@ impl Default for PassManager {
 impl PassManager {
     /// Creates an empty pass manager with no passes.
     pub fn new() -> Self {
-        Self { passes: Vec::new() }
+        Self {
+            pre_passes: Vec::new(),
+            passes: Vec::new(),
+        }
     }
 
     /// Creates a pass manager with passes appropriate for the given level.
@@ -73,7 +79,7 @@ impl PassManager {
         match level {
             OptLevel::O0 => {}
             OptLevel::O1 | OptLevel::O2 => {
-                pm.add_pass(Box::new(IrValidation));
+                pm.add_pre_pass(Box::new(IrValidation));
                 pm.add_pass(Box::new(ConstantFolding));
                 pm.add_pass(Box::new(FmaFusion));
                 pm.add_pass(Box::new(DeadCodeElimination));
@@ -82,13 +88,24 @@ impl PassManager {
         pm
     }
 
-    /// Adds a pass to the pipeline.
+    /// Adds a pass to run once before the fixed-point loop.
+    pub fn add_pre_pass(&mut self, pass: Box<dyn Pass>) {
+        self.pre_passes.push(pass);
+    }
+
+    /// Adds a pass to the fixed-point pipeline.
     pub fn add_pass(&mut self, pass: Box<dyn Pass>) {
         self.passes.push(pass);
     }
 
-    /// Runs all passes until a fixed point is reached or the iteration limit.
+    /// Runs pre-passes once, then iterates the main passes until a fixed point
+    /// is reached or the iteration limit.
     pub fn run(&self, module: &mut Module) {
+        for pass in &self.pre_passes {
+            pass.run(module);
+            log::debug!("pre-pass '{}' completed", pass.name());
+        }
+
         for iteration in 0..MAX_ITERATIONS {
             let mut changed = false;
             for pass in &self.passes {

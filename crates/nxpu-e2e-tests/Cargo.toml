@@ -26,5 +26,5 @@ nxpu-backend-arm-ethos = { path = "../nxpu-backend-arm-ethos" }
 nxpu-backend-ceva = { path = "../nxpu-backend-ceva" }
 nxpu-backend-rockchip = { path = "../nxpu-backend-rockchip" }
 prost.workspace = true
-tract-onnx = "0.21"
-ndarray = "0.16"
+tract-onnx.workspace = true
+ndarray.workspace = true

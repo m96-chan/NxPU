@@ -75,7 +75,9 @@ impl Backend for OnnxBackend {
             let summary = match fp {
                 fusion::FusedPattern::Single(p) => pattern_summary(p).to_string(),
                 fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm (fused)".into(),
-                fusion::FusedPattern::WithActivation { base, activation } => {
+                fusion::FusedPattern::WithActivation {
+                    base, activation, ..
+                } => {
                     let base_name = match base.as_ref() {
                         fusion::FusedPattern::Single(p) => pattern_summary(p),
                         fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",

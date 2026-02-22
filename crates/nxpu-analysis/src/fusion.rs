@@ -80,6 +80,8 @@ pub enum FusedPattern {
     WithActivation {
         base: Box<FusedPattern>,
         activation: FusedActivation,
+        /// The original activation pattern (preserved for tensor connectivity).
+        activation_pattern: Box<KernelPattern>,
     },
 }
 
@@ -100,7 +102,9 @@ impl FusedPattern {
         match self {
             FusedPattern::Single(p) => p,
             FusedPattern::ConvBatchNorm { norm, .. } => norm,
-            FusedPattern::WithActivation { base, .. } => base.output_pattern(),
+            FusedPattern::WithActivation {
+                activation_pattern, ..
+            } => activation_pattern,
         }
     }
 
@@ -159,10 +163,11 @@ pub fn fuse_patterns(patterns: Vec<KernelPattern>) -> Vec<(FusedPattern, usize)>
                 }
             ) && tensors_connect(fused.output_pattern(), next)
             {
-                let _ = iter.next();
+                let (_, act_pattern) = iter.next().unwrap();
                 FusedPattern::WithActivation {
                     base: Box::new(fused),
                     activation: FusedActivation::Relu,
+                    activation_pattern: Box::new(act_pattern),
                 }
             } else {
                 fused
@@ -347,6 +352,7 @@ mod tests {
             FusedPattern::WithActivation {
                 base,
                 activation: FusedActivation::Relu,
+                ..
             } => {
                 assert!(matches!(**base, FusedPattern::ConvBatchNorm { .. }));
             }

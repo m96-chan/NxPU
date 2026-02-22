@@ -1,11 +1,25 @@
 //! IR validation pass.
 //!
-//! Checks structural invariants of the IR module and logs warnings for
-//! problems found. This pass never modifies the module.
+//! Checks structural invariants of the IR module and collects warnings.
+//! This pass never modifies the module.
+
+use std::fmt;
 
 use nxpu_ir::{Expression, Module};
 
 use crate::Pass;
+
+/// A validation warning describing a structural issue in the IR.
+#[derive(Debug, Clone)]
+pub struct ValidationWarning {
+    pub message: String,
+}
+
+impl fmt::Display for ValidationWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 /// Validates IR structural invariants. Returns `false` (never modifies the module).
 #[derive(Debug)]
@@ -17,25 +31,37 @@ impl Pass for IrValidation {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        validate_module(module);
+        for w in collect_warnings(module) {
+            log::warn!("{}", w.message);
+        }
         false
     }
 }
 
-fn validate_module(module: &Module) {
+/// Collect all validation warnings for a module without logging.
+///
+/// This is the primary validation API — usable in tests and debug builds
+/// without needing a logger configured.
+pub fn collect_warnings(module: &Module) -> Vec<ValidationWarning> {
+    let mut warnings = Vec::new();
+    let type_count = module.types.len();
+
     // Validate expression operand bounds in global expressions.
-    validate_expression_arena(&module.global_expressions, "global_expressions");
+    validate_expression_arena(
+        &module.global_expressions,
+        "global_expressions",
+        &mut warnings,
+    );
 
     // Validate global variable type handles.
-    let type_count = module.types.len();
     for (handle, gv) in module.global_variables.iter() {
         if gv.ty.index() >= type_count {
-            log::warn!(
-                "global variable {:?} (handle {:?}) references out-of-bounds type handle {:?}",
-                gv.name,
-                handle,
-                gv.ty
-            );
+            warnings.push(ValidationWarning {
+                message: format!(
+                    "global variable {:?} (handle {:?}) references out-of-bounds type handle {:?}",
+                    gv.name, handle, gv.ty
+                ),
+            });
         }
     }
 
@@ -44,41 +70,87 @@ fn validate_module(module: &Module) {
         // Workgroup sizes must be > 0.
         for (i, &size) in ep.workgroup_size.iter().enumerate() {
             if size == 0 {
-                log::warn!("entry point '{}' has workgroup_size[{}] = 0", ep.name, i);
+                warnings.push(ValidationWarning {
+                    message: format!("entry point '{}' has workgroup_size[{}] = 0", ep.name, i),
+                });
             }
         }
 
-        validate_expression_arena(&ep.function.expressions, &format!("ep '{}'", ep.name));
+        validate_expression_arena(
+            &ep.function.expressions,
+            &format!("ep '{}'", ep.name),
+            &mut warnings,
+        );
+
+        // Validate local variable type handles.
+        validate_local_and_arg_types(
+            &ep.function,
+            type_count,
+            &format!("ep '{}'", ep.name),
+            &mut warnings,
+        );
     }
 
     // Validate helper functions.
     for (handle, func) in module.functions.iter() {
-        validate_expression_arena(
-            &func.expressions,
-            &format!(
-                "function '{}' ({:?})",
-                func.name.as_deref().unwrap_or("<unnamed>"),
-                handle
-            ),
+        let ctx = format!(
+            "function '{}' ({:?})",
+            func.name.as_deref().unwrap_or("<unnamed>"),
+            handle
         );
+        validate_expression_arena(&func.expressions, &ctx, &mut warnings);
+        validate_local_and_arg_types(func, type_count, &ctx, &mut warnings);
     }
+
+    warnings
 }
 
-fn validate_expression_arena(arena: &nxpu_ir::Arena<Expression>, context: &str) {
+fn validate_expression_arena(
+    arena: &nxpu_ir::Arena<Expression>,
+    context: &str,
+    warnings: &mut Vec<ValidationWarning>,
+) {
     let arena_len = arena.len();
 
     for (handle, expr) in arena.iter() {
         let operands = crate::dce::expression_operands(expr);
         for operand in operands {
             if operand.index() >= arena_len {
-                log::warn!(
-                    "{}: expression {:?} references out-of-bounds operand {:?} (arena size {})",
-                    context,
-                    handle,
-                    operand,
-                    arena_len,
-                );
+                warnings.push(ValidationWarning {
+                    message: format!(
+                        "{}: expression {:?} references out-of-bounds operand {:?} (arena size {})",
+                        context, handle, operand, arena_len,
+                    ),
+                });
             }
+        }
+    }
+}
+
+fn validate_local_and_arg_types(
+    func: &nxpu_ir::Function,
+    type_count: usize,
+    context: &str,
+    warnings: &mut Vec<ValidationWarning>,
+) {
+    for (lv_handle, local) in func.local_variables.iter() {
+        if local.ty.index() >= type_count {
+            warnings.push(ValidationWarning {
+                message: format!(
+                    "{}: local variable {:?} ({:?}) references out-of-bounds type {:?}",
+                    context, local.name, lv_handle, local.ty
+                ),
+            });
+        }
+    }
+    for (i, arg) in func.arguments.iter().enumerate() {
+        if arg.ty.index() >= type_count {
+            warnings.push(ValidationWarning {
+                message: format!(
+                    "{}: argument {} ({:?}) references out-of-bounds type {:?}",
+                    context, i, arg.name, arg.ty
+                ),
+            });
         }
     }
 }
@@ -89,7 +161,7 @@ mod tests {
     use nxpu_ir::{EntryPoint, Function, Literal};
 
     #[test]
-    fn valid_module_passes() {
+    fn valid_module_no_warnings() {
         let mut module = Module::default();
         module.entry_points.push(EntryPoint {
             name: "main".into(),
@@ -97,16 +169,12 @@ mod tests {
             function: Function::new("main"),
         });
 
-        let pass = IrValidation;
-        let changed = pass.run(&mut module);
-        assert!(!changed);
+        let warnings = collect_warnings(&module);
+        assert!(warnings.is_empty());
     }
 
     #[test]
-    fn zero_workgroup_size_warns() {
-        // This test verifies the pass runs without panicking on a zero
-        // workgroup size. The warning is emitted via log::warn! which
-        // is a no-op in tests unless a logger is configured.
+    fn zero_workgroup_size_detected() {
         let mut module = Module::default();
         module.entry_points.push(EntryPoint {
             name: "bad_ep".into(),
@@ -114,13 +182,17 @@ mod tests {
             function: Function::new("bad_ep"),
         });
 
-        let pass = IrValidation;
-        let changed = pass.run(&mut module);
-        assert!(!changed);
+        let warnings = collect_warnings(&module);
+        assert!(!warnings.is_empty());
+        assert!(
+            warnings[0].message.contains("workgroup_size[0] = 0"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
     }
 
     #[test]
-    fn valid_expressions_ok() {
+    fn valid_expressions_no_warnings() {
         let mut module = Module::default();
         let mut func = Function::new("main");
         let _lit = func
@@ -132,8 +204,14 @@ mod tests {
             function: func,
         });
 
+        let warnings = collect_warnings(&module);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn pass_returns_false() {
+        let mut module = Module::default();
         let pass = IrValidation;
-        let changed = pass.run(&mut module);
-        assert!(!changed);
+        assert!(!pass.run(&mut module));
     }
 }

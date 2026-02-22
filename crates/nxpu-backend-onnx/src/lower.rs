@@ -232,7 +232,9 @@ pub fn build_fused_model(
                 }],
             })
         }
-        FusedPattern::WithActivation { base, activation } => {
+        FusedPattern::WithActivation {
+            base, activation, ..
+        } => {
             let mut model = build_fused_model(base, ep_name)?;
             if let (Some(graph), FusedActivation::Relu) = (model.graph.as_mut(), activation) {
                 // Rename the last output to an intermediate and add a Relu node.

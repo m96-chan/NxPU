@@ -55,8 +55,11 @@ fn syntax_error_gives_useful_message() {
     let result = nxpu_parser::parse("fn main( {}");
     assert!(result.is_err());
     let err_msg = format!("{}", result.unwrap_err());
-    // Should contain some indication of what went wrong.
-    assert!(!err_msg.is_empty());
+    // Should contain a keyword indicating a parse error, not just be empty.
+    assert!(
+        err_msg.contains("expected") || err_msg.contains("error") || err_msg.contains("parse"),
+        "error message should be descriptive, got: {err_msg}"
+    );
 }
 
 use nxpu_backend_core::Backend;

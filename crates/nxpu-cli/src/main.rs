@@ -97,7 +97,7 @@ fn build_registry() -> BackendRegistry {
 }
 
 fn run() -> miette::Result<()> {
-    env_logger::init();
+    env_logger::try_init().ok();
 
     let cli = Cli::parse();
 

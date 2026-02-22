@@ -11,7 +11,7 @@
 If you discover a security vulnerability in NxPU, please report it responsibly:
 
 1. **Do not** open a public GitHub issue.
-2. Email your report to the maintainers via the contact information in the repository.
+2. Use [GitHub's private vulnerability reporting](https://github.com/m96-chan/NxPU/security/advisories/new) to submit your report.
 3. Include a clear description of the vulnerability, steps to reproduce, and potential impact.
 4. Allow reasonable time for a fix before public disclosure.
 
