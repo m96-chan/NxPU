@@ -3,11 +3,11 @@
 //! Emits CoreML ML Program (`.mlmodel`) protobuf from NxPU IR.
 //! The Apple Neural Engine operates at FP16 precision.
 
+use nxpu_analysis::analyze;
 use nxpu_backend_core::{
     Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
     OutputContent, OutputFile, Precision,
 };
-use nxpu_backend_onnx::analyze;
 use nxpu_ir::Module;
 use prost::Message;
 

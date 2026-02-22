@@ -3,11 +3,11 @@
 //! Emits StableHLO MLIR textual format (`.mlir`) from NxPU IR.
 //! StableHLO is the native entry point for Google Cloud TPU via OpenXLA.
 
+use nxpu_analysis::analyze;
 use nxpu_backend_core::{
     Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
     OutputContent, OutputFile,
 };
-use nxpu_backend_onnx::analyze;
 use nxpu_ir::Module;
 
 mod lower;

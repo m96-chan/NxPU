@@ -219,6 +219,11 @@ pub enum Expression {
     CallResult(Handle<crate::Function>),
     /// The result of an atomic operation (paired with an `Atomic` statement).
     AtomicResult { ty: Handle<Type>, comparison: bool },
+    /// A zero-initialized value of the given type.
+    ///
+    /// Used for vector, matrix, struct, and array zero-initialization where a
+    /// simple scalar literal would be type-incorrect.
+    ZeroValue(Handle<Type>),
 }
 
 #[cfg(test)]

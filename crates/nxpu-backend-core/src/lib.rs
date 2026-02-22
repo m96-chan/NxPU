@@ -55,11 +55,23 @@ pub trait Backend: Debug + Send + Sync {
 }
 
 /// Options passed to a backend during compilation.
+///
+/// The `precision` field controls the target quantization precision.
+/// In the typical workflow, the caller (e.g. `nxpu-cli`) applies the
+/// appropriate quantization pass (`F32ToF16`, `F32ToBf16`, `F32ToInt8`,
+/// or `MixedPrecisionPass`) to the IR module *before* calling
+/// `Backend::compile`. The `precision` field is informational — backends
+/// can read it to emit diagnostics or choose format-specific options,
+/// but the IR has already been rewritten by the quantization pass.
 #[derive(Clone, Debug, Default)]
 pub struct BackendOptions {
     /// Optimization level (0 = none, 1 = basic, 2 = aggressive).
     pub opt_level: u8,
     /// Precision policy for quantization.
+    ///
+    /// The CLI applies the corresponding quantization pass to the IR before
+    /// compilation. Backends may use this to emit precision-related
+    /// diagnostics or metadata, but should not re-quantize the IR.
     pub precision: PrecisionPolicy,
 }
 

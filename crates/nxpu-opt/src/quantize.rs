@@ -108,17 +108,10 @@ impl CalibrationData {
 }
 
 /// Target precision for a single layer/variable in mixed-precision mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerPrecision {
-    /// Keep original F32 precision (sensitive layer).
-    F32,
-    /// Convert to F16.
-    F16,
-    /// Convert to BF16.
-    BF16,
-    /// Convert to INT8 (quantized).
-    Int8,
-}
+///
+/// This is an alias for [`nxpu_backend_core::Precision`] to avoid duplicating
+/// the enum definition across crates.
+pub type LayerPrecision = nxpu_backend_core::Precision;
 
 /// Policy for choosing per-layer precision in mixed-precision quantization.
 ///
@@ -265,7 +258,7 @@ fn rewrite_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
     for (old_handle, size, old_stride) in array_types {
         let numerator = old_stride as u64 * target_scalar.width as u64;
         let f32_width = Scalar::F32.width as u64;
-        debug_assert!(
+        assert!(
             numerator.is_multiple_of(f32_width),
             "stride {old_stride} not evenly divisible when converting to {:?}",
             target_scalar,
@@ -413,7 +406,7 @@ impl Pass for MixedPrecisionPass {
                     });
                     let numerator = stride as u64 * target_scalar.width as u64;
                     let f32_width = Scalar::F32.width as u64;
-                    debug_assert!(
+                    assert!(
                         numerator.is_multiple_of(f32_width),
                         "stride {stride} not evenly divisible when converting to {:?}",
                         target_scalar,

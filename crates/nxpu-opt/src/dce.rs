@@ -178,7 +178,8 @@ fn expression_operands(expr: &Expression) -> Vec<Handle<Expression>> {
         | Expression::GlobalVariable(_)
         | Expression::LocalVariable(_)
         | Expression::CallResult(_)
-        | Expression::AtomicResult { .. } => vec![],
+        | Expression::AtomicResult { .. }
+        | Expression::ZeroValue(_) => vec![],
 
         Expression::Load { pointer } => vec![*pointer],
         Expression::Unary { expr, .. } => vec![*expr],

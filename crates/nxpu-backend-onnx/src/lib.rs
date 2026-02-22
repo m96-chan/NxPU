@@ -90,7 +90,7 @@ impl Backend for OnnxBackend {
                 message: format!("entry point '{ep_name}': classified as {summary}"),
             });
 
-            let model = lower::build_fused_model(fp, ep_name);
+            let model = lower::build_fused_model(fp, ep_name)?;
             let bytes = model.encode_to_vec();
 
             let filename = if fused.len() == 1 {

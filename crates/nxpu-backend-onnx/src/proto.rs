@@ -10,10 +10,11 @@ pub mod data_type {
     pub const FLOAT: i32 = 1;
     pub const UINT8: i32 = 2;
     pub const INT8: i32 = 3;
-    pub const FLOAT16: i32 = 10;
     pub const INT32: i32 = 6;
-    pub const UINT32: i32 = 12;
+    pub const INT64: i32 = 7;
     pub const BOOL: i32 = 9;
+    pub const FLOAT16: i32 = 10;
+    pub const UINT32: i32 = 12;
     pub const BFLOAT16: i32 = 16;
 }
 
@@ -48,10 +49,27 @@ pub struct GraphProto {
     pub node: Vec<NodeProto>,
     #[prost(string, tag = "2")]
     pub name: String,
+    #[prost(message, repeated, tag = "5")]
+    pub initializer: Vec<TensorProto>,
     #[prost(message, repeated, tag = "11")]
     pub input: Vec<ValueInfoProto>,
     #[prost(message, repeated, tag = "12")]
     pub output: Vec<ValueInfoProto>,
+}
+
+/// A tensor value (for initializers / constant data).
+#[derive(Clone, PartialEq, Message)]
+pub struct TensorProto {
+    #[prost(int64, repeated, tag = "1")]
+    pub dims: Vec<i64>,
+    #[prost(int32, tag = "2")]
+    pub data_type: i32,
+    #[prost(string, tag = "8")]
+    pub name: String,
+    #[prost(float, repeated, tag = "4")]
+    pub float_data: Vec<f32>,
+    #[prost(int64, repeated, tag = "7")]
+    pub int64_data: Vec<i64>,
 }
 
 /// A single operator invocation.
@@ -270,6 +288,7 @@ mod tests {
             producer_version: "0.1.0".into(),
             graph: Some(GraphProto {
                 name: "test".into(),
+                initializer: vec![],
                 node: vec![NodeProto::simple(
                     "MatMul",
                     "matmul_0",

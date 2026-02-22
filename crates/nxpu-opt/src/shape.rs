@@ -53,11 +53,10 @@ impl Pass for ShapeInference {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        let shape_map = infer_shapes(module);
-        // Shape inference is read-only; it populates a side-channel.
-        // Currently we annotate global variables by storing shape info.
-        // The pass returns true if shapes were discovered.
-        !shape_map.is_empty()
+        let _shape_map = infer_shapes(module);
+        // Shape inference is a pure analysis pass — it does not modify the IR.
+        // Consumers should call `infer_shapes()` directly to obtain the map.
+        false
     }
 }
 
@@ -361,7 +360,8 @@ mod tests {
         let mut module = make_simple_module();
         let pass = ShapeInference;
         let changed = pass.run(&mut module);
-        assert!(changed);
+        // Analysis pass never reports changes.
+        assert!(!changed);
     }
 
     #[test]

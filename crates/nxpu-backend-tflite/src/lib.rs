@@ -3,11 +3,11 @@
 //! Emits TFLite FlatBuffer (`.tflite`) models from NxPU IR.
 //! Targets: MediaTek APU (NeuroPilot), Google Edge TPU, Arm Ethos NPU (Vela).
 
+use nxpu_analysis::analyze;
 use nxpu_backend_core::{
     Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
     OutputContent, OutputFile,
 };
-use nxpu_backend_onnx::analyze;
 use nxpu_ir::Module;
 
 mod lower;

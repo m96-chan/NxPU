@@ -56,6 +56,10 @@ NxPU/
 │   ├── nxpu-parser/       # WGSL parser
 │   ├── nxpu-ir/           # Intermediate representation
 │   ├── nxpu-opt/          # IR optimization passes
+│   ├── nxpu-backend-core/ # Backend trait and plugin architecture
+│   ├── nxpu-analysis/     # Shared pattern analysis and fusion
+│   ├── nxpu-cli/          # Command-line interface
+│   ├── nxpu-e2e-tests/    # End-to-end tests
 │   └── nxpu-backend-*/    # NPU backend emitters
 ├── tests/                 # Integration tests
 ├── examples/              # WGSL samples
@@ -66,7 +70,7 @@ NxPU/
 
 ### Prerequisites
 
-- Rust 1.80+
+- Rust 1.85+
 - Cargo
 
 ### Build
