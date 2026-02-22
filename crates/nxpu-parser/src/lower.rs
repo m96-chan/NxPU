@@ -1168,4 +1168,442 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Should have at least one global variable (buf).
         assert!(!module.global_variables.is_empty());
     }
+
+    // ---- Nested structs ----
+
+    #[test]
+    fn lower_nested_struct() {
+        let source = "
+struct Inner {
+    x: f32,
+    y: f32,
+}
+
+struct Outer {
+    a: Inner,
+    b: f32,
+}
+
+@group(0) @binding(0) var<storage, read_write> data: Outer;
+
+@compute @workgroup_size(1)
+fn main() {
+    data.a.x = data.b;
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        // Find the Outer struct type and verify it has a member whose type is the Inner struct.
+        let mut found_outer = false;
+        for (_, ty) in module.types.iter() {
+            if ty.name.as_deref() == Some("Outer") {
+                found_outer = true;
+                if let nxpu_ir::TypeInner::Struct { ref members, .. } = ty.inner {
+                    assert_eq!(members.len(), 2);
+                    // First member ("a") should point to the Inner struct type.
+                    let inner_ty = &module.types[members[0].ty];
+                    assert_eq!(inner_ty.name.as_deref(), Some("Inner"));
+                    assert!(
+                        matches!(inner_ty.inner, nxpu_ir::TypeInner::Struct { .. }),
+                        "Inner should be a struct"
+                    );
+                } else {
+                    panic!("Outer should be a Struct");
+                }
+            }
+        }
+        assert!(found_outer, "Outer struct type not found");
+    }
+
+    // ---- Multiple entry points ----
+
+    #[test]
+    fn lower_multiple_entry_points() {
+        let source = "
+@group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+
+@compute @workgroup_size(64)
+fn kernel_a(@builtin(global_invocation_id) gid: vec3<u32>) {
+    buf[gid.x] = buf[gid.x] + 1.0;
+}
+
+@compute @workgroup_size(128)
+fn kernel_b(@builtin(global_invocation_id) gid: vec3<u32>) {
+    buf[gid.x] = buf[gid.x] * 2.0;
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        assert_eq!(module.entry_points.len(), 2);
+
+        let names: Vec<&str> = module.entry_points.iter().map(|ep| ep.name.as_str()).collect();
+        assert!(names.contains(&"kernel_a"));
+        assert!(names.contains(&"kernel_b"));
+
+        let ep_a = module.entry_points.iter().find(|ep| ep.name == "kernel_a").unwrap();
+        let ep_b = module.entry_points.iter().find(|ep| ep.name == "kernel_b").unwrap();
+        assert_eq!(ep_a.workgroup_size, [64, 1, 1]);
+        assert_eq!(ep_b.workgroup_size, [128, 1, 1]);
+    }
+
+    // ---- Complex expression lowering ----
+
+    #[test]
+    fn lower_binary_and_math_expressions() {
+        let source = "
+@group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let a = buf[i];
+    let b = buf[i + 1u];
+    buf[i] = clamp(a * b + 1.0, 0.0, 1.0);
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        // Verify the entry point function has expressions containing Binary and Math nodes.
+        let func = &module.entry_points[0].function;
+        let has_binary = func.expressions.iter().any(|(_, e)| {
+            matches!(e, nxpu_ir::Expression::Binary { .. })
+        });
+        let has_math = func.expressions.iter().any(|(_, e)| {
+            matches!(e, nxpu_ir::Expression::Math { fun: nxpu_ir::MathFunction::Clamp, .. })
+        });
+        assert!(has_binary, "expected Binary expressions");
+        assert!(has_math, "expected Math(Clamp) expression");
+    }
+
+    #[test]
+    fn lower_unary_negate() {
+        let source = "
+@group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    buf[gid.x] = -buf[gid.x];
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        let func = &module.entry_points[0].function;
+        let has_negate = func.expressions.iter().any(|(_, e)| {
+            matches!(e, nxpu_ir::Expression::Unary { op: nxpu_ir::UnaryOp::Negate, .. })
+        });
+        assert!(has_negate, "expected Unary(Negate) expression");
+    }
+
+    #[test]
+    fn lower_select_expression() {
+        let source = "
+@group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    buf[i] = select(0.0, 1.0, buf[i] > 0.5);
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        let func = &module.entry_points[0].function;
+        let has_select = func.expressions.iter().any(|(_, e)| {
+            matches!(e, nxpu_ir::Expression::Select { .. })
+        });
+        assert!(has_select, "expected Select expression");
+    }
+
+    #[test]
+    fn lower_if_statement() {
+        let source = "
+@group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if buf[i] > 0.0 {
+        buf[i] = 1.0;
+    } else {
+        buf[i] = 0.0;
+    }
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        let func = &module.entry_points[0].function;
+        let has_if = func.body.iter().any(|s| {
+            matches!(s, nxpu_ir::Statement::If { .. })
+        });
+        assert!(has_if, "expected If statement");
+    }
+
+    #[test]
+    fn lower_loop_statement() {
+        let source = "
+@group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    var i: u32 = 0u;
+    loop {
+        if i >= 10u { break; }
+        buf[i] = f32(i);
+        i = i + 1u;
+    }
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        let func = &module.entry_points[0].function;
+        let has_loop = func.body.iter().any(|s| {
+            matches!(s, nxpu_ir::Statement::Loop { .. })
+        });
+        assert!(has_loop, "expected Loop statement");
+    }
+
+    #[test]
+    fn lower_function_call() {
+        let source = "
+@group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+
+fn helper(x: f32) -> f32 {
+    return x * 2.0;
+}
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    buf[gid.x] = helper(buf[gid.x]);
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        // Should have one helper function and one entry point.
+        assert_eq!(module.functions.len(), 1);
+        assert_eq!(module.entry_points.len(), 1);
+
+        // The entry point body should contain a Call statement.
+        let func = &module.entry_points[0].function;
+        let has_call = func.body.iter().any(|s| {
+            matches!(s, nxpu_ir::Statement::Call { .. })
+        });
+        assert!(has_call, "expected Call statement");
+    }
+
+    #[test]
+    fn lower_cast_expression() {
+        let source = "
+@group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    buf[gid.x] = f32(gid.x);
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        let func = &module.entry_points[0].function;
+        let has_as = func.expressions.iter().any(|(_, e)| {
+            matches!(e, nxpu_ir::Expression::As { .. })
+        });
+        assert!(has_as, "expected As (cast) expression");
+    }
+
+    #[test]
+    fn lower_vector_splat() {
+        let source = "
+@group(0) @binding(0) var<storage, read_write> buf: array<vec4<f32>>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    buf[gid.x] = vec4<f32>(1.0);
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        let func = &module.entry_points[0].function;
+        let has_splat = func.expressions.iter().any(|(_, e)| {
+            matches!(e, nxpu_ir::Expression::Splat { .. })
+        });
+        assert!(has_splat, "expected Splat expression");
+    }
+
+    #[test]
+    fn lower_global_variable_binding() {
+        let source = "
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    output[gid.x] = input[gid.x];
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        assert_eq!(module.global_variables.len(), 2);
+
+        let bindings: Vec<_> = module
+            .global_variables
+            .iter()
+            .filter_map(|(_, v)| v.binding.as_ref())
+            .collect();
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().any(|b| b.binding == 0));
+        assert!(bindings.iter().any(|b| b.binding == 1));
+    }
+
+    // ---- Error paths ----
+
+    #[test]
+    fn error_unsupported_image_type() {
+        // Samplers/images are GPU-only and should be rejected.
+        let source = "
+@group(0) @binding(0) var t: texture_2d<f32>;
+
+@compute @workgroup_size(1)
+fn main() {}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let err = lower_module(&naga_module).unwrap_err();
+        match err {
+            ParseError::Unsupported(ref msg) => assert!(msg.contains("Image"), "got: {msg}"),
+            other => panic!("expected Unsupported, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_unsupported_sampler_type() {
+        let source = "
+@group(0) @binding(0) var s: sampler;
+
+@compute @workgroup_size(1)
+fn main() {}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let err = lower_module(&naga_module).unwrap_err();
+        match err {
+            ParseError::Unsupported(ref msg) => assert!(msg.contains("Sampler"), "got: {msg}"),
+            other => panic!("expected Unsupported, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_compute_entry_points_skipped() {
+        // Vertex/fragment entry points should be silently ignored.
+        let source = "
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+        assert!(module.entry_points.is_empty(), "non-compute entry points should be skipped");
+    }
+
+    #[test]
+    fn lower_array_size_constant() {
+        assert_eq!(
+            lower_array_size(naga::ArraySize::Constant(core::num::NonZeroU32::new(42).unwrap())).unwrap(),
+            nxpu_ir::ArraySize::Constant(42)
+        );
+    }
+
+    #[test]
+    fn lower_array_size_dynamic() {
+        assert_eq!(
+            lower_array_size(naga::ArraySize::Dynamic).unwrap(),
+            nxpu_ir::ArraySize::Dynamic
+        );
+    }
+
+    #[test]
+    fn lower_swizzle() {
+        let pat = lower_swizzle_pattern([
+            naga::SwizzleComponent::Z,
+            naga::SwizzleComponent::Y,
+            naga::SwizzleComponent::X,
+            naga::SwizzleComponent::W,
+        ]);
+        assert_eq!(
+            pat,
+            [
+                nxpu_ir::SwizzleComponent::Z,
+                nxpu_ir::SwizzleComponent::Y,
+                nxpu_ir::SwizzleComponent::X,
+                nxpu_ir::SwizzleComponent::W,
+            ]
+        );
+    }
+
+    #[test]
+    fn lower_barrier_storage_and_workgroup() {
+        let both = lower_barrier(naga::Barrier::STORAGE | naga::Barrier::WORK_GROUP);
+        assert!(both.contains(nxpu_ir::Barrier::STORAGE));
+        assert!(both.contains(nxpu_ir::Barrier::WORKGROUP));
+
+        let storage_only = lower_barrier(naga::Barrier::STORAGE);
+        assert!(storage_only.contains(nxpu_ir::Barrier::STORAGE));
+        assert!(!storage_only.contains(nxpu_ir::Barrier::WORKGROUP));
+
+        let workgroup_only = lower_barrier(naga::Barrier::WORK_GROUP);
+        assert!(!workgroup_only.contains(nxpu_ir::Barrier::STORAGE));
+        assert!(workgroup_only.contains(nxpu_ir::Barrier::WORKGROUP));
+    }
+
+    #[test]
+    fn lower_workgroup_variable() {
+        let source = "
+var<workgroup> wg_buf: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    wg_buf[lid.x] = f32(lid.x);
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        let has_workgroup = module.global_variables.iter().any(|(_, v)| {
+            v.space == nxpu_ir::AddressSpace::Workgroup
+        });
+        assert!(has_workgroup, "expected workgroup-space global variable");
+    }
+
+    #[test]
+    fn lower_constant_expression() {
+        let source = "
+const SCALE: f32 = 2.0;
+
+@group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    buf[gid.x] = buf[gid.x] * SCALE;
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        // The constant should be inlined as a literal in the entry point function.
+        let func = &module.entry_points[0].function;
+        let has_f32_2 = func.expressions.iter().any(|(_, e)| {
+            matches!(e, nxpu_ir::Expression::Literal(nxpu_ir::Literal::F32(v)) if *v == 2.0)
+        });
+        assert!(has_f32_2, "expected inlined constant 2.0");
+    }
+
+    #[test]
+    fn lower_matrix_type() {
+        let source = "
+@group(0) @binding(0) var<storage, read_write> m: mat4x4<f32>;
+
+@compute @workgroup_size(1)
+fn main() {
+    m[0][0] = 1.0;
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+
+        let has_matrix = module.types.iter().any(|(_, ty)| {
+            matches!(ty.inner, nxpu_ir::TypeInner::Matrix { .. })
+        });
+        assert!(has_matrix, "expected Matrix type");
+    }
 }
