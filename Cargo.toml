@@ -32,3 +32,15 @@ homepage = "https://github.com/m96-chan/NxPU"
 keywords = ["wgsl", "npu", "transpiler", "machine-learning", "compiler"]
 categories = ["compilers", "hardware-support"]
 rust-version = "1.87"
+
+[workspace.dependencies]
+thiserror = "2"
+prost = "0.13"
+flatbuffers = "25"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+miette = { version = "7", features = ["fancy"] }
+naga = { version = "28", features = ["wgsl-in"] }
+tract-onnx = "0.21"
+ndarray = "0.16"

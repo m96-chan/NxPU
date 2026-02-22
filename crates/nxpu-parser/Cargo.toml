@@ -7,6 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-naga = { version = "28", features = ["wgsl-in"] }
+naga.workspace = true
 nxpu-ir = { path = "../nxpu-ir" }
-thiserror = "2"
+thiserror.workspace = true

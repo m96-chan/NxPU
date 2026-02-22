@@ -17,6 +17,14 @@ nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }
 nxpu-backend-tflite = { path = "../nxpu-backend-tflite" }
 nxpu-backend-coreml = { path = "../nxpu-backend-coreml" }
 nxpu-backend-stablehlo = { path = "../nxpu-backend-stablehlo" }
-prost = "0.13"
-tract-onnx = "0.21"
-ndarray = "0.16"
+nxpu-backend-samsung = { path = "../nxpu-backend-samsung" }
+nxpu-backend-mediatek = { path = "../nxpu-backend-mediatek" }
+nxpu-backend-intel = { path = "../nxpu-backend-intel" }
+nxpu-backend-amd = { path = "../nxpu-backend-amd" }
+nxpu-backend-qualcomm = { path = "../nxpu-backend-qualcomm" }
+nxpu-backend-arm-ethos = { path = "../nxpu-backend-arm-ethos" }
+nxpu-backend-ceva = { path = "../nxpu-backend-ceva" }
+nxpu-backend-rockchip = { path = "../nxpu-backend-rockchip" }
+prost.workspace = true
+tract-onnx.workspace = true
+ndarray.workspace = true

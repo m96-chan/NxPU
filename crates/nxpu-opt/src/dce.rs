@@ -3,13 +3,14 @@
 //! Removes `Emit` statements whose expression ranges contain no
 //! expressions referenced (directly or transitively) by any other statement.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use nxpu_ir::{Expression, Function, Handle, LocalVariable, Module, Statement};
+use nxpu_ir::{Arena, Expression, Function, Handle, LocalVariable, Module, Statement};
 
 use crate::Pass;
 
-/// Removes unused `Emit` statements from function bodies.
+/// Removes unused `Emit` statements and unreferenced local variables from
+/// function bodies.
 #[derive(Debug)]
 pub struct DeadCodeElimination;
 
@@ -22,9 +23,11 @@ impl Pass for DeadCodeElimination {
         let mut changed = false;
         for (_, func) in module.functions.iter_mut() {
             changed |= run_on_function(func);
+            changed |= remove_dead_locals(func);
         }
         for ep in &mut module.entry_points {
             changed |= run_on_function(&mut ep.function);
+            changed |= remove_dead_locals(&mut ep.function);
         }
         changed
     }
@@ -168,7 +171,7 @@ fn collect_used_from_block(
 }
 
 /// Returns all expression handles directly referenced by an expression.
-fn expression_operands(expr: &Expression) -> Vec<Handle<Expression>> {
+pub(crate) fn expression_operands(expr: &Expression) -> Vec<Handle<Expression>> {
     match expr {
         Expression::Literal(_)
         | Expression::FunctionArgument(_)
@@ -257,6 +260,55 @@ fn filter_dead_in_block(
         _ => true,
     });
     changed
+}
+
+/// Removes local variables that are never referenced in any expression,
+/// and remaps `Expression::LocalVariable` handles accordingly.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
+fn remove_dead_locals(func: &mut Function) -> bool {
+    // Collect referenced local variable handles.
+    let mut referenced: HashSet<Handle<LocalVariable>> = HashSet::new();
+    for (_, expr) in func.expressions.iter() {
+        if let Expression::LocalVariable(lv) = expr {
+            referenced.insert(*lv);
+        }
+    }
+
+    let old_len = func.local_variables.len();
+    // Check if every local variable in the arena is referenced.
+    let all_referenced = func
+        .local_variables
+        .iter()
+        .all(|(h, _)| referenced.contains(&h));
+    if all_referenced {
+        return false;
+    }
+
+    // Build a new arena and a handle remap table.
+    let mut new_arena: Arena<LocalVariable> = Arena::new();
+    let mut remap: HashMap<Handle<LocalVariable>, Handle<LocalVariable>> = HashMap::new();
+
+    for (old_handle, local) in func.local_variables.iter() {
+        if referenced.contains(&old_handle) {
+            let new_handle = new_arena.append(local.clone());
+            remap.insert(old_handle, new_handle);
+        }
+    }
+
+    // Remap all Expression::LocalVariable handles.
+    let expr_handles: Vec<Handle<Expression>> = func.expressions.iter().map(|(h, _)| h).collect();
+    for h in expr_handles {
+        if let Expression::LocalVariable(lv) = &func.expressions[h] {
+            if let Some(&new_lv) = remap.get(lv) {
+                if new_lv != *lv {
+                    func.expressions[h] = Expression::LocalVariable(new_lv);
+                }
+            }
+        }
+    }
+
+    func.local_variables = new_arena;
+    func.local_variables.len() < old_len
 }
 
 #[cfg(test)]
@@ -433,5 +485,50 @@ mod tests {
             .count();
         assert_eq!(store_count, 1);
         let _ = changed;
+    }
+
+    #[test]
+    fn removes_unreferenced_local() {
+        let mut func = Function::new("test");
+        // Add two locals; only reference one in expressions.
+        let _lv_unused = func.local_variables.append(nxpu_ir::LocalVariable {
+            name: Some("unused".into()),
+            ty: dummy_type_handle(),
+            init: None,
+        });
+        let lv_used = func.local_variables.append(nxpu_ir::LocalVariable {
+            name: Some("used".into()),
+            ty: dummy_type_handle(),
+            init: None,
+        });
+        // Reference only lv_used.
+        let _ptr = func.expressions.append(Expression::LocalVariable(lv_used));
+
+        assert_eq!(func.local_variables.len(), 2);
+        let changed = remove_dead_locals(&mut func);
+        assert!(changed);
+        assert_eq!(func.local_variables.len(), 1);
+    }
+
+    #[test]
+    fn keeps_all_referenced_locals() {
+        let mut func = Function::new("test");
+        let lv_a = func.local_variables.append(nxpu_ir::LocalVariable {
+            name: Some("a".into()),
+            ty: dummy_type_handle(),
+            init: None,
+        });
+        let lv_b = func.local_variables.append(nxpu_ir::LocalVariable {
+            name: Some("b".into()),
+            ty: dummy_type_handle(),
+            init: None,
+        });
+        let _ptr_a = func.expressions.append(Expression::LocalVariable(lv_a));
+        let _ptr_b = func.expressions.append(Expression::LocalVariable(lv_b));
+
+        assert_eq!(func.local_variables.len(), 2);
+        let changed = remove_dead_locals(&mut func);
+        assert!(!changed);
+        assert_eq!(func.local_variables.len(), 2);
     }
 }

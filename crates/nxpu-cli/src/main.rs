@@ -14,7 +14,7 @@ use nxpu_opt::{OptLevel, PassManager};
 #[command(version, about)]
 struct Cli {
     /// Input WGSL file
-    input: PathBuf,
+    input: Option<PathBuf>,
 
     /// Target backend (default: ir-dump)
     #[arg(short, long, default_value = "ir-dump")]
@@ -39,6 +39,10 @@ struct Cli {
     /// Precision policy: keep, f16, bf16, int8, or auto (default: auto)
     #[arg(long, default_value = "auto", value_parser = parse_precision)]
     precision: PrecisionPolicy,
+
+    /// List all available target backends and exit
+    #[arg(long)]
+    list_targets: bool,
 }
 
 fn parse_precision(s: &str) -> Result<PrecisionPolicy, String> {
@@ -75,13 +79,45 @@ fn main() -> ExitCode {
     }
 }
 
+fn build_registry() -> BackendRegistry {
+    let mut registry = BackendRegistry::with_builtins();
+    registry.register(Box::new(nxpu_backend_onnx::OnnxBackend));
+    registry.register(Box::new(nxpu_backend_tflite::TfLiteBackend));
+    registry.register(Box::new(nxpu_backend_coreml::CoreMlBackend));
+    registry.register(Box::new(nxpu_backend_stablehlo::StableHloBackend));
+    registry.register(Box::new(nxpu_backend_samsung::SamsungBackend));
+    registry.register(Box::new(nxpu_backend_mediatek::MediaTekBackend));
+    registry.register(Box::new(nxpu_backend_intel::IntelBackend));
+    registry.register(Box::new(nxpu_backend_amd::AmdBackend));
+    registry.register(Box::new(nxpu_backend_qualcomm::QualcommBackend));
+    registry.register(Box::new(nxpu_backend_arm_ethos::ArmEthosBackend));
+    registry.register(Box::new(nxpu_backend_ceva::CevaBackend));
+    registry.register(Box::new(nxpu_backend_rockchip::RockchipBackend));
+    registry
+}
+
 fn run() -> miette::Result<()> {
+    env_logger::try_init().ok();
+
     let cli = Cli::parse();
 
+    // --list-targets: print available backends and exit.
+    if cli.list_targets {
+        let registry = build_registry();
+        for target in registry.list_targets() {
+            println!("{target}");
+        }
+        return Ok(());
+    }
+
+    let input = cli.input.ok_or_else(|| {
+        miette::miette!("input file is required (use --list-targets to list backends)")
+    })?;
+
     // 1. Read source file.
-    let source = std::fs::read_to_string(&cli.input)
+    let source = std::fs::read_to_string(&input)
         .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read {}", cli.input.display()))?;
+        .wrap_err_with(|| format!("failed to read {}", input.display()))?;
 
     // 2. Parse WGSL to IR.
     let mut module = nxpu_parser::parse(&source)
@@ -102,19 +138,7 @@ fn run() -> miette::Result<()> {
     }
 
     // 6. Backend dispatch.
-    let mut registry = BackendRegistry::with_builtins();
-    registry.register(Box::new(nxpu_backend_onnx::OnnxBackend));
-    registry.register(Box::new(nxpu_backend_tflite::TfLiteBackend));
-    registry.register(Box::new(nxpu_backend_coreml::CoreMlBackend));
-    registry.register(Box::new(nxpu_backend_stablehlo::StableHloBackend));
-    registry.register(Box::new(nxpu_backend_samsung::SamsungBackend));
-    registry.register(Box::new(nxpu_backend_mediatek::MediaTekBackend));
-    registry.register(Box::new(nxpu_backend_intel::IntelBackend));
-    registry.register(Box::new(nxpu_backend_amd::AmdBackend));
-    registry.register(Box::new(nxpu_backend_qualcomm::QualcommBackend));
-    registry.register(Box::new(nxpu_backend_arm_ethos::ArmEthosBackend));
-    registry.register(Box::new(nxpu_backend_ceva::CevaBackend));
-    registry.register(Box::new(nxpu_backend_rockchip::RockchipBackend));
+    let registry = build_registry();
     let backend = registry.find(&cli.target).ok_or_else(|| {
         let available = registry.list_targets().join(", ");
         miette::miette!("unknown target '{}' (available: {})", cli.target, available)
@@ -170,28 +194,45 @@ fn run() -> miette::Result<()> {
     }
 
     // 8. Write output.
-    for file in &output.files {
-        match (&cli.output, &file.content) {
-            (Some(path), OutputContent::Text(text)) => {
-                std::fs::write(path, text)
-                    .into_diagnostic()
-                    .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+    if let Some(base) = &cli.output {
+        if output.files.len() > 1 {
+            // Multi-file output: derive per-file paths from the base output path.
+            let stem = base
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "output".into());
+            let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+            for file in &output.files {
+                let dest = parent.join(format!("{stem}_{}", file.name));
+                write_output_file(&dest, &file.content)?;
             }
-            (Some(path), OutputContent::Binary(data)) => {
-                std::fs::write(path, data)
-                    .into_diagnostic()
-                    .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+        } else {
+            for file in &output.files {
+                write_output_file(base, &file.content)?;
             }
-            (None, OutputContent::Text(text)) => {
-                print!("{text}");
-            }
-            (None, OutputContent::Binary(_)) => {
-                return Err(miette::miette!(
-                    "backend produced binary output but no --output path was specified"
-                ));
+        }
+    } else {
+        for file in &output.files {
+            match &file.content {
+                OutputContent::Text(text) => print!("{text}"),
+                OutputContent::Binary(_) => {
+                    return Err(miette::miette!(
+                        "backend produced binary output but no --output path was specified"
+                    ));
+                }
             }
         }
     }
 
     Ok(())
+}
+
+fn write_output_file(path: &std::path::Path, content: &OutputContent) -> miette::Result<()> {
+    match content {
+        OutputContent::Text(text) => std::fs::write(path, text),
+        OutputContent::Binary(data) => std::fs::write(path, data),
+    }
+    .into_diagnostic()
+    .wrap_err_with(|| format!("failed to write {}", path.display()))
 }

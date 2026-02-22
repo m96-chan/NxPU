@@ -5,6 +5,60 @@
 
 use crate::analyze::KernelPattern;
 
+/// Returns the output tensor names of a pattern.
+pub fn output_tensor_names(pattern: &KernelPattern) -> Vec<&str> {
+    match pattern {
+        KernelPattern::MatMul { output, .. }
+        | KernelPattern::ElementWise { output, .. }
+        | KernelPattern::Conv2D { output, .. }
+        | KernelPattern::Pool { output, .. }
+        | KernelPattern::Activation { output, .. }
+        | KernelPattern::Reduce { output, .. }
+        | KernelPattern::Transpose { output, .. }
+        | KernelPattern::Reshape { output, .. }
+        | KernelPattern::Normalization { output, .. }
+        | KernelPattern::Concat { output, .. }
+        | KernelPattern::Attention { output, .. } => vec![output.name.as_str()],
+        KernelPattern::Split { outputs, .. } => outputs.iter().map(|t| t.name.as_str()).collect(),
+        KernelPattern::Unknown { .. } => vec![],
+    }
+}
+
+/// Returns the input tensor names of a pattern.
+pub fn input_tensor_names(pattern: &KernelPattern) -> Vec<&str> {
+    match pattern {
+        KernelPattern::MatMul { inputs, .. } => inputs.iter().map(|t| t.name.as_str()).collect(),
+        KernelPattern::ElementWise { inputs, .. } => {
+            inputs.iter().map(|t| t.name.as_str()).collect()
+        }
+        KernelPattern::Conv2D { input, weight, .. } => {
+            vec![input.name.as_str(), weight.name.as_str()]
+        }
+        KernelPattern::Pool { input, .. }
+        | KernelPattern::Activation { input, .. }
+        | KernelPattern::Reduce { input, .. }
+        | KernelPattern::Transpose { input, .. }
+        | KernelPattern::Reshape { input, .. }
+        | KernelPattern::Split { input, .. } => vec![input.name.as_str()],
+        KernelPattern::Normalization {
+            input, scale, bias, ..
+        } => vec![input.name.as_str(), scale.name.as_str(), bias.name.as_str()],
+        KernelPattern::Concat { inputs, .. } => inputs.iter().map(|t| t.name.as_str()).collect(),
+        KernelPattern::Attention {
+            query, key, value, ..
+        } => vec![query.name.as_str(), key.name.as_str(), value.name.as_str()],
+        KernelPattern::Unknown { .. } => vec![],
+    }
+}
+
+/// Returns `true` if any output tensor name of `producer` matches any input
+/// tensor name of `consumer`, indicating data flows between them.
+pub fn tensors_connect(producer: &KernelPattern, consumer: &KernelPattern) -> bool {
+    let outputs = output_tensor_names(producer);
+    let inputs = input_tensor_names(consumer);
+    outputs.iter().any(|o| inputs.contains(o))
+}
+
 /// Fused activation function appended to a base operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FusedActivation {
@@ -26,6 +80,8 @@ pub enum FusedPattern {
     WithActivation {
         base: Box<FusedPattern>,
         activation: FusedActivation,
+        /// The original activation pattern (preserved for tensor connectivity).
+        activation_pattern: Box<KernelPattern>,
     },
 }
 
@@ -36,6 +92,19 @@ impl FusedPattern {
             FusedPattern::Single(p) => p,
             FusedPattern::ConvBatchNorm { conv, .. } => conv,
             FusedPattern::WithActivation { base, .. } => base.primary_pattern(),
+        }
+    }
+
+    /// Return a reference to the last (output-producing) pattern in the fused
+    /// chain. For connectivity checks, this determines which tensor name
+    /// flows out of the fused operation.
+    fn output_pattern(&self) -> &KernelPattern {
+        match self {
+            FusedPattern::Single(p) => p,
+            FusedPattern::ConvBatchNorm { norm, .. } => norm,
+            FusedPattern::WithActivation {
+                activation_pattern, ..
+            } => activation_pattern,
         }
     }
 
@@ -66,11 +135,17 @@ pub fn fuse_patterns(patterns: Vec<KernelPattern>) -> Vec<(FusedPattern, usize)>
 
         let fused = match &pattern {
             KernelPattern::Conv2D { .. } => {
-                if let Some((_, KernelPattern::Normalization { .. })) = iter.peek() {
-                    let (_, norm) = iter.next().unwrap();
-                    FusedPattern::ConvBatchNorm {
-                        conv: pattern,
-                        norm: Box::new(norm),
+                if let Some((_, next)) = iter.peek() {
+                    if matches!(next, KernelPattern::Normalization { .. })
+                        && tensors_connect(&pattern, next)
+                    {
+                        let (_, norm) = iter.next().unwrap();
+                        FusedPattern::ConvBatchNorm {
+                            conv: pattern,
+                            norm: Box::new(norm),
+                        }
+                    } else {
+                        FusedPattern::Single(pattern)
                     }
                 } else {
                     FusedPattern::Single(pattern)
@@ -79,18 +154,23 @@ pub fn fuse_patterns(patterns: Vec<KernelPattern>) -> Vec<(FusedPattern, usize)>
             _ => FusedPattern::Single(pattern),
         };
 
-        let fused = if let Some((
-            _,
-            KernelPattern::Activation {
-                op: crate::analyze::ActivationOp::Relu,
-                ..
-            },
-        )) = iter.peek()
-        {
-            let _ = iter.next();
-            FusedPattern::WithActivation {
-                base: Box::new(fused),
-                activation: FusedActivation::Relu,
+        let fused = if let Some((_, next)) = iter.peek() {
+            if matches!(
+                next,
+                KernelPattern::Activation {
+                    op: crate::analyze::ActivationOp::Relu,
+                    ..
+                }
+            ) && tensors_connect(fused.output_pattern(), next)
+            {
+                let (_, act_pattern) = iter.next().unwrap();
+                FusedPattern::WithActivation {
+                    base: Box::new(fused),
+                    activation: FusedActivation::Relu,
+                    activation_pattern: Box::new(act_pattern),
+                }
+            } else {
+                fused
             }
         } else {
             fused
@@ -272,6 +352,7 @@ mod tests {
             FusedPattern::WithActivation {
                 base,
                 activation: FusedActivation::Relu,
+                ..
             } => {
                 assert!(matches!(**base, FusedPattern::ConvBatchNorm { .. }));
             }
@@ -304,5 +385,70 @@ mod tests {
         assert_eq!(fused.len(), 2);
         assert_eq!(fused[0].1, 0);
         assert_eq!(fused[1].1, 1);
+    }
+
+    #[test]
+    fn tensors_connect_matching_names() {
+        let producer = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let consumer = KernelPattern::Activation {
+            op: ActivationOp::Relu,
+            input: make_tensor("c", TensorRole::Input),
+            output: make_tensor("d", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        assert!(tensors_connect(&producer, &consumer));
+    }
+
+    #[test]
+    fn tensors_connect_mismatched_names() {
+        let producer = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let consumer = KernelPattern::Activation {
+            op: ActivationOp::Relu,
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        assert!(!tensors_connect(&producer, &consumer));
+    }
+
+    #[test]
+    fn no_fusion_mismatched_tensor_names() {
+        // Add outputs "c" but Relu consumes "x" — should NOT fuse.
+        let patterns = vec![
+            KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("a", TensorRole::Input),
+                    make_tensor("b", TensorRole::Input),
+                ],
+                output: make_tensor("c", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+            KernelPattern::Activation {
+                op: ActivationOp::Relu,
+                input: make_tensor("x", TensorRole::Input),
+                output: make_tensor("y", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 2);
     }
 }
