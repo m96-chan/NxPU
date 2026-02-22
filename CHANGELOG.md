@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-22
+
+### Added
+- Numerical correctness tests for tanh, conv2d, maxpool, and attention ops (#101).
+- CLI unit tests for argument parsing, precision, and opt-level validation (#99).
+- Workspace-level lint configuration with clippy pedantic (#98).
+- `cargo-deny` license audit in CI (#97).
+- Feature flags for backend selection (`backend-onnx`, `backend-tflite`, etc.) (#95).
+
+### Fixed
+- Move miette `fancy` feature to CLI-only to reduce dependency footprint (#96).
+- Fix MSRV CI and doc env for Windows (#102, #103).
+- Fix security audit CI job permissions.
+- Fix formatting across workspace.
+- Resolve release quality issues #85-#92.
+
+### Changed
+- Annotate dev-only workspace dependencies (#93).
+
 ## [0.1.0] - 2026-02-22
 
 ### Added
@@ -27,5 +46,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nxpu-cli`: Command-line interface with target selection, optimization levels, precision control, `--list-targets`, and `RUST_LOG` support.
 - End-to-end tests covering all backends, error paths, and numerical validation.
 
-[Unreleased]: https://github.com/m96-chan/NxPU/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/m96-chan/NxPU/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/m96-chan/NxPU/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/m96-chan/NxPU/releases/tag/v0.1.0
