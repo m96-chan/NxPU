@@ -61,14 +61,10 @@ fn run_on_function(func: &mut Function) -> bool {
     let dead_store_ptrs: HashSet<Handle<Expression>> = func
         .expressions
         .iter()
-        .filter_map(|(h, expr)| {
-            if let Expression::LocalVariable(lv) = expr
-                && !loaded_locals.contains(lv)
-            {
-                return Some(h);
-            }
-            None
+        .filter(|(_, expr)| {
+            matches!(expr, Expression::LocalVariable(lv) if !loaded_locals.contains(lv))
         })
+        .map(|(h, _)| h)
         .collect();
 
     // 4. Filter out dead Emit/Store/Call statements.
@@ -76,13 +72,14 @@ fn run_on_function(func: &mut Function) -> bool {
 }
 
 /// Collect all local variables that are loaded (read) anywhere in the function.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
 fn collect_loaded_locals(func: &Function) -> HashSet<Handle<LocalVariable>> {
     let mut loaded = HashSet::new();
     for (_, expr) in func.expressions.iter() {
-        if let Expression::Load { pointer } = expr
-            && let Some(Expression::LocalVariable(lv)) = func.expressions.try_get(*pointer)
-        {
-            loaded.insert(*lv);
+        if let Expression::Load { pointer } = expr {
+            if let Some(Expression::LocalVariable(lv)) = func.expressions.try_get(*pointer) {
+                loaded.insert(*lv);
+            }
         }
     }
     loaded
@@ -178,7 +175,8 @@ fn expression_operands(expr: &Expression) -> Vec<Handle<Expression>> {
         | Expression::GlobalVariable(_)
         | Expression::LocalVariable(_)
         | Expression::CallResult(_)
-        | Expression::AtomicResult { .. } => vec![],
+        | Expression::AtomicResult { .. }
+        | Expression::ZeroValue(_) => vec![],
 
         Expression::Load { pointer } => vec![*pointer],
         Expression::Unary { expr, .. } => vec![*expr],

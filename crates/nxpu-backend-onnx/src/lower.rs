@@ -9,9 +9,10 @@ use crate::analyze::{
 };
 use crate::fusion::{FusedActivation, FusedPattern};
 use crate::proto::*;
+use nxpu_backend_core::BackendError;
 
 /// Build an ONNX model from a classified kernel pattern.
-pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> ModelProto {
+pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<ModelProto, BackendError> {
     let graph = match pattern {
         KernelPattern::MatMul {
             inputs,
@@ -80,11 +81,13 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> ModelProto {
             seq_len,
         } => build_attention_graph(query, key, value, output, seq_len, d_k, ep_name),
         KernelPattern::Unknown { reason } => {
-            panic!("cannot lower Unknown pattern to ONNX: {reason}")
+            return Err(BackendError::Unsupported(format!(
+                "cannot lower Unknown pattern to ONNX: {reason}"
+            )));
         }
     };
 
-    ModelProto {
+    Ok(ModelProto {
         ir_version: 7,
         producer_name: "nxpu".into(),
         producer_version: env!("CARGO_PKG_VERSION").into(),
@@ -93,13 +96,16 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> ModelProto {
             domain: String::new(),
             version: 13,
         }],
-    }
+    })
 }
 
 /// Build an ONNX model from a fused pattern.
 ///
 /// Handles single patterns, Conv+BatchNorm fusion, and activation fusion.
-pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> ModelProto {
+pub fn build_fused_model(
+    fp: &crate::fusion::FusedPattern,
+    ep_name: &str,
+) -> Result<ModelProto, BackendError> {
     match fp {
         FusedPattern::Single(p) => build_model(p, ep_name),
         FusedPattern::ConvBatchNorm { conv, norm } => {
@@ -110,7 +116,11 @@ pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> Mod
                     shape,
                     ..
                 } => (input, weight, shape),
-                _ => unreachable!("ConvBatchNorm conv must be Conv2D"),
+                _ => {
+                    return Err(BackendError::Unsupported(
+                        "ConvBatchNorm conv must be Conv2D".into(),
+                    ));
+                }
             };
             let (scale, bias, norm_output) = match norm.as_ref() {
                 KernelPattern::Normalization {
@@ -119,7 +129,11 @@ pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> Mod
                     output,
                     ..
                 } => (scale, bias, output),
-                _ => unreachable!("ConvBatchNorm norm must be Normalization"),
+                _ => {
+                    return Err(BackendError::Unsupported(
+                        "ConvBatchNorm norm must be Normalization".into(),
+                    ));
+                }
             };
 
             let intermediate = "conv_out_intermediate";
@@ -161,6 +175,7 @@ pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> Mod
 
             let graph = GraphProto {
                 name: ep_name.into(),
+                initializer: vec![],
                 node: vec![conv_node, bn_node],
                 input: vec![
                     ValueInfoProto::tensor(
@@ -206,7 +221,7 @@ pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> Mod
                 )],
             };
 
-            ModelProto {
+            Ok(ModelProto {
                 ir_version: 7,
                 producer_name: "nxpu".into(),
                 producer_version: env!("CARGO_PKG_VERSION").into(),
@@ -215,10 +230,10 @@ pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> Mod
                     domain: String::new(),
                     version: 13,
                 }],
-            }
+            })
         }
         FusedPattern::WithActivation { base, activation } => {
-            let mut model = build_fused_model(base, ep_name);
+            let mut model = build_fused_model(base, ep_name)?;
             if let (Some(graph), FusedActivation::Relu) = (model.graph.as_mut(), activation) {
                 // Rename the last output to an intermediate and add a Relu node.
                 if let Some(last_output) = graph.output.last_mut() {
@@ -251,7 +266,7 @@ pub fn build_fused_model(fp: &crate::fusion::FusedPattern, ep_name: &str) -> Mod
                     }
                 }
             }
-            model
+            Ok(model)
         }
     }
 }
@@ -268,6 +283,7 @@ fn build_matmul_graph(
 
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![],
         node: vec![NodeProto::simple(
             "MatMul",
             "matmul_0",
@@ -316,9 +332,10 @@ fn build_elementwise_graph(
 
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![],
         node: vec![NodeProto::simple(
-            op.onnx_op_type(),
-            format!("{}_0", op.onnx_op_type().to_lowercase()),
+            op.op_name(),
+            format!("{}_0", op.op_name().to_lowercase()),
             vec![a_name.clone(), b_name.clone()],
             vec![c_name.clone()],
         )],
@@ -351,6 +368,7 @@ fn build_conv2d_graph(
 ) -> GraphProto {
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![],
         node: vec![NodeProto::with_attrs(
             "Conv",
             "conv_0",
@@ -415,9 +433,10 @@ fn build_pool_graph(
 ) -> GraphProto {
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![],
         node: vec![NodeProto::with_attrs(
-            kind.onnx_op_type(),
-            format!("{}_0", kind.onnx_op_type().to_lowercase()),
+            kind.op_name(),
+            format!("{}_0", kind.op_name().to_lowercase()),
             vec![input.name.clone()],
             vec![output.name.clone()],
             vec![
@@ -457,9 +476,10 @@ fn build_activation_graph(
 ) -> GraphProto {
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![],
         node: vec![NodeProto::simple(
-            op.onnx_op_type(),
-            format!("{}_0", op.onnx_op_type().to_lowercase()),
+            op.op_name(),
+            format!("{}_0", op.op_name().to_lowercase()),
             vec![input.name.clone()],
             vec![output.name.clone()],
         )],
@@ -485,9 +505,10 @@ fn build_reduce_graph(
 ) -> GraphProto {
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![],
         node: vec![NodeProto::with_attrs(
-            op.onnx_op_type(),
-            format!("{}_0", op.onnx_op_type().to_lowercase()),
+            op.op_name(),
+            format!("{}_0", op.op_name().to_lowercase()),
             vec![input.name.clone()],
             vec![output.name.clone()],
             vec![AttributeProto::ints("axes", vec![axis])],
@@ -525,6 +546,7 @@ fn build_transpose_graph(
 
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![],
         node: vec![NodeProto::with_attrs(
             "Transpose",
             "transpose_0",
@@ -545,20 +567,41 @@ fn build_transpose_graph(
     }
 }
 
+/// Build a Reshape graph.
+///
+/// Currently emits a single-element shape initializer of `[-1]`, which tells
+/// the ONNX runtime to flatten the input into a 1-D tensor.  This is correct
+/// for the simple reshape patterns the analysis pass currently recognises, but
+/// will need to be extended once multi-dimensional target shapes are supported.
 fn build_reshape_graph(input: &TensorBinding, output: &TensorBinding, ep_name: &str) -> GraphProto {
+    let shape_name = format!("{}_shape", output.name);
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![TensorProto {
+            dims: vec![1],
+            data_type: data_type::INT64,
+            name: shape_name.clone(),
+            float_data: vec![],
+            int64_data: vec![-1],
+        }],
         node: vec![NodeProto::simple(
             "Reshape",
             "reshape_0",
-            vec![input.name.clone()],
+            vec![input.name.clone(), shape_name.clone()],
             vec![output.name.clone()],
         )],
-        input: vec![ValueInfoProto::tensor(
-            &input.name,
-            input.elem_type,
-            vec![TensorShapeDimension::symbolic("N")],
-        )],
+        input: vec![
+            ValueInfoProto::tensor(
+                &input.name,
+                input.elem_type,
+                vec![TensorShapeDimension::symbolic("N")],
+            ),
+            ValueInfoProto::tensor(
+                &shape_name,
+                data_type::INT64,
+                vec![TensorShapeDimension::fixed(1)],
+            ),
+        ],
         output: vec![ValueInfoProto::tensor(
             &output.name,
             output.elem_type,
@@ -578,6 +621,7 @@ fn build_normalization_graph(
     // var → empty string (runtime computed)
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![],
         node: vec![NodeProto::with_attrs(
             "BatchNormalization",
             "batchnorm_0",
@@ -635,6 +679,7 @@ fn build_concat_graph(
     let input_names: Vec<String> = inputs.iter().map(|i| i.name.clone()).collect();
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![],
         node: vec![NodeProto::with_attrs(
             "Concat",
             "concat_0",
@@ -669,6 +714,7 @@ fn build_split_graph(
     let output_names: Vec<String> = outputs.iter().map(|o| o.name.clone()).collect();
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![],
         node: vec![NodeProto::with_attrs(
             "Split",
             "split_0",
@@ -718,6 +764,13 @@ fn build_attention_graph(
     let out_shape = q_shape.clone();
     GraphProto {
         name: ep_name.into(),
+        initializer: vec![TensorProto {
+            dims: vec![1],
+            data_type: data_type::FLOAT,
+            name: "sqrt_dk".into(),
+            float_data: vec![(d_k.parse::<f32>().unwrap_or(64.0)).sqrt()],
+            int64_data: vec![],
+        }],
         node: vec![
             // Transpose K
             NodeProto::with_attrs(
@@ -824,7 +877,7 @@ mod tests {
             },
         };
 
-        let model = build_model(&pattern, "matmul_kernel");
+        let model = build_model(&pattern, "matmul_kernel").unwrap();
 
         assert_eq!(model.ir_version, 7);
         assert_eq!(model.producer_name, "nxpu");
@@ -883,7 +936,7 @@ mod tests {
             dim_name: "N".into(),
         };
 
-        let model = build_model(&pattern, "vecadd");
+        let model = build_model(&pattern, "vecadd").unwrap();
         let graph = model.graph.as_ref().unwrap();
 
         assert_eq!(graph.node.len(), 1);
@@ -921,7 +974,7 @@ mod tests {
                 output: make_tensor("c", TensorRole::Output),
                 dim_name: "N".into(),
             };
-            let model = build_model(&pattern, "test");
+            let model = build_model(&pattern, "test").unwrap();
             let graph = model.graph.as_ref().unwrap();
             assert_eq!(graph.node[0].op_type, expected);
         }
@@ -949,7 +1002,7 @@ mod tests {
                 pad_w: 0,
             },
         };
-        let model = build_model(&pattern, "conv2d");
+        let model = build_model(&pattern, "conv2d").unwrap();
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "Conv");
 
@@ -975,7 +1028,7 @@ mod tests {
                 stride_w: 2,
             },
         };
-        let model = build_model(&pattern, "maxpool");
+        let model = build_model(&pattern, "maxpool").unwrap();
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "MaxPool");
     }
@@ -993,7 +1046,7 @@ mod tests {
                 output: make_tensor("y", TensorRole::Output),
                 dim_name: "N".into(),
             };
-            let model = build_model(&pattern, "test");
+            let model = build_model(&pattern, "test").unwrap();
             let graph = model.graph.as_ref().unwrap();
             assert_eq!(graph.node[0].op_type, expected);
         }
@@ -1007,7 +1060,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             axis: 1,
         };
-        let model = build_model(&pattern, "reduce");
+        let model = build_model(&pattern, "reduce").unwrap();
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "ReduceSum");
     }
@@ -1019,7 +1072,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             perm: vec![1, 0],
         };
-        let model = build_model(&pattern, "transpose");
+        let model = build_model(&pattern, "transpose").unwrap();
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "Transpose");
     }
@@ -1033,7 +1086,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             epsilon: 1e-5,
         };
-        let model = build_model(&pattern, "batchnorm");
+        let model = build_model(&pattern, "batchnorm").unwrap();
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "BatchNormalization");
     }

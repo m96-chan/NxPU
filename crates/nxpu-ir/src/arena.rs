@@ -177,12 +177,17 @@ impl<T> Arena<T> {
 
     /// Returns the handle that will be assigned to the next appended value.
     pub fn next_handle(&self) -> Handle<T> {
-        Handle::new(self.data.len() as u32)
+        let index = u32::try_from(self.data.len()).unwrap_or_else(|_| {
+            panic!("arena overflow: {} items exceeds u32::MAX", self.data.len())
+        });
+        Handle::new(index)
     }
 
     /// Appends a value and returns its handle.
     pub fn append(&mut self, value: T) -> Handle<T> {
-        let index = self.data.len() as u32;
+        let index = u32::try_from(self.data.len()).unwrap_or_else(|_| {
+            panic!("arena overflow: {} items exceeds u32::MAX", self.data.len())
+        });
         self.data.push(value);
         Handle::new(index)
     }
@@ -263,7 +268,9 @@ impl<T: Hash + Eq> UniqueArena<T> {
         if let Some(&index) = self.map.get(&value) {
             return Handle::new(index);
         }
-        let index = self.data.len() as u32;
+        let index = u32::try_from(self.data.len()).unwrap_or_else(|_| {
+            panic!("arena overflow: {} items exceeds u32::MAX", self.data.len())
+        });
         self.map.insert(value.clone(), index);
         self.data.push(value);
         Handle::new(index)

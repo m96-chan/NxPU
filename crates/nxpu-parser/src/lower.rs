@@ -26,6 +26,8 @@ struct FuncCtx {
     function: nxpu_ir::Function,
     expr_map: HashMap<naga::Handle<naga::Expression>, Handle<nxpu_ir::Expression>>,
     local_var_map: HashMap<naga::Handle<naga::LocalVariable>, Handle<nxpu_ir::LocalVariable>>,
+    /// Cache for global expressions that have been copied into this function's arena.
+    global_to_func_cache: HashMap<Handle<nxpu_ir::Expression>, Handle<nxpu_ir::Expression>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +221,10 @@ impl LowerCtx<'_> {
     fn lower_const_expr(&self, expr: &naga::Expression) -> Result<nxpu_ir::Expression, ParseError> {
         match *expr {
             naga::Expression::Literal(lit) => Ok(nxpu_ir::Expression::Literal(lower_literal(lit)?)),
-            naga::Expression::ZeroValue(ty) => Ok(synthesize_zero(&self.naga.types[ty].inner)),
+            naga::Expression::ZeroValue(ty) => {
+                let ir_ty = self.map_type(ty)?;
+                Ok(synthesize_zero(ir_ty, &self.naga.types[ty].inner))
+            }
             naga::Expression::Constant(h) => {
                 // Inline: copy the constant's init expression.
                 let constant = &self.naga.constants[h];
@@ -295,6 +300,7 @@ impl LowerCtx<'_> {
             },
             expr_map: HashMap::new(),
             local_var_map: HashMap::new(),
+            global_to_func_cache: HashMap::new(),
         };
 
         // Arguments
@@ -354,7 +360,7 @@ impl LowerCtx<'_> {
         // Local variables — second pass: fill in init expressions now that
         // both function and const expression maps are populated.
         for (naga_handle, init_h) in local_inits {
-            let ir_init = self.map_func_or_const_expr(&fctx, init_h)?;
+            let ir_init = self.map_func_or_const_expr(&mut fctx, init_h)?;
             let ir_handle = *fctx.local_var_map.get(&naga_handle).unwrap();
             fctx.function.local_variables[ir_handle].init = Some(ir_init);
         }
@@ -394,7 +400,10 @@ impl LowerCtx<'_> {
                 self.lower_const_expr_into_func(&self.naga.global_expressions[constant.init])
             }
             naga::Expression::Override(_) => Err(unsupported("Override expression")),
-            naga::Expression::ZeroValue(ty) => Ok(synthesize_zero(&self.naga.types[ty].inner)),
+            naga::Expression::ZeroValue(ty) => {
+                let ir_ty = self.map_type(ty)?;
+                Ok(synthesize_zero(ir_ty, &self.naga.types[ty].inner))
+            }
             naga::Expression::Compose { ty, ref components } => {
                 let ir_ty = self.map_type(ty)?;
                 let ir_components = components
@@ -568,20 +577,70 @@ impl LowerCtx<'_> {
 
     /// Resolve an expression handle that might live in either the function
     /// arena or the global const-expression arena (for local variable inits).
+    ///
+    /// When the expression lives in the global arena, it is recursively copied
+    /// into the function's arena so that handles are never mixed between arenas.
     fn map_func_or_const_expr(
         &self,
-        fctx: &FuncCtx,
+        fctx: &mut FuncCtx,
         h: naga::Handle<naga::Expression>,
     ) -> Result<Handle<nxpu_ir::Expression>, ParseError> {
         if let Some(&ir) = fctx.expr_map.get(&h) {
             return Ok(ir);
         }
-        if let Some(&ir) = self.const_expr_map.get(&h) {
-            return Ok(ir);
+        if let Some(&global_ir) = self.const_expr_map.get(&h) {
+            return self.copy_global_expr_to_func(fctx, global_ir);
         }
         Err(ParseError::Lowering(format!(
             "unmapped expression (func or const) {h:?}"
         )))
+    }
+
+    /// Recursively copy a global expression into the function's expression arena.
+    ///
+    /// Only handles expression kinds that can appear in naga's `global_expressions`
+    /// arena: [`Literal`], [`ZeroValue`], and [`Compose`] (which may recursively
+    /// contain the former two).  Any other variant produces a `ParseError`.
+    fn copy_global_expr_to_func(
+        &self,
+        fctx: &mut FuncCtx,
+        global_handle: Handle<nxpu_ir::Expression>,
+    ) -> Result<Handle<nxpu_ir::Expression>, ParseError> {
+        if let Some(&cached) = fctx.global_to_func_cache.get(&global_handle) {
+            return Ok(cached);
+        }
+
+        let expr = self.module.global_expressions[global_handle].clone();
+        let func_handle = match expr {
+            nxpu_ir::Expression::Literal(lit) => fctx
+                .function
+                .expressions
+                .append(nxpu_ir::Expression::Literal(lit)),
+            nxpu_ir::Expression::ZeroValue(ty) => fctx
+                .function
+                .expressions
+                .append(nxpu_ir::Expression::ZeroValue(ty)),
+            nxpu_ir::Expression::Compose { ty, components } => {
+                let func_components = components
+                    .iter()
+                    .map(|&c| self.copy_global_expr_to_func(fctx, c))
+                    .collect::<Result<Vec<_>, _>>()?;
+                fctx.function
+                    .expressions
+                    .append(nxpu_ir::Expression::Compose {
+                        ty,
+                        components: func_components,
+                    })
+            }
+            other => {
+                return Err(ParseError::Lowering(format!(
+                    "unexpected global expression kind in copy_global_expr_to_func: {other:?}"
+                )));
+            }
+        };
+
+        fctx.global_to_func_cache.insert(global_handle, func_handle);
+        Ok(func_handle)
     }
 }
 
@@ -942,13 +1001,15 @@ fn lower_barrier(barrier: naga::Barrier) -> nxpu_ir::Barrier {
 }
 
 /// Synthesize a zero-value expression for the given naga type.
-fn synthesize_zero(inner: &naga::TypeInner) -> nxpu_ir::Expression {
+///
+/// Scalars and atomics produce a scalar `Literal`; all other types (vectors,
+/// matrices, structs, arrays) produce a `ZeroValue` with the IR type handle.
+fn synthesize_zero(ir_type: Handle<nxpu_ir::Type>, inner: &naga::TypeInner) -> nxpu_ir::Expression {
     match *inner {
-        naga::TypeInner::Scalar(s) => nxpu_ir::Expression::Literal(scalar_zero(s)),
-        naga::TypeInner::Vector { scalar, .. } => nxpu_ir::Expression::Literal(scalar_zero(scalar)),
-        naga::TypeInner::Matrix { scalar, .. } => nxpu_ir::Expression::Literal(scalar_zero(scalar)),
-        naga::TypeInner::Atomic(s) => nxpu_ir::Expression::Literal(scalar_zero(s)),
-        _ => nxpu_ir::Expression::Literal(nxpu_ir::Literal::U32(0)),
+        naga::TypeInner::Scalar(s) | naga::TypeInner::Atomic(s) => {
+            nxpu_ir::Expression::Literal(scalar_zero(s))
+        }
+        _ => nxpu_ir::Expression::ZeroValue(ir_type),
     }
 }
 

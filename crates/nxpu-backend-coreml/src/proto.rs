@@ -123,6 +123,8 @@ pub struct MlBlock {
     pub operations: Vec<MlOperation>,
     #[prost(string, repeated, tag = "2")]
     pub outputs: Vec<String>,
+    #[prost(message, repeated, tag = "3")]
+    pub constants: Vec<MlConstant>,
 }
 
 /// A single MIL operation (matmul, add, etc.).
@@ -136,6 +138,50 @@ pub struct MlOperation {
     pub inputs: Vec<MlOperand>,
     #[prost(message, repeated, tag = "4")]
     pub outputs: Vec<MlOperand>,
+    #[prost(message, repeated, tag = "5")]
+    pub attributes: Vec<MlAttribute>,
+}
+
+/// An attribute value for MIL operations.
+#[derive(Clone, PartialEq, Message)]
+pub struct MlAttribute {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(oneof = "ml_attribute::Value", tags = "2, 3, 4, 5")]
+    pub value: Option<ml_attribute::Value>,
+}
+
+pub mod ml_attribute {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(int64, tag = "2")]
+        Int(i64),
+        #[prost(float, tag = "3")]
+        Float(f32),
+        #[prost(string, tag = "4")]
+        Str(String),
+        #[prost(message, tag = "5")]
+        Ints(super::MlIntsValue),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MlIntsValue {
+    #[prost(int64, repeated, tag = "1")]
+    pub values: Vec<i64>,
+}
+
+/// A constant value in a MIL block.
+#[derive(Clone, PartialEq, Message)]
+pub struct MlConstant {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub r#type: String,
+    #[prost(float, repeated, tag = "3")]
+    pub float_data: Vec<f32>,
+    #[prost(int64, repeated, tag = "4")]
+    pub int64_data: Vec<i64>,
 }
 
 /// An operand reference.

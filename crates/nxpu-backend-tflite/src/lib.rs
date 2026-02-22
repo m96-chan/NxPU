@@ -3,11 +3,11 @@
 //! Emits TFLite FlatBuffer (`.tflite`) models from NxPU IR.
 //! Targets: MediaTek APU (NeuroPilot), Google Edge TPU, Arm Ethos NPU (Vela).
 
+use nxpu_analysis::analyze;
 use nxpu_backend_core::{
     Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
     OutputContent, OutputFile,
 };
-use nxpu_backend_onnx::analyze;
 use nxpu_ir::Module;
 
 mod lower;
@@ -51,11 +51,11 @@ impl Backend for TfLiteBackend {
 
             let summary = match &pattern {
                 analyze::KernelPattern::MatMul { .. } => "BATCH_MATMUL",
-                analyze::KernelPattern::ElementWise { op, .. } => op.onnx_op_type(),
+                analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
                 analyze::KernelPattern::Conv2D { .. } => "CONV_2D",
-                analyze::KernelPattern::Pool { kind, .. } => kind.onnx_op_type(),
-                analyze::KernelPattern::Activation { op, .. } => op.onnx_op_type(),
-                analyze::KernelPattern::Reduce { op, .. } => op.onnx_op_type(),
+                analyze::KernelPattern::Pool { kind, .. } => kind.op_name(),
+                analyze::KernelPattern::Activation { op, .. } => op.op_name(),
+                analyze::KernelPattern::Reduce { op, .. } => op.op_name(),
                 analyze::KernelPattern::Transpose { .. } => "TRANSPOSE",
                 analyze::KernelPattern::Reshape { .. } => "RESHAPE",
                 analyze::KernelPattern::Normalization { .. } => "BatchNormalization",

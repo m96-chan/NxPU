@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::IrError;
 use crate::types::{Scalar, TensorShape};
 
 /// A unique identifier for a node in the computation graph.
@@ -142,38 +143,40 @@ impl ComputeGraph {
 
     /// Add a node to the graph and return its id.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if any input or output [`EdgeId`] has not been previously
-    /// registered via [`add_edge`](Self::add_edge), or if an output edge
-    /// already has a producer node (each edge may have at most one producer).
+    /// Returns [`IrError::UnknownEdge`] if any input or output [`EdgeId`] has
+    /// not been previously registered via [`add_edge`](Self::add_edge), or
+    /// [`IrError::DuplicateEdgeProducer`] if an output edge already has a
+    /// producer node (each edge may have at most one producer).
     pub fn add_node(
         &mut self,
         op: GraphOp,
         inputs: Vec<EdgeId>,
         outputs: Vec<EdgeId>,
         name: impl Into<String>,
-    ) -> NodeId {
+    ) -> Result<NodeId, IrError> {
         let name = name.into();
 
         // Validate that all referenced edges exist.
         for &e in inputs.iter().chain(outputs.iter()) {
-            assert!(
-                self.edges.contains_key(&e),
-                "add_node({name}): EdgeId({}) not registered in graph",
-                e.0,
-            );
+            if !self.edges.contains_key(&e) {
+                return Err(IrError::UnknownEdge {
+                    edge_id: e.0,
+                    node_name: name,
+                });
+            }
         }
 
         // Enforce single-producer-per-edge invariant.
         for &out in &outputs {
-            let existing = self.nodes.iter().find(|n| n.outputs.contains(&out));
-            assert!(
-                existing.is_none(),
-                "add_node({name}): EdgeId({}) already produced by node {:?}",
-                out.0,
-                existing.unwrap().name,
-            );
+            if let Some(existing) = self.nodes.iter().find(|n| n.outputs.contains(&out)) {
+                return Err(IrError::DuplicateEdgeProducer {
+                    edge_id: out.0,
+                    existing_producer: existing.name.clone(),
+                    new_producer: name,
+                });
+            }
         }
 
         let id = NodeId(self.next_node_id);
@@ -185,7 +188,7 @@ impl ComputeGraph {
             outputs,
             name,
         });
-        id
+        Ok(id)
     }
 
     /// Number of nodes in the graph.
@@ -203,10 +206,10 @@ impl ComputeGraph {
     /// The ordering is deterministic: among nodes with the same in-degree,
     /// the one with the smaller [`NodeId`] is emitted first.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the graph contains a cycle.
-    pub fn topological_order(&self) -> Vec<&GraphNode> {
+    /// Returns [`IrError::CycleDetected`] if the graph contains a cycle.
+    pub fn topological_order(&self) -> Result<Vec<&GraphNode>, IrError> {
         // Build adjacency: which node produces each edge?
         let mut edge_producer: HashMap<EdgeId, usize> = HashMap::new();
         for (i, node) in self.nodes.iter().enumerate() {
@@ -251,14 +254,14 @@ impl ComputeGraph {
             }
         }
 
-        assert!(
-            result.len() == n,
-            "topological_order: graph contains a cycle ({} of {} nodes visited)",
-            result.len(),
-            n,
-        );
+        if result.len() != n {
+            return Err(IrError::CycleDetected {
+                visited: result.len(),
+                total: n,
+            });
+        }
 
-        result
+        Ok(result)
     }
 
     /// Find all nodes that consume the given edge.
@@ -326,9 +329,15 @@ mod tests {
         graph.inputs = vec![a, b, bias];
         graph.outputs = vec![relu_out];
 
-        graph.add_node(GraphOp::MatMul, vec![a, b], vec![matmul_out], "matmul_0");
-        graph.add_node(GraphOp::Add, vec![matmul_out, bias], vec![add_out], "add_0");
-        graph.add_node(GraphOp::Relu, vec![add_out], vec![relu_out], "relu_0");
+        graph
+            .add_node(GraphOp::MatMul, vec![a, b], vec![matmul_out], "matmul_0")
+            .unwrap();
+        graph
+            .add_node(GraphOp::Add, vec![matmul_out, bias], vec![add_out], "add_0")
+            .unwrap();
+        graph
+            .add_node(GraphOp::Relu, vec![add_out], vec![relu_out], "relu_0")
+            .unwrap();
 
         assert_eq!(graph.node_count(), 3);
         assert_eq!(graph.edge_count(), 6);
@@ -346,10 +355,14 @@ mod tests {
         graph.inputs = vec![a, b];
         graph.outputs = vec![d];
 
-        graph.add_node(GraphOp::MatMul, vec![a, b], vec![c], "matmul");
-        graph.add_node(GraphOp::Relu, vec![c], vec![d], "relu");
+        graph
+            .add_node(GraphOp::MatMul, vec![a, b], vec![c], "matmul")
+            .unwrap();
+        graph
+            .add_node(GraphOp::Relu, vec![c], vec![d], "relu")
+            .unwrap();
 
-        let order = graph.topological_order();
+        let order = graph.topological_order().unwrap();
         assert_eq!(order.len(), 2);
         assert_eq!(order[0].name, "matmul");
         assert_eq!(order[1].name, "relu");
@@ -363,8 +376,12 @@ mod tests {
         let b = graph.add_edge(make_tensor_info("B", &[10]));
         let c = graph.add_edge(make_tensor_info("C", &[10]));
 
-        graph.add_node(GraphOp::Add, vec![a], vec![b], "add");
-        graph.add_node(GraphOp::Relu, vec![b], vec![c], "relu");
+        graph
+            .add_node(GraphOp::Add, vec![a], vec![b], "add")
+            .unwrap();
+        graph
+            .add_node(GraphOp::Relu, vec![b], vec![c], "relu")
+            .unwrap();
 
         let producer = graph.edge_producer(b).unwrap();
         assert_eq!(producer.name, "add");
@@ -402,7 +419,7 @@ mod tests {
     #[test]
     fn topological_order_empty_graph() {
         let graph = ComputeGraph::new();
-        let order = graph.topological_order();
+        let order = graph.topological_order().unwrap();
         assert!(order.is_empty());
     }
 
@@ -418,12 +435,20 @@ mod tests {
         let e_cd = graph.add_edge(make_tensor_info("cd", &[10]));
         let e_out = graph.add_edge(make_tensor_info("out", &[10]));
 
-        graph.add_node(GraphOp::Relu, vec![e_in], vec![e_ab, e_ac], "A");
-        graph.add_node(GraphOp::Relu, vec![e_ab], vec![e_bd], "B");
-        graph.add_node(GraphOp::Relu, vec![e_ac], vec![e_cd], "C");
-        graph.add_node(GraphOp::Add, vec![e_bd, e_cd], vec![e_out], "D");
+        graph
+            .add_node(GraphOp::Relu, vec![e_in], vec![e_ab, e_ac], "A")
+            .unwrap();
+        graph
+            .add_node(GraphOp::Relu, vec![e_ab], vec![e_bd], "B")
+            .unwrap();
+        graph
+            .add_node(GraphOp::Relu, vec![e_ac], vec![e_cd], "C")
+            .unwrap();
+        graph
+            .add_node(GraphOp::Add, vec![e_bd, e_cd], vec![e_out], "D")
+            .unwrap();
 
-        let order = graph.topological_order();
+        let order = graph.topological_order().unwrap();
         assert_eq!(order.len(), 4);
         assert_eq!(order[0].name, "A");
         // B before C (deterministic by NodeId)
@@ -433,7 +458,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "graph contains a cycle")]
     fn topological_order_detects_cycle() {
         let mut graph = ComputeGraph::new();
 
@@ -458,28 +482,43 @@ mod tests {
         });
         graph.next_node_id = 2;
 
-        graph.topological_order(); // should panic
+        let err = graph.topological_order().unwrap_err();
+        assert!(
+            matches!(err, crate::IrError::CycleDetected { .. }),
+            "expected CycleDetected, got {err:?}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "not registered in graph")]
     fn add_node_rejects_unknown_edge() {
         let mut graph = ComputeGraph::new();
         let fake_edge = EdgeId(999);
         let out = graph.add_edge(make_tensor_info("out", &[10]));
-        graph.add_node(GraphOp::Relu, vec![fake_edge], vec![out], "bad");
+        let err = graph
+            .add_node(GraphOp::Relu, vec![fake_edge], vec![out], "bad")
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::IrError::UnknownEdge { .. }),
+            "expected UnknownEdge, got {err:?}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "already produced by node")]
     fn add_node_rejects_duplicate_producer() {
         let mut graph = ComputeGraph::new();
         let a = graph.add_edge(make_tensor_info("a", &[10]));
         let b = graph.add_edge(make_tensor_info("b", &[10]));
         let c = graph.add_edge(make_tensor_info("c", &[10]));
 
-        graph.add_node(GraphOp::Relu, vec![a], vec![b], "first");
-        // b already has a producer — should panic
-        graph.add_node(GraphOp::Relu, vec![c], vec![b], "second");
+        graph
+            .add_node(GraphOp::Relu, vec![a], vec![b], "first")
+            .unwrap();
+        let err = graph
+            .add_node(GraphOp::Relu, vec![c], vec![b], "second")
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::IrError::DuplicateEdgeProducer { .. }),
+            "expected DuplicateEdgeProducer, got {err:?}"
+        );
     }
 }

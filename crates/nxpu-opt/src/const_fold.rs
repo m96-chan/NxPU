@@ -87,13 +87,19 @@ fn fold_binary(op: BinaryOp, left: Literal, right: Literal) -> Option<Literal> {
     }
 }
 
+/// Returns `Some(v)` only if `v` is finite (not NaN or Infinity).
+/// Non-finite results are left unfolded for correct runtime evaluation.
+fn finite(v: f32) -> Option<f32> {
+    if v.is_finite() { Some(v) } else { None }
+}
+
 fn fold_f32(op: BinaryOp, l: f32, r: f32) -> Option<Literal> {
     match op {
-        BinaryOp::Add => Some(Literal::F32(l + r)),
-        BinaryOp::Subtract => Some(Literal::F32(l - r)),
-        BinaryOp::Multiply => Some(Literal::F32(l * r)),
-        BinaryOp::Divide => Some(Literal::F32(l / r)),
-        BinaryOp::Modulo => Some(Literal::F32(l % r)),
+        BinaryOp::Add => finite(l + r).map(Literal::F32),
+        BinaryOp::Subtract => finite(l - r).map(Literal::F32),
+        BinaryOp::Multiply => finite(l * r).map(Literal::F32),
+        BinaryOp::Divide => finite(l / r).map(Literal::F32),
+        BinaryOp::Modulo => finite(l % r).map(Literal::F32),
         BinaryOp::Equal => Some(Literal::Bool(l == r)),
         BinaryOp::NotEqual => Some(Literal::Bool(l != r)),
         BinaryOp::Less => Some(Literal::Bool(l < r)),
@@ -160,7 +166,7 @@ fn fold_bool(op: BinaryOp, l: bool, r: bool) -> Option<Literal> {
 
 fn fold_unary(op: UnaryOp, lit: Literal) -> Option<Literal> {
     match (op, lit) {
-        (UnaryOp::Negate, Literal::F32(v)) => Some(Literal::F32(-v)),
+        (UnaryOp::Negate, Literal::F32(v)) => finite(-v).map(Literal::F32),
         (UnaryOp::Negate, Literal::I32(v)) => Some(Literal::I32(v.wrapping_neg())),
         (UnaryOp::LogicalNot, Literal::Bool(v)) => Some(Literal::Bool(!v)),
         (UnaryOp::BitwiseNot, Literal::I32(v)) => Some(Literal::I32(!v)),
@@ -249,7 +255,7 @@ fn fold_math(
         | MathFunction::SmoothStep => None,
     };
 
-    result.map(Literal::F32)
+    result.and_then(finite).map(Literal::F32)
 }
 
 #[cfg(test)]
@@ -527,6 +533,45 @@ mod tests {
             Expression::Literal(Literal::F32(v)) => assert_eq!(*v, 10.0),
             other => panic!("expected 10.0, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn no_fold_f32_div_by_zero() {
+        let mut func = Function::new("test");
+        let a = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let b = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        let div = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Divide,
+            left: a,
+            right: b,
+        });
+
+        let changed = run_on_function(&mut func);
+        assert!(!changed);
+        // Should remain a Binary expression (not folded to Inf).
+        assert!(matches!(&func.expressions[div], Expression::Binary { .. }));
+    }
+
+    #[test]
+    fn no_fold_sqrt_negative() {
+        let mut func = Function::new("test");
+        let h = make_math1(&mut func, MathFunction::Sqrt, -1.0);
+        let changed = run_on_function(&mut func);
+        assert!(!changed);
+        assert!(matches!(&func.expressions[h], Expression::Math { .. }));
+    }
+
+    #[test]
+    fn no_fold_log_zero() {
+        let mut func = Function::new("test");
+        let h = make_math1(&mut func, MathFunction::Log, 0.0);
+        let changed = run_on_function(&mut func);
+        assert!(!changed);
+        assert!(matches!(&func.expressions[h], Expression::Math { .. }));
     }
 
     #[test]

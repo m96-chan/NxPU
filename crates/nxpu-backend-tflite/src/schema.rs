@@ -66,6 +66,8 @@ pub mod vt {
         pub const OPCODE_INDEX: u16 = 4;
         pub const INPUTS: u16 = 6;
         pub const OUTPUTS: u16 = 8;
+        pub const BUILTIN_OPTIONS_TYPE: u16 = 10;
+        pub const BUILTIN_OPTIONS: u16 = 12;
     }
     pub mod operator_code {
         pub const DEPRECATED_BUILTIN_CODE: u16 = 4;
@@ -73,6 +75,43 @@ pub mod vt {
         pub const BUILTIN_CODE: u16 = 10;
     }
     pub mod buffer {
-        // Empty — no data field needed for dynamic tensors.
+        pub const DATA: u16 = 4;
     }
+}
+
+/// TFLite `BuiltinOptionsType` enum values (union discriminant stored in operator.builtin_options_type).
+#[allow(dead_code)]
+pub mod builtin_options_type {
+    pub const NONE: u8 = 0;
+    pub const CONV_2D: u8 = 1;
+    pub const SOFTMAX: u8 = 9;
+    pub const POOL_2D: u8 = 22;
+}
+
+/// VTable field offsets for `SoftmaxOptions`.
+#[allow(dead_code)]
+pub mod softmax_options {
+    pub const BETA: u16 = 4;
+}
+
+/// VTable field offsets for `Conv2DOptions`.
+#[allow(dead_code)]
+pub mod conv2d_options {
+    pub const PADDING: u16 = 4;
+    pub const STRIDE_W: u16 = 6;
+    pub const STRIDE_H: u16 = 8;
+    pub const ACTIVATION: u16 = 10;
+    pub const DILATION_W: u16 = 12;
+    pub const DILATION_H: u16 = 14;
+}
+
+/// VTable field offsets for `Pool2DOptions`.
+#[allow(dead_code)]
+pub mod pool2d_options {
+    pub const PADDING: u16 = 4;
+    pub const STRIDE_W: u16 = 6;
+    pub const STRIDE_H: u16 = 8;
+    pub const FILTER_W: u16 = 10;
+    pub const FILTER_H: u16 = 12;
+    pub const ACTIVATION: u16 = 14;
 }

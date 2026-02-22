@@ -5,6 +5,7 @@ members = [
     "crates/nxpu-ir",
     "crates/nxpu-opt",
     "crates/nxpu-backend-core",
+    "crates/nxpu-analysis",
     "crates/nxpu-backend-onnx",
     "crates/nxpu-backend-tflite",
     "crates/nxpu-backend-coreml",
@@ -30,4 +31,4 @@ repository = "https://github.com/m96-chan/NxPU"
 homepage = "https://github.com/m96-chan/NxPU"
 keywords = ["wgsl", "npu", "transpiler", "machine-learning", "compiler"]
 categories = ["compilers", "hardware-support"]
-rust-version = "1.85"
+rust-version = "1.87"

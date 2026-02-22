@@ -108,17 +108,10 @@ impl CalibrationData {
 }
 
 /// Target precision for a single layer/variable in mixed-precision mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerPrecision {
-    /// Keep original F32 precision (sensitive layer).
-    F32,
-    /// Convert to F16.
-    F16,
-    /// Convert to BF16.
-    BF16,
-    /// Convert to INT8 (quantized).
-    Int8,
-}
+///
+/// This is an alias for [`nxpu_backend_core::Precision`] to avoid duplicating
+/// the enum definition across crates.
+pub type LayerPrecision = nxpu_backend_core::Precision;
 
 /// Policy for choosing per-layer precision in mixed-precision quantization.
 ///
@@ -231,6 +224,7 @@ pub fn policy_from_sensitivity(
 /// 3. For each Array/Tensor type with F32 elements, insert a new type
 ///    with the target scalar and adjusted stride.
 /// 4. Update `GlobalVariable.ty` handles via the remap.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
 fn rewrite_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
     // Insert target scalar type.
     let target_scalar_handle = module.types.insert(Type {
@@ -252,10 +246,10 @@ fn rewrite_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
         .types
         .iter()
         .filter_map(|(handle, ty)| {
-            if let TypeInner::Array { base, size, stride } = &ty.inner
-                && *base == f32_handle
-            {
-                return Some((handle, *size, *stride));
+            if let TypeInner::Array { base, size, stride } = &ty.inner {
+                if *base == f32_handle {
+                    return Some((handle, *size, *stride));
+                }
             }
             None
         })
@@ -265,7 +259,7 @@ fn rewrite_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
     for (old_handle, size, old_stride) in array_types {
         let numerator = old_stride as u64 * target_scalar.width as u64;
         let f32_width = Scalar::F32.width as u64;
-        debug_assert!(
+        assert!(
             numerator.is_multiple_of(f32_width),
             "stride {old_stride} not evenly divisible when converting to {:?}",
             target_scalar,
@@ -289,10 +283,10 @@ fn rewrite_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
         .types
         .iter()
         .filter_map(|(handle, ty)| {
-            if let TypeInner::Tensor { scalar, shape } = &ty.inner
-                && *scalar == Scalar::F32
-            {
-                return Some((handle, shape.clone()));
+            if let TypeInner::Tensor { scalar, shape } = &ty.inner {
+                if *scalar == Scalar::F32 {
+                    return Some((handle, shape.clone()));
+                }
             }
             None
         })
@@ -413,7 +407,7 @@ impl Pass for MixedPrecisionPass {
                     });
                     let numerator = stride as u64 * target_scalar.width as u64;
                     let f32_width = Scalar::F32.width as u64;
-                    debug_assert!(
+                    assert!(
                         numerator.is_multiple_of(f32_width),
                         "stride {stride} not evenly divisible when converting to {:?}",
                         target_scalar,
@@ -530,21 +524,22 @@ impl Pass for F32ToInt8 {
 }
 
 /// Compute per-tensor quantization parameters from calibration data and module.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
 pub fn compute_calibrated_params(
     module: &Module,
     calibration: &CalibrationData,
 ) -> Vec<(String, QuantizationParams)> {
     let mut result = Vec::new();
     for (_handle, gv) in module.global_variables.iter() {
-        if let Some(binding) = &gv.binding
-            && let Some(cal) = calibration.find(binding.group, binding.binding)
-        {
-            let params = QuantizationParams::from_range(cal.min, cal.max);
-            let name = gv
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("tensor_{}_{}", binding.group, binding.binding));
-            result.push((name, params));
+        if let Some(binding) = &gv.binding {
+            if let Some(cal) = calibration.find(binding.group, binding.binding) {
+                let params = QuantizationParams::from_range(cal.min, cal.max);
+                let name = gv
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("tensor_{}_{}", binding.group, binding.binding));
+                result.push((name, params));
+            }
         }
     }
     result

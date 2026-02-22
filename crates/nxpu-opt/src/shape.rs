@@ -53,11 +53,10 @@ impl Pass for ShapeInference {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        let shape_map = infer_shapes(module);
-        // Shape inference is read-only; it populates a side-channel.
-        // Currently we annotate global variables by storing shape info.
-        // The pass returns true if shapes were discovered.
-        !shape_map.is_empty()
+        let _shape_map = infer_shapes(module);
+        // Shape inference is a pure analysis pass — it does not modify the IR.
+        // Consumers should call `infer_shapes()` directly to obtain the map.
+        false
     }
 }
 
@@ -80,12 +79,13 @@ pub fn infer_shapes(module: &Module) -> ShapeMap {
 }
 
 /// Extract parameter names from uniform struct members.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
 fn extract_param_names(module: &Module) -> Vec<String> {
     for (_handle, gv) in module.global_variables.iter() {
-        if gv.space == AddressSpace::Uniform
-            && let TypeInner::Struct { members, .. } = &module.types[gv.ty].inner
-        {
-            return members.iter().filter_map(|m| m.name.clone()).collect();
+        if gv.space == AddressSpace::Uniform {
+            if let TypeInner::Struct { members, .. } = &module.types[gv.ty].inner {
+                return members.iter().filter_map(|m| m.name.clone()).collect();
+            }
         }
     }
     vec![]
@@ -361,7 +361,8 @@ mod tests {
         let mut module = make_simple_module();
         let pass = ShapeInference;
         let changed = pass.run(&mut module);
-        assert!(changed);
+        // Analysis pass never reports changes.
+        assert!(!changed);
     }
 
     #[test]

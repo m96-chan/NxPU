@@ -336,6 +336,7 @@ fn format_expr(handle: Handle<Expression>, exprs: &crate::Arena<Expression>) -> 
         Expression::AtomicResult { ty, comparison } => {
             format!("AtomicResult({ty:?}, cmp={comparison})")
         }
+        Expression::ZeroValue(ty) => format!("ZeroValue({ty:?})"),
     }
 }
 

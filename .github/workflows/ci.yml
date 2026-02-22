@@ -10,12 +10,13 @@ env:
 
 jobs:
   check:
-    name: Check (${{ matrix.toolchain }})
-    runs-on: ubuntu-latest
+    name: Check (${{ matrix.toolchain }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.toolchain == 'nightly' }}
     strategy:
       matrix:
         toolchain: [stable, nightly]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -31,3 +32,24 @@ jobs:
         run: cargo test --workspace
       - name: Doc
         run: cargo doc --workspace --no-deps
+
+  msrv:
+    name: MSRV (1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.87"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --workspace
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -3,10 +3,10 @@
 //! Builds a CoreML ML Program model with MIL operations targeting
 //! Apple Neural Engine (FP16 precision).
 
-use nxpu_backend_onnx::analyze::{
+use nxpu_analysis::analyze::data_type;
+use nxpu_analysis::analyze::{
     ActivationOp, ElementWiseOp, KernelPattern, PoolKind, ReduceOp, TensorBinding,
 };
-use nxpu_backend_onnx::proto::data_type;
 
 use crate::proto::*;
 
@@ -26,7 +26,16 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
             weight,
             output,
             ..
-        } => build_binary_op("conv", input, weight, output),
+        } => build_binary_op(
+            "conv",
+            input,
+            weight,
+            output,
+            vec![MlAttribute {
+                name: "pad_type".into(),
+                value: Some(ml_attribute::Value::Str("valid".into())),
+            }],
+        ),
         KernelPattern::Pool {
             kind,
             input,
@@ -37,7 +46,15 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
                 PoolKind::Max => "max_pool",
                 PoolKind::Avg => "avg_pool",
             };
-            build_unary_op(mil_op, input, output)
+            build_unary_op(
+                mil_op,
+                input,
+                output,
+                vec![MlAttribute {
+                    name: "pad_type".into(),
+                    value: Some(ml_attribute::Value::Str("valid".into())),
+                }],
+            )
         }
         KernelPattern::Activation {
             op, input, output, ..
@@ -48,7 +65,14 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
                 ActivationOp::Tanh => "tanh",
                 ActivationOp::Softmax => "softmax",
             };
-            build_unary_op(mil_op, input, output)
+            let attributes = match op {
+                ActivationOp::Softmax => vec![MlAttribute {
+                    name: "axis".into(),
+                    value: Some(ml_attribute::Value::Int(-1)),
+                }],
+                _ => vec![],
+            };
+            build_unary_op(mil_op, input, output, attributes)
         }
         KernelPattern::Reduce {
             op, input, output, ..
@@ -59,12 +83,28 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
                 ReduceOp::Max => "reduce_max",
                 ReduceOp::Min => "reduce_min",
             };
-            build_unary_op(mil_op, input, output)
+            build_unary_op(
+                mil_op,
+                input,
+                output,
+                vec![
+                    MlAttribute {
+                        name: "axes".into(),
+                        value: Some(ml_attribute::Value::Ints(MlIntsValue { values: vec![-1] })),
+                    },
+                    MlAttribute {
+                        name: "keep_dims".into(),
+                        value: Some(ml_attribute::Value::Int(0)),
+                    },
+                ],
+            )
         }
         KernelPattern::Transpose { input, output, .. } => {
-            build_unary_op("transpose", input, output)
+            build_unary_op("transpose", input, output, vec![])
         }
-        KernelPattern::Reshape { input, output, .. } => build_unary_op("reshape", input, output),
+        KernelPattern::Reshape { input, output, .. } => {
+            build_unary_op("reshape", input, output, vec![])
+        }
         KernelPattern::Normalization {
             input,
             scale,
@@ -72,9 +112,20 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
             output,
             ..
         } => build_normalization(input, scale, bias, output),
-        KernelPattern::Concat { inputs, output, .. } => {
-            build_nary_op("concat", inputs.iter().collect(), output)
-        }
+        KernelPattern::Concat {
+            inputs,
+            output,
+            axis,
+            ..
+        } => build_nary_op(
+            "concat",
+            inputs.iter().collect(),
+            output,
+            vec![MlAttribute {
+                name: "axis".into(),
+                value: Some(ml_attribute::Value::Int(*axis)),
+            }],
+        ),
         KernelPattern::Split { input, outputs, .. } => build_split(input, outputs),
         KernelPattern::Attention {
             query,
@@ -127,6 +178,7 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
                 block: Some(MlBlock {
                     operations,
                     outputs: output_names,
+                    constants: vec![],
                 }),
             }],
         })),
@@ -148,7 +200,7 @@ fn build_matmul<'a>(
     a: &'a TensorBinding,
     b: &'a TensorBinding,
     c: &'a TensorBinding,
-    _shape: &nxpu_backend_onnx::analyze::MatMulShape,
+    _shape: &nxpu_analysis::analyze::MatMulShape,
 ) -> (
     Vec<&'a TensorBinding>,
     Vec<&'a TensorBinding>,
@@ -168,6 +220,7 @@ fn build_matmul<'a>(
         outputs: vec![MlOperand {
             name: c.name.clone(),
         }],
+        attributes: vec![],
     };
     (vec![a, b], vec![c], vec![op])
 }
@@ -202,6 +255,7 @@ fn build_elementwise<'a>(
         outputs: vec![MlOperand {
             name: c.name.clone(),
         }],
+        attributes: vec![],
     };
     (vec![a, b], vec![c], vec![op])
 }
@@ -210,6 +264,7 @@ fn build_unary_op<'a>(
     mil_op: &str,
     input: &'a TensorBinding,
     output: &'a TensorBinding,
+    attributes: Vec<MlAttribute>,
 ) -> (
     Vec<&'a TensorBinding>,
     Vec<&'a TensorBinding>,
@@ -224,6 +279,7 @@ fn build_unary_op<'a>(
         outputs: vec![MlOperand {
             name: output.name.clone(),
         }],
+        attributes,
     };
     (vec![input], vec![output], vec![op])
 }
@@ -233,6 +289,7 @@ fn build_binary_op<'a>(
     a: &'a TensorBinding,
     b: &'a TensorBinding,
     c: &'a TensorBinding,
+    attributes: Vec<MlAttribute>,
 ) -> (
     Vec<&'a TensorBinding>,
     Vec<&'a TensorBinding>,
@@ -252,6 +309,7 @@ fn build_binary_op<'a>(
         outputs: vec![MlOperand {
             name: c.name.clone(),
         }],
+        attributes,
     };
     (vec![a, b], vec![c], vec![op])
 }
@@ -283,6 +341,7 @@ fn build_normalization<'a>(
         outputs: vec![MlOperand {
             name: output.name.clone(),
         }],
+        attributes: vec![],
     };
     (vec![input, scale, bias], vec![output], vec![op])
 }
@@ -291,6 +350,7 @@ fn build_nary_op<'a>(
     mil_op: &str,
     inputs: Vec<&'a TensorBinding>,
     output: &'a TensorBinding,
+    attributes: Vec<MlAttribute>,
 ) -> (
     Vec<&'a TensorBinding>,
     Vec<&'a TensorBinding>,
@@ -308,6 +368,7 @@ fn build_nary_op<'a>(
         outputs: vec![MlOperand {
             name: output.name.clone(),
         }],
+        attributes,
     };
     (inputs, vec![output], vec![op])
 }
@@ -332,6 +393,7 @@ fn build_split<'a>(
                 name: o.name.clone(),
             })
             .collect(),
+        attributes: vec![],
     };
     let out_refs: Vec<&TensorBinding> = outputs.iter().collect();
     (vec![input], out_refs, vec![op])
@@ -366,6 +428,7 @@ fn build_attention<'a>(
         outputs: vec![MlOperand {
             name: output.name.clone(),
         }],
+        attributes: vec![],
     };
     (vec![query, key, value], vec![output], vec![op])
 }
@@ -373,7 +436,7 @@ fn build_attention<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nxpu_backend_onnx::analyze::{ActivationOp, MatMulShape, PoolKind, PoolShape, TensorRole};
+    use nxpu_analysis::analyze::{ActivationOp, MatMulShape, PoolKind, PoolShape, TensorRole};
 
     fn dummy_handle() -> nxpu_ir::Handle<nxpu_ir::GlobalVariable> {
         let mut arena = nxpu_ir::Arena::new();
