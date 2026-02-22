@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-analysis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-backend-core",
  "nxpu-ir",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-amd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-backend-core",
  "nxpu-backend-onnx",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-arm-ethos"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-backend-core",
  "nxpu-backend-tflite",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-ceva"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-backend-core",
  "nxpu-backend-onnx",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-ir",
  "thiserror",
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-coreml"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-analysis",
  "nxpu-backend-core",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-intel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-backend-core",
  "nxpu-backend-onnx",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-mediatek"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-backend-core",
  "nxpu-backend-tflite",
@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-onnx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-analysis",
  "nxpu-backend-core",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-qualcomm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-backend-core",
  "nxpu-backend-onnx",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-rockchip"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-backend-core",
  "nxpu-backend-onnx",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-samsung"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-backend-core",
  "nxpu-backend-onnx",
@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-stablehlo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nxpu-analysis",
  "nxpu-backend-core",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-backend-tflite"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flatbuffers",
  "nxpu-analysis",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "env_logger",
@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-e2e-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ndarray",
  "nxpu-backend-amd",
@@ -1110,14 +1110,14 @@ dependencies = [
 
 [[package]]
 name = "nxpu-ir"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "nxpu-opt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "nxpu-backend-core",
@@ -1126,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "nxpu-parser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "naga",
  "nxpu-ir",
