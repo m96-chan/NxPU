@@ -10,23 +10,43 @@ publish = false
 name = "nxpu"
 path = "src/main.rs"
 
+[features]
+default = ["all-backends"]
+all-backends = [
+    "backend-onnx", "backend-tflite", "backend-coreml", "backend-stablehlo",
+    "backend-samsung", "backend-mediatek", "backend-intel", "backend-amd",
+    "backend-qualcomm", "backend-arm-ethos", "backend-ceva", "backend-rockchip",
+]
+backend-onnx = ["dep:nxpu-backend-onnx"]
+backend-tflite = ["dep:nxpu-backend-tflite"]
+backend-coreml = ["dep:nxpu-backend-coreml"]
+backend-stablehlo = ["dep:nxpu-backend-stablehlo"]
+backend-samsung = ["dep:nxpu-backend-samsung", "backend-onnx"]
+backend-mediatek = ["dep:nxpu-backend-mediatek", "backend-tflite"]
+backend-intel = ["dep:nxpu-backend-intel", "backend-onnx"]
+backend-amd = ["dep:nxpu-backend-amd", "backend-onnx"]
+backend-qualcomm = ["dep:nxpu-backend-qualcomm", "backend-onnx"]
+backend-arm-ethos = ["dep:nxpu-backend-arm-ethos", "backend-tflite"]
+backend-ceva = ["dep:nxpu-backend-ceva", "backend-onnx"]
+backend-rockchip = ["dep:nxpu-backend-rockchip", "backend-onnx"]
+
 [dependencies]
 nxpu-parser = { path = "../nxpu-parser" }
 nxpu-ir = { path = "../nxpu-ir" }
 nxpu-opt = { path = "../nxpu-opt" }
 nxpu-backend-core = { path = "../nxpu-backend-core" }
-nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }
-nxpu-backend-tflite = { path = "../nxpu-backend-tflite" }
-nxpu-backend-coreml = { path = "../nxpu-backend-coreml" }
-nxpu-backend-stablehlo = { path = "../nxpu-backend-stablehlo" }
-nxpu-backend-samsung = { path = "../nxpu-backend-samsung" }
-nxpu-backend-mediatek = { path = "../nxpu-backend-mediatek" }
-nxpu-backend-intel = { path = "../nxpu-backend-intel" }
-nxpu-backend-amd = { path = "../nxpu-backend-amd" }
-nxpu-backend-qualcomm = { path = "../nxpu-backend-qualcomm" }
-nxpu-backend-arm-ethos = { path = "../nxpu-backend-arm-ethos" }
-nxpu-backend-ceva = { path = "../nxpu-backend-ceva" }
-nxpu-backend-rockchip = { path = "../nxpu-backend-rockchip" }
+nxpu-backend-onnx = { path = "../nxpu-backend-onnx", optional = true }
+nxpu-backend-tflite = { path = "../nxpu-backend-tflite", optional = true }
+nxpu-backend-coreml = { path = "../nxpu-backend-coreml", optional = true }
+nxpu-backend-stablehlo = { path = "../nxpu-backend-stablehlo", optional = true }
+nxpu-backend-samsung = { path = "../nxpu-backend-samsung", optional = true }
+nxpu-backend-mediatek = { path = "../nxpu-backend-mediatek", optional = true }
+nxpu-backend-intel = { path = "../nxpu-backend-intel", optional = true }
+nxpu-backend-amd = { path = "../nxpu-backend-amd", optional = true }
+nxpu-backend-qualcomm = { path = "../nxpu-backend-qualcomm", optional = true }
+nxpu-backend-arm-ethos = { path = "../nxpu-backend-arm-ethos", optional = true }
+nxpu-backend-ceva = { path = "../nxpu-backend-ceva", optional = true }
+nxpu-backend-rockchip = { path = "../nxpu-backend-rockchip", optional = true }
 clap.workspace = true
 log.workspace = true
 env_logger.workspace = true

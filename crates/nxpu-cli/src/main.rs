@@ -80,18 +80,31 @@ fn main() -> ExitCode {
 }
 
 fn build_registry() -> BackendRegistry {
+    #[allow(unused_mut)]
     let mut registry = BackendRegistry::with_builtins();
+    #[cfg(feature = "backend-onnx")]
     registry.register(Box::new(nxpu_backend_onnx::OnnxBackend));
+    #[cfg(feature = "backend-tflite")]
     registry.register(Box::new(nxpu_backend_tflite::TfLiteBackend));
+    #[cfg(feature = "backend-coreml")]
     registry.register(Box::new(nxpu_backend_coreml::CoreMlBackend));
+    #[cfg(feature = "backend-stablehlo")]
     registry.register(Box::new(nxpu_backend_stablehlo::StableHloBackend));
+    #[cfg(feature = "backend-samsung")]
     registry.register(Box::new(nxpu_backend_samsung::SamsungBackend));
+    #[cfg(feature = "backend-mediatek")]
     registry.register(Box::new(nxpu_backend_mediatek::MediaTekBackend));
+    #[cfg(feature = "backend-intel")]
     registry.register(Box::new(nxpu_backend_intel::IntelBackend));
+    #[cfg(feature = "backend-amd")]
     registry.register(Box::new(nxpu_backend_amd::AmdBackend));
+    #[cfg(feature = "backend-qualcomm")]
     registry.register(Box::new(nxpu_backend_qualcomm::QualcommBackend));
+    #[cfg(feature = "backend-arm-ethos")]
     registry.register(Box::new(nxpu_backend_arm_ethos::ArmEthosBackend));
+    #[cfg(feature = "backend-ceva")]
     registry.register(Box::new(nxpu_backend_ceva::CevaBackend));
+    #[cfg(feature = "backend-rockchip")]
     registry.register(Box::new(nxpu_backend_rockchip::RockchipBackend));
     registry
 }
