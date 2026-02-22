@@ -76,13 +76,14 @@ fn run_on_function(func: &mut Function) -> bool {
 }
 
 /// Collect all local variables that are loaded (read) anywhere in the function.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
 fn collect_loaded_locals(func: &Function) -> HashSet<Handle<LocalVariable>> {
     let mut loaded = HashSet::new();
     for (_, expr) in func.expressions.iter() {
-        if let Expression::Load { pointer } = expr
-            && let Some(Expression::LocalVariable(lv)) = func.expressions.try_get(*pointer)
-        {
-            loaded.insert(*lv);
+        if let Expression::Load { pointer } = expr {
+            if let Some(Expression::LocalVariable(lv)) = func.expressions.try_get(*pointer) {
+                loaded.insert(*lv);
+            }
         }
     }
     loaded

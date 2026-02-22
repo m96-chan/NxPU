@@ -224,6 +224,7 @@ pub fn policy_from_sensitivity(
 /// 3. For each Array/Tensor type with F32 elements, insert a new type
 ///    with the target scalar and adjusted stride.
 /// 4. Update `GlobalVariable.ty` handles via the remap.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
 fn rewrite_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
     // Insert target scalar type.
     let target_scalar_handle = module.types.insert(Type {
@@ -245,10 +246,10 @@ fn rewrite_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
         .types
         .iter()
         .filter_map(|(handle, ty)| {
-            if let TypeInner::Array { base, size, stride } = &ty.inner
-                && *base == f32_handle
-            {
-                return Some((handle, *size, *stride));
+            if let TypeInner::Array { base, size, stride } = &ty.inner {
+                if *base == f32_handle {
+                    return Some((handle, *size, *stride));
+                }
             }
             None
         })
@@ -282,10 +283,10 @@ fn rewrite_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
         .types
         .iter()
         .filter_map(|(handle, ty)| {
-            if let TypeInner::Tensor { scalar, shape } = &ty.inner
-                && *scalar == Scalar::F32
-            {
-                return Some((handle, shape.clone()));
+            if let TypeInner::Tensor { scalar, shape } = &ty.inner {
+                if *scalar == Scalar::F32 {
+                    return Some((handle, shape.clone()));
+                }
             }
             None
         })
@@ -523,21 +524,22 @@ impl Pass for F32ToInt8 {
 }
 
 /// Compute per-tensor quantization parameters from calibration data and module.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
 pub fn compute_calibrated_params(
     module: &Module,
     calibration: &CalibrationData,
 ) -> Vec<(String, QuantizationParams)> {
     let mut result = Vec::new();
     for (_handle, gv) in module.global_variables.iter() {
-        if let Some(binding) = &gv.binding
-            && let Some(cal) = calibration.find(binding.group, binding.binding)
-        {
-            let params = QuantizationParams::from_range(cal.min, cal.max);
-            let name = gv
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("tensor_{}_{}", binding.group, binding.binding));
-            result.push((name, params));
+        if let Some(binding) = &gv.binding {
+            if let Some(cal) = calibration.find(binding.group, binding.binding) {
+                let params = QuantizationParams::from_range(cal.min, cal.max);
+                let name = gv
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("tensor_{}_{}", binding.group, binding.binding));
+                result.push((name, params));
+            }
         }
     }
     result

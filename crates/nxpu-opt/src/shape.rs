@@ -79,12 +79,13 @@ pub fn infer_shapes(module: &Module) -> ShapeMap {
 }
 
 /// Extract parameter names from uniform struct members.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
 fn extract_param_names(module: &Module) -> Vec<String> {
     for (_handle, gv) in module.global_variables.iter() {
-        if gv.space == AddressSpace::Uniform
-            && let TypeInner::Struct { members, .. } = &module.types[gv.ty].inner
-        {
-            return members.iter().filter_map(|m| m.name.clone()).collect();
+        if gv.space == AddressSpace::Uniform {
+            if let TypeInner::Struct { members, .. } = &module.types[gv.ty].inner {
+                return members.iter().filter_map(|m| m.name.clone()).collect();
+            }
         }
     }
     vec![]
