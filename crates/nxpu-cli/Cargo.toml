@@ -50,5 +50,5 @@ nxpu-backend-rockchip = { path = "../nxpu-backend-rockchip", optional = true }
 clap.workspace = true
 log.workspace = true
 env_logger.workspace = true
-miette.workspace = true
+miette = { workspace = true, features = ["fancy"] }
 thiserror.workspace = true
