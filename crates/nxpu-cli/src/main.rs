@@ -249,3 +249,209 @@ fn write_output_file(path: &std::path::Path, content: &OutputContent) -> miette:
     .into_diagnostic()
     .wrap_err_with(|| format!("failed to write {}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    // ---- Argument parsing ----
+
+    #[test]
+    fn cli_defaults() {
+        let cli = Cli::try_parse_from(["nxpu", "input.wgsl"]).unwrap();
+        assert_eq!(cli.input.unwrap(), PathBuf::from("input.wgsl"));
+        assert_eq!(cli.target, "ir-dump");
+        assert!(cli.output.is_none());
+        assert_eq!(cli.opt_level, OptLevel::O1);
+        assert!(!cli.emit_ir);
+        assert!(!cli.dry_run);
+        assert_eq!(cli.precision, PrecisionPolicy::Auto);
+        assert!(!cli.list_targets);
+    }
+
+    #[test]
+    fn cli_all_flags() {
+        let cli = Cli::try_parse_from([
+            "nxpu",
+            "model.wgsl",
+            "--target",
+            "onnx",
+            "--output",
+            "out.onnx",
+            "--opt-level",
+            "2",
+            "--emit-ir",
+            "--precision",
+            "f16",
+        ])
+        .unwrap();
+        assert_eq!(cli.input.unwrap(), PathBuf::from("model.wgsl"));
+        assert_eq!(cli.target, "onnx");
+        assert_eq!(cli.output.unwrap(), PathBuf::from("out.onnx"));
+        assert_eq!(cli.opt_level, OptLevel::O2);
+        assert!(cli.emit_ir);
+        assert_eq!(cli.precision, PrecisionPolicy::Explicit(Precision::F16));
+    }
+
+    #[test]
+    fn cli_short_flags() {
+        let cli = Cli::try_parse_from(["nxpu", "in.wgsl", "-t", "tflite", "-o", "out.tflite"])
+            .unwrap();
+        assert_eq!(cli.target, "tflite");
+        assert_eq!(cli.output.unwrap(), PathBuf::from("out.tflite"));
+    }
+
+    #[test]
+    fn cli_list_targets_no_input() {
+        let cli = Cli::try_parse_from(["nxpu", "--list-targets"]).unwrap();
+        assert!(cli.list_targets);
+        assert!(cli.input.is_none());
+    }
+
+    #[test]
+    fn cli_invalid_opt_level() {
+        let result = Cli::try_parse_from(["nxpu", "in.wgsl", "--opt-level", "3"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_invalid_precision() {
+        let result = Cli::try_parse_from(["nxpu", "in.wgsl", "--precision", "f64"]);
+        assert!(result.is_err());
+    }
+
+    // ---- parse_precision ----
+
+    #[test]
+    fn precision_valid_values() {
+        assert_eq!(parse_precision("keep").unwrap(), PrecisionPolicy::Keep);
+        assert_eq!(
+            parse_precision("f16").unwrap(),
+            PrecisionPolicy::Explicit(Precision::F16)
+        );
+        assert_eq!(
+            parse_precision("bf16").unwrap(),
+            PrecisionPolicy::Explicit(Precision::BF16)
+        );
+        assert_eq!(
+            parse_precision("int8").unwrap(),
+            PrecisionPolicy::Explicit(Precision::Int8)
+        );
+        assert_eq!(parse_precision("auto").unwrap(), PrecisionPolicy::Auto);
+    }
+
+    #[test]
+    fn precision_invalid_value() {
+        let err = parse_precision("f64").unwrap_err();
+        assert!(err.contains("invalid precision"));
+        assert!(err.contains("f64"));
+    }
+
+    // ---- parse_opt_level ----
+
+    #[test]
+    fn opt_level_valid_values() {
+        assert_eq!(parse_opt_level("0").unwrap(), OptLevel::O0);
+        assert_eq!(parse_opt_level("1").unwrap(), OptLevel::O1);
+        assert_eq!(parse_opt_level("2").unwrap(), OptLevel::O2);
+    }
+
+    #[test]
+    fn opt_level_invalid_value() {
+        let err = parse_opt_level("3").unwrap_err();
+        assert!(err.contains("invalid optimization level"));
+        assert!(err.contains('3'));
+    }
+
+    // ---- Target validation (build_registry) ----
+
+    #[test]
+    fn registry_always_has_ir_dump() {
+        let registry = build_registry();
+        assert!(
+            registry.find("ir-dump").is_some(),
+            "ir-dump should always be available"
+        );
+    }
+
+    #[test]
+    fn registry_unknown_target_returns_none() {
+        let registry = build_registry();
+        assert!(registry.find("nonexistent-backend").is_none());
+    }
+
+    #[test]
+    fn registry_list_targets_includes_ir_dump() {
+        let registry = build_registry();
+        let targets = registry.list_targets();
+        assert!(targets.contains(&"ir-dump"));
+    }
+
+    #[cfg(feature = "backend-onnx")]
+    #[test]
+    fn registry_has_onnx_when_enabled() {
+        let registry = build_registry();
+        assert!(registry.find("onnx").is_some());
+    }
+
+    #[cfg(feature = "backend-tflite")]
+    #[test]
+    fn registry_has_tflite_when_enabled() {
+        let registry = build_registry();
+        assert!(registry.find("tflite").is_some());
+    }
+
+    // ---- Output path generation ----
+
+    #[test]
+    fn multi_file_output_path_derivation() {
+        let base = PathBuf::from("/tmp/model.onnx");
+        let stem = base
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "output".into());
+        let parent = base
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+
+        let dest = parent.join(format!("{stem}_{}", "weights.bin"));
+        assert_eq!(dest, PathBuf::from("/tmp/model_weights.bin"));
+    }
+
+    #[test]
+    fn multi_file_output_path_no_extension() {
+        let base = PathBuf::from("output");
+        let stem = base
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "output".into());
+        let parent = base
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+
+        let dest = parent.join(format!("{stem}_{}", "data.bin"));
+        assert_eq!(dest, PathBuf::from("output_data.bin"));
+    }
+
+    // ---- Error formatting ----
+
+    #[test]
+    fn unknown_target_error_lists_available() {
+        let registry = build_registry();
+        let result = registry.find("bogus");
+        assert!(result.is_none());
+        let available = registry.list_targets().join(", ");
+        let msg = format!("unknown target 'bogus' (available: {available})");
+        assert!(msg.contains("bogus"));
+        assert!(msg.contains("ir-dump"));
+    }
+
+    #[test]
+    fn missing_input_error_message() {
+        let err = miette::miette!("input file is required (use --list-targets to list backends)");
+        let msg = format!("{err}");
+        assert!(msg.contains("input file is required"));
+        assert!(msg.contains("--list-targets"));
+    }
+}
