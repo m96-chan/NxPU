@@ -48,6 +48,13 @@ jobs:
       - name: Check
         run: cargo check --workspace
 
+  license-audit:
+    name: License Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
