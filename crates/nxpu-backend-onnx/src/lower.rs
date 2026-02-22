@@ -334,8 +334,8 @@ fn build_elementwise_graph(
         name: ep_name.into(),
         initializer: vec![],
         node: vec![NodeProto::simple(
-            op.onnx_op_type(),
-            format!("{}_0", op.onnx_op_type().to_lowercase()),
+            op.op_name(),
+            format!("{}_0", op.op_name().to_lowercase()),
             vec![a_name.clone(), b_name.clone()],
             vec![c_name.clone()],
         )],
@@ -435,8 +435,8 @@ fn build_pool_graph(
         name: ep_name.into(),
         initializer: vec![],
         node: vec![NodeProto::with_attrs(
-            kind.onnx_op_type(),
-            format!("{}_0", kind.onnx_op_type().to_lowercase()),
+            kind.op_name(),
+            format!("{}_0", kind.op_name().to_lowercase()),
             vec![input.name.clone()],
             vec![output.name.clone()],
             vec![
@@ -478,8 +478,8 @@ fn build_activation_graph(
         name: ep_name.into(),
         initializer: vec![],
         node: vec![NodeProto::simple(
-            op.onnx_op_type(),
-            format!("{}_0", op.onnx_op_type().to_lowercase()),
+            op.op_name(),
+            format!("{}_0", op.op_name().to_lowercase()),
             vec![input.name.clone()],
             vec![output.name.clone()],
         )],
@@ -507,8 +507,8 @@ fn build_reduce_graph(
         name: ep_name.into(),
         initializer: vec![],
         node: vec![NodeProto::with_attrs(
-            op.onnx_op_type(),
-            format!("{}_0", op.onnx_op_type().to_lowercase()),
+            op.op_name(),
+            format!("{}_0", op.op_name().to_lowercase()),
             vec![input.name.clone()],
             vec![output.name.clone()],
             vec![AttributeProto::ints("axes", vec![axis])],
@@ -567,6 +567,12 @@ fn build_transpose_graph(
     }
 }
 
+/// Build a Reshape graph.
+///
+/// Currently emits a single-element shape initializer of `[-1]`, which tells
+/// the ONNX runtime to flatten the input into a 1-D tensor.  This is correct
+/// for the simple reshape patterns the analysis pass currently recognises, but
+/// will need to be extended once multi-dimensional target shapes are supported.
 fn build_reshape_graph(input: &TensorBinding, output: &TensorBinding, ep_name: &str) -> GraphProto {
     let shape_name = format!("{}_shape", output.name);
     GraphProto {

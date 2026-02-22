@@ -68,8 +68,8 @@ pub enum ElementWiseOp {
 }
 
 impl ElementWiseOp {
-    /// Returns the ONNX operator type string.
-    pub fn onnx_op_type(self) -> &'static str {
+    /// Returns the canonical operator name (e.g. "Add", "Relu", "ReduceSum").
+    pub fn op_name(self) -> &'static str {
         match self {
             Self::Add => "Add",
             Self::Sub => "Sub",
@@ -89,8 +89,8 @@ pub enum ActivationOp {
 }
 
 impl ActivationOp {
-    /// Returns the ONNX operator type string.
-    pub fn onnx_op_type(self) -> &'static str {
+    /// Returns the canonical operator name (e.g. "Add", "Relu", "ReduceSum").
+    pub fn op_name(self) -> &'static str {
         match self {
             Self::Relu => "Relu",
             Self::Sigmoid => "Sigmoid",
@@ -110,8 +110,8 @@ pub enum ReduceOp {
 }
 
 impl ReduceOp {
-    /// Returns the ONNX operator type string.
-    pub fn onnx_op_type(self) -> &'static str {
+    /// Returns the canonical operator name (e.g. "Add", "Relu", "ReduceSum").
+    pub fn op_name(self) -> &'static str {
         match self {
             Self::Sum => "ReduceSum",
             Self::Mean => "ReduceMean",
@@ -129,8 +129,8 @@ pub enum PoolKind {
 }
 
 impl PoolKind {
-    /// Returns the ONNX operator type string.
-    pub fn onnx_op_type(self) -> &'static str {
+    /// Returns the canonical operator name (e.g. "Add", "Relu", "ReduceSum").
+    pub fn op_name(self) -> &'static str {
         match self {
             Self::Max => "MaxPool",
             Self::Avg => "AveragePool",

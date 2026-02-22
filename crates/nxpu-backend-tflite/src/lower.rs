@@ -50,7 +50,7 @@ pub fn build_model(pattern: &KernelPattern) -> Vec<u8> {
                 output,
                 &shapes,
                 opcode,
-                &format!("{}_1d", op.onnx_op_type().to_lowercase()),
+                &format!("{}_1d", op.op_name().to_lowercase()),
             )
         }
         KernelPattern::Conv2D {
@@ -90,7 +90,7 @@ pub fn build_model(pattern: &KernelPattern) -> Vec<u8> {
                     &shapes[0],
                     &shapes[1],
                     opcode,
-                    &format!("{}_1d", op.onnx_op_type().to_lowercase()),
+                    &format!("{}_1d", op.op_name().to_lowercase()),
                 )
             }
         }
@@ -110,7 +110,7 @@ pub fn build_model(pattern: &KernelPattern) -> Vec<u8> {
                 &shapes[0],
                 &shapes[1],
                 opcode,
-                &format!("{}_reduce", op.onnx_op_type().to_lowercase()),
+                &format!("{}_reduce", op.op_name().to_lowercase()),
             )
         }
         KernelPattern::Transpose { input, output, .. } => {
@@ -904,7 +904,8 @@ fn build_tflite_pool(
 /// Build a TFLite model for attention:
 ///   BATCH_MATMUL(Q,K) → DIV(scores, sqrt_dk) → SOFTMAX(beta=1.0) → BATCH_MATMUL(attn,V).
 ///
-/// The `d_k` string is parsed to an f32; if parsing fails a fallback of 1.0 is used.
+/// The `d_k` string is parsed to an f32; if parsing fails a fallback of 64.0 is used
+/// (matching ONNX and StableHLO backends).
 /// `sqrt(d_k)` is embedded as a scalar constant tensor so the runtime performs the
 /// standard scaled dot-product attention.
 fn build_tflite_attention(
@@ -916,8 +917,8 @@ fn build_tflite_attention(
 ) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::with_capacity(2048);
 
-    // Compute sqrt(d_k) from the symbolic dimension name (fall back to 1.0 if not numeric).
-    let dk_val: f32 = d_k.parse::<f32>().unwrap_or(1.0);
+    // Compute sqrt(d_k) from the symbolic dimension name (fall back to 64.0 if not numeric).
+    let dk_val: f32 = d_k.parse::<f32>().unwrap_or(64.0);
     let sqrt_dk: f32 = dk_val.sqrt();
     // Serialize as little-endian f32 bytes for the constant buffer.
     let sqrt_dk_bytes: Vec<u8> = sqrt_dk.to_le_bytes().to_vec();

@@ -70,7 +70,7 @@ NxPU/
 
 ### Prerequisites
 
-- Rust 1.85+
+- Rust 1.87+
 - Cargo
 
 ### Build

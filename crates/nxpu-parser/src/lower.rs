@@ -597,6 +597,10 @@ impl LowerCtx<'_> {
     }
 
     /// Recursively copy a global expression into the function's expression arena.
+    ///
+    /// Only handles expression kinds that can appear in naga's `global_expressions`
+    /// arena: [`Literal`], [`ZeroValue`], and [`Compose`] (which may recursively
+    /// contain the former two).  Any other variant produces a `ParseError`.
     fn copy_global_expr_to_func(
         &self,
         fctx: &mut FuncCtx,

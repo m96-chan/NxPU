@@ -166,7 +166,7 @@ fn fold_bool(op: BinaryOp, l: bool, r: bool) -> Option<Literal> {
 
 fn fold_unary(op: UnaryOp, lit: Literal) -> Option<Literal> {
     match (op, lit) {
-        (UnaryOp::Negate, Literal::F32(v)) => Some(Literal::F32(-v)),
+        (UnaryOp::Negate, Literal::F32(v)) => finite(-v).map(Literal::F32),
         (UnaryOp::Negate, Literal::I32(v)) => Some(Literal::I32(v.wrapping_neg())),
         (UnaryOp::LogicalNot, Literal::Bool(v)) => Some(Literal::Bool(!v)),
         (UnaryOp::BitwiseNot, Literal::I32(v)) => Some(Literal::I32(!v)),

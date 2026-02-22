@@ -34,13 +34,13 @@ jobs:
         run: cargo doc --workspace --no-deps
 
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.87)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85"
+          toolchain: "1.87"
       - uses: Swatinem/rust-cache@v2
       - name: Check
         run: cargo check --workspace
@@ -50,7 +50,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-      - name: Audit
-        run: cargo audit
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

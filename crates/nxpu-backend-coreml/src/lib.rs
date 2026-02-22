@@ -56,14 +56,14 @@ impl Backend for CoreMlBackend {
 
             let summary = match &pattern {
                 analyze::KernelPattern::MatMul { .. } => "matmul",
-                analyze::KernelPattern::ElementWise { op, .. } => op.onnx_op_type(),
+                analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
                 analyze::KernelPattern::Conv2D { .. } => "conv",
                 analyze::KernelPattern::Pool { kind, .. } => match kind {
                     analyze::PoolKind::Max => "max_pool",
                     analyze::PoolKind::Avg => "avg_pool",
                 },
-                analyze::KernelPattern::Activation { op, .. } => op.onnx_op_type(),
-                analyze::KernelPattern::Reduce { op, .. } => op.onnx_op_type(),
+                analyze::KernelPattern::Activation { op, .. } => op.op_name(),
+                analyze::KernelPattern::Reduce { op, .. } => op.op_name(),
                 analyze::KernelPattern::Transpose { .. } => "transpose",
                 analyze::KernelPattern::Reshape { .. } => "reshape",
                 analyze::KernelPattern::Normalization { .. } => "batch_norm",

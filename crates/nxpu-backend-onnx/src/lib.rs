@@ -112,11 +112,11 @@ impl Backend for OnnxBackend {
 fn pattern_summary(pattern: &KernelPattern) -> &'static str {
     match pattern {
         KernelPattern::MatMul { .. } => "MatMul",
-        KernelPattern::ElementWise { op, .. } => op.onnx_op_type(),
+        KernelPattern::ElementWise { op, .. } => op.op_name(),
         KernelPattern::Conv2D { .. } => "Conv",
-        KernelPattern::Pool { kind, .. } => kind.onnx_op_type(),
-        KernelPattern::Activation { op, .. } => op.onnx_op_type(),
-        KernelPattern::Reduce { op, .. } => op.onnx_op_type(),
+        KernelPattern::Pool { kind, .. } => kind.op_name(),
+        KernelPattern::Activation { op, .. } => op.op_name(),
+        KernelPattern::Reduce { op, .. } => op.op_name(),
         KernelPattern::Transpose { .. } => "Transpose",
         KernelPattern::Reshape { .. } => "Reshape",
         KernelPattern::Normalization { .. } => "BatchNormalization",

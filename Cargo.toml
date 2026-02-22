@@ -31,4 +31,4 @@ repository = "https://github.com/m96-chan/NxPU"
 homepage = "https://github.com/m96-chan/NxPU"
 keywords = ["wgsl", "npu", "transpiler", "machine-learning", "compiler"]
 categories = ["compilers", "hardware-support"]
-rust-version = "1.85"
+rust-version = "1.87"

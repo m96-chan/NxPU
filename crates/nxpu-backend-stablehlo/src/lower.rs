@@ -165,7 +165,7 @@ module @{ep_name} {{
 }}
 "#,
         ep_name = ep_name,
-        op_name = op.onnx_op_type(),
+        op_name = op.op_name(),
         dim = dim_name,
         a = a.name,
         b = b.name,
@@ -401,14 +401,16 @@ fn build_reduce_mlir(
 module @{ep_name} {{
   func.func @main(%{inp}: {in_type}) -> {out_type} {{
 {reduce_block}
-    %count = stablehlo.constant dense<1.0> : {st}
-    %{out} = stablehlo.divide %reduce_result, %count : {out_type}
+    %dim_size_i32 = stablehlo.get_dimension_size %{inp}, dim = {axis} : ({in_type}) -> tensor<i32>
+    %dim_size = stablehlo.convert %dim_size_i32 : (tensor<i32>) -> {st}
+    %dim_bcast = stablehlo.broadcast_in_dim %dim_size, dims = [] : ({st}) -> {out_type}
+    %{out} = stablehlo.divide %reduce_result, %dim_bcast : {out_type}
     return %{out} : {out_type}
   }}
 }}
 "#,
             ep_name = ep_name,
-            op_name = op.onnx_op_type(),
+            op_name = op.op_name(),
             inp = input.name,
             out = output.name,
             in_type = in_type,
@@ -428,7 +430,7 @@ module @{ep_name} {{
 }}
 "#,
             ep_name = ep_name,
-            op_name = op.onnx_op_type(),
+            op_name = op.op_name(),
             inp = input.name,
             in_type = in_type,
             out_type = out_type,
