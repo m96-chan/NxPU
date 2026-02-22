@@ -3,6 +3,8 @@
 //! Analyzes an entry point's global variables and function body to classify
 //! the computation into a known ONNX-mappable pattern.
 
+use std::fmt;
+
 use nxpu_ir::{
     AddressSpace, Arena, BinaryOp, Expression, GlobalVariable, Handle, MathFunction, Module,
     Scalar, ScalarKind, Statement, StorageAccess, TypeInner,
@@ -41,21 +43,49 @@ pub enum TensorRole {
     Output,
 }
 
+impl fmt::Display for TensorRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Input => "Input",
+            Self::Output => "Output",
+        })
+    }
+}
+
 /// A storage buffer bound as a tensor.
 #[derive(Debug, Clone)]
 pub struct TensorBinding {
+    /// Handle to the underlying global variable.
     pub handle: Handle<GlobalVariable>,
+    /// Human-readable tensor name.
     pub name: String,
+    /// ONNX element data type (see [`data_type`]).
     pub elem_type: i32,
+    /// Whether this tensor is an input or output.
     pub role: TensorRole,
+}
+
+impl fmt::Display for TensorBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.name, self.role)
+    }
 }
 
 /// Symbolic dimension names for matrix multiplication.
 #[derive(Debug, Clone)]
 pub struct MatMulShape {
+    /// Number of rows in the left matrix.
     pub m: String,
+    /// Number of columns in the right matrix.
     pub n: String,
+    /// Shared inner dimension.
     pub k: String,
+}
+
+impl fmt::Display for MatMulShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MatMul({}x{} * {}x{})", self.m, self.k, self.k, self.n)
+    }
 }
 
 /// Element-wise binary operation kind.
@@ -65,6 +95,12 @@ pub enum ElementWiseOp {
     Sub,
     Mul,
     Div,
+}
+
+impl fmt::Display for ElementWiseOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.op_name())
+    }
 }
 
 impl ElementWiseOp {
@@ -88,8 +124,14 @@ pub enum ActivationOp {
     Softmax,
 }
 
+impl fmt::Display for ActivationOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.op_name())
+    }
+}
+
 impl ActivationOp {
-    /// Returns the canonical operator name (e.g. "Add", "Relu", "ReduceSum").
+    /// Returns the canonical operator name (e.g. "Relu", "Sigmoid").
     pub fn op_name(self) -> &'static str {
         match self {
             Self::Relu => "Relu",
@@ -109,8 +151,14 @@ pub enum ReduceOp {
     Min,
 }
 
+impl fmt::Display for ReduceOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.op_name())
+    }
+}
+
 impl ReduceOp {
-    /// Returns the canonical operator name (e.g. "Add", "Relu", "ReduceSum").
+    /// Returns the canonical operator name (e.g. "ReduceSum", "ReduceMean").
     pub fn op_name(self) -> &'static str {
         match self {
             Self::Sum => "ReduceSum",
@@ -128,8 +176,14 @@ pub enum PoolKind {
     Avg,
 }
 
+impl fmt::Display for PoolKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.op_name())
+    }
+}
+
 impl PoolKind {
-    /// Returns the canonical operator name (e.g. "Add", "Relu", "ReduceSum").
+    /// Returns the canonical operator name (e.g. "MaxPool", "AveragePool").
     pub fn op_name(self) -> &'static str {
         match self {
             Self::Max => "MaxPool",
@@ -141,28 +195,65 @@ impl PoolKind {
 /// Conv2D shape parameters extracted from uniform params.
 #[derive(Debug, Clone)]
 pub struct Conv2DShape {
+    /// Batch dimension name.
     pub batch: String,
+    /// Input channel dimension name.
     pub channels_in: String,
+    /// Output channel dimension name.
     pub channels_out: String,
+    /// Spatial height dimension name.
     pub height: String,
+    /// Spatial width dimension name.
     pub width: String,
+    /// Kernel height dimension name.
     pub kernel_h: String,
+    /// Kernel width dimension name.
     pub kernel_w: String,
+    /// Kernel height as a concrete value.
     pub kernel_h_val: i64,
+    /// Kernel width as a concrete value.
     pub kernel_w_val: i64,
+    /// Vertical stride.
     pub stride_h: i64,
+    /// Horizontal stride.
     pub stride_w: i64,
+    /// Vertical padding.
     pub pad_h: i64,
+    /// Horizontal padding.
     pub pad_w: i64,
+}
+
+impl fmt::Display for Conv2DShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Conv2D({}x{}x{} k{}x{})",
+            self.channels_in, self.height, self.width, self.kernel_h, self.kernel_w
+        )
+    }
 }
 
 /// Pooling shape parameters.
 #[derive(Debug, Clone)]
 pub struct PoolShape {
+    /// Kernel height.
     pub kernel_h: i64,
+    /// Kernel width.
     pub kernel_w: i64,
+    /// Vertical stride.
     pub stride_h: i64,
+    /// Horizontal stride.
     pub stride_w: i64,
+}
+
+impl fmt::Display for PoolShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Pool(k{}x{} s{}x{})",
+            self.kernel_h, self.kernel_w, self.stride_h, self.stride_w
+        )
+    }
 }
 
 /// A classified kernel pattern that maps to ONNX operators.
@@ -253,6 +344,34 @@ pub enum KernelPattern {
     },
     /// Unrecognized pattern — classification could not determine a known op.
     Unknown { reason: String },
+}
+
+impl fmt::Display for KernelPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MatMul { shape, .. } => write!(f, "{shape}"),
+            Self::ElementWise { op, .. } => write!(f, "{op}"),
+            Self::Conv2D { shape, .. } => write!(f, "{shape}"),
+            Self::Pool { kind, shape, .. } => {
+                write!(
+                    f,
+                    "{}(k{}x{} s{}x{})",
+                    kind, shape.kernel_h, shape.kernel_w, shape.stride_h, shape.stride_w
+                )
+            }
+            Self::Activation { op, .. } => write!(f, "{op}"),
+            Self::Reduce { op, axis, .. } => write!(f, "{op}(axis={axis})"),
+            Self::Transpose { perm, .. } => write!(f, "Transpose({perm:?})"),
+            Self::Reshape { .. } => f.write_str("Reshape"),
+            Self::Normalization { epsilon, .. } => write!(f, "Normalization(eps={epsilon})"),
+            Self::Concat { axis, .. } => write!(f, "Concat(axis={axis})"),
+            Self::Split { axis, .. } => write!(f, "Split(axis={axis})"),
+            Self::Attention { d_k, seq_len, .. } => {
+                write!(f, "Attention(d_k={d_k}, seq_len={seq_len})")
+            }
+            Self::Unknown { reason } => write!(f, "Unknown({reason})"),
+        }
+    }
 }
 
 /// Classify an entry point into a known ONNX-mappable pattern.

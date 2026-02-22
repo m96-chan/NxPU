@@ -36,6 +36,12 @@ impl std::ops::BitOr for Barrier {
     }
 }
 
+impl std::ops::BitOrAssign for Barrier {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 /// A statement in the IR.
 ///
 /// Statements have side effects and/or control flow.

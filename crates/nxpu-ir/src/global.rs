@@ -57,7 +57,9 @@ pub enum AddressSpace {
 /// `@group(N) @binding(N)` resource binding.
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub struct ResourceBinding {
+    /// Bind group index.
     pub group: u32,
+    /// Binding index within the group.
     pub binding: u32,
 }
 
@@ -88,10 +90,15 @@ pub enum Binding {
 /// A module-scope variable.
 #[derive(Clone, Debug)]
 pub struct GlobalVariable {
+    /// Optional variable name.
     pub name: Option<String>,
+    /// Address space (uniform, storage, etc.).
     pub space: AddressSpace,
+    /// Optional resource binding (`@group(N) @binding(N)`).
     pub binding: Option<ResourceBinding>,
+    /// The type of this variable.
     pub ty: Handle<Type>,
+    /// Optional initializer expression.
     pub init: Option<Handle<crate::Expression>>,
     /// Optional memory layout annotation for tensor data.
     pub layout: Option<crate::types::MemoryLayout>,

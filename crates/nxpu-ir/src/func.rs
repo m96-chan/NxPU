@@ -11,35 +11,50 @@ use crate::types::Type;
 /// A function argument declaration.
 #[derive(Clone, Debug)]
 pub struct FunctionArgument {
+    /// Optional argument name.
     pub name: Option<String>,
+    /// The type of this argument.
     pub ty: Handle<Type>,
+    /// Optional binding (e.g. built-in or location).
     pub binding: Option<Binding>,
 }
 
 /// The return type and optional binding of a function.
 #[derive(Clone, Debug)]
 pub struct FunctionResult {
+    /// The return type.
     pub ty: Handle<Type>,
+    /// Optional binding for the return value.
     pub binding: Option<Binding>,
 }
 
 /// A function-local variable.
 #[derive(Clone, Debug)]
 pub struct LocalVariable {
+    /// Optional variable name.
     pub name: Option<String>,
+    /// The type of this variable.
     pub ty: Handle<Type>,
+    /// Optional initializer expression.
     pub init: Option<Handle<Expression>>,
 }
 
 /// An IR function.
 #[derive(Clone, Debug)]
 pub struct Function {
+    /// Optional function name.
     pub name: Option<String>,
+    /// Formal parameters.
     pub arguments: Vec<FunctionArgument>,
+    /// Return type and optional binding.
     pub result: Option<FunctionResult>,
+    /// Function-local variable declarations.
     pub local_variables: Arena<LocalVariable>,
+    /// Expression arena for this function.
     pub expressions: Arena<Expression>,
+    /// Map from expression handles to user-defined names.
     pub named_expressions: HashMap<Handle<Expression>, String>,
+    /// The function body.
     pub body: Block,
 }
 
@@ -61,8 +76,11 @@ impl Function {
 /// A compute shader entry point.
 #[derive(Clone, Debug)]
 pub struct EntryPoint {
+    /// Entry point name (matches the WGSL function name).
     pub name: String,
+    /// Workgroup dimensions `[x, y, z]`.
     pub workgroup_size: [u32; 3],
+    /// The entry point function body.
     pub function: Function,
 }
 

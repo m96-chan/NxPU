@@ -23,7 +23,9 @@ pub enum ScalarKind {
 /// A scalar type: kind + byte width.
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Scalar {
+    /// The kind of scalar (bool, int, float, etc.).
     pub kind: ScalarKind,
+    /// Width of the scalar in bytes.
     pub width: Bytes,
 }
 
@@ -189,15 +191,20 @@ impl MemoryLayout {
 /// A member of a struct type.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct StructMember {
+    /// Optional member name.
     pub name: Option<String>,
+    /// The type of this member.
     pub ty: Handle<Type>,
+    /// Byte offset within the struct.
     pub offset: u32,
 }
 
 /// A named type.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct Type {
+    /// Optional human-readable name.
     pub name: Option<String>,
+    /// The concrete type shape.
     pub inner: TypeInner,
 }
 

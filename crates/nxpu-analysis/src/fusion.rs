@@ -66,6 +66,15 @@ pub enum FusedActivation {
     Relu,
 }
 
+impl std::fmt::Display for FusedActivation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "None",
+            Self::Relu => "Relu",
+        })
+    }
+}
+
 /// A pattern that may be fused from one or more classified patterns.
 #[derive(Debug, Clone)]
 pub enum FusedPattern {
@@ -83,6 +92,18 @@ pub enum FusedPattern {
         /// The original activation pattern (preserved for tensor connectivity).
         activation_pattern: Box<KernelPattern>,
     },
+}
+
+impl std::fmt::Display for FusedPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single(p) => write!(f, "{p}"),
+            Self::ConvBatchNorm { conv, .. } => write!(f, "{conv}+BatchNorm"),
+            Self::WithActivation {
+                base, activation, ..
+            } => write!(f, "{base}+{activation}"),
+        }
+    }
 }
 
 impl FusedPattern {

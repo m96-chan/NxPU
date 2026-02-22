@@ -12,6 +12,7 @@ use nxpu_ir::Module;
 use prost::Message;
 
 mod lower;
+#[doc(hidden)]
 pub mod proto;
 
 /// CoreML backend targeting Apple Neural Engine.

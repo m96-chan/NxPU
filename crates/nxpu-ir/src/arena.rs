@@ -132,7 +132,7 @@ impl<T> Range<T> {
     }
 
     /// Returns the handle one past the last element.
-    pub fn last(&self) -> Handle<T> {
+    pub fn end(&self) -> Handle<T> {
         Handle::new(self.last)
     }
 
@@ -359,7 +359,7 @@ mod tests {
         let range = Range::<u32>::from_index_range(2..5);
         assert!(!range.is_empty());
         assert_eq!(range.first().index(), 2);
-        assert_eq!(range.last().index(), 5);
+        assert_eq!(range.end().index(), 5);
         assert_eq!(range.index_range(), 2..5);
 
         let empty = Range::<u32>::from_index_range(3..3);
