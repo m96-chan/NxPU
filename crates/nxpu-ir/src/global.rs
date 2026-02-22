@@ -64,15 +64,15 @@ pub struct ResourceBinding {
 /// Built-in shader inputs/outputs.
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub enum BuiltIn {
-    /// `@builtin(global_invocation_id)` — vec3<u32>
+    /// `@builtin(global_invocation_id)` — `vec3<u32>`
     GlobalInvocationId,
-    /// `@builtin(local_invocation_id)` — vec3<u32>
+    /// `@builtin(local_invocation_id)` — `vec3<u32>`
     LocalInvocationId,
-    /// `@builtin(local_invocation_index)` — u32
+    /// `@builtin(local_invocation_index)` — `u32`
     LocalInvocationIndex,
-    /// `@builtin(workgroup_id)` — vec3<u32>
+    /// `@builtin(workgroup_id)` — `vec3<u32>`
     WorkgroupId,
-    /// `@builtin(num_workgroups)` — vec3<u32>
+    /// `@builtin(num_workgroups)` — `vec3<u32>`
     NumWorkgroups,
 }
 

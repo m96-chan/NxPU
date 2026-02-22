@@ -78,7 +78,7 @@ impl Backend for CoreMlBackend {
                 message: format!("entry point '{}': MIL op {}", ep.name, summary),
             });
 
-            let model = lower::build_model(&pattern, &ep.name);
+            let model = lower::build_model(&pattern, &ep.name)?;
             let bytes = model.encode_to_vec();
 
             let filename = if module.entry_points.len() == 1 {

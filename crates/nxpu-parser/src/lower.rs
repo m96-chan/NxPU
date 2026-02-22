@@ -361,7 +361,10 @@ impl LowerCtx<'_> {
         // both function and const expression maps are populated.
         for (naga_handle, init_h) in local_inits {
             let ir_init = self.map_func_or_const_expr(&mut fctx, init_h)?;
-            let ir_handle = *fctx.local_var_map.get(&naga_handle).unwrap();
+            let ir_handle = *fctx
+                .local_var_map
+                .get(&naga_handle)
+                .expect("local_var_map populated in first pass");
             fctx.function.local_variables[ir_handle].init = Some(ir_init);
         }
 

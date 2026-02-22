@@ -1,8 +1,10 @@
 [package]
 name = "nxpu-analysis"
+description = "Shared pattern analysis and fusion for NxPU backends"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 nxpu-ir = { path = "../nxpu-ir" }

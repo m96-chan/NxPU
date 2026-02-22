@@ -61,7 +61,6 @@ NxPU/
 │   ├── nxpu-cli/          # Command-line interface
 │   ├── nxpu-e2e-tests/    # End-to-end tests
 │   └── nxpu-backend-*/    # NPU backend emitters
-├── tests/                 # Integration tests
 ├── examples/              # WGSL samples
 └── docs/                  # Documentation
 ```
