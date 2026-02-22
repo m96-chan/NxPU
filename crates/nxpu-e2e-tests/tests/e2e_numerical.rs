@@ -315,11 +315,7 @@ fn batchnorm_numerical() {
     let beta = vec![0.0, 0.0];
     let result = run_onnx(
         &source,
-        vec![
-            (x, vec![1, 2, 1, 2]),
-            (gamma, vec![2]),
-            (beta, vec![2]),
-        ],
+        vec![(x, vec![1, 2, 1, 2]), (gamma, vec![2]), (beta, vec![2])],
     );
     // y = gamma * (x - mean) / sqrt(var + 1e-5) + beta
     let s = (0.25_f32 + 1e-5).sqrt();

@@ -102,10 +102,7 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<ModelProto,
 /// Build an ONNX model from a fused pattern.
 ///
 /// Handles single patterns, Conv+BatchNorm fusion, and activation fusion.
-pub fn build_fused_model(
-    fp: &FusedPattern,
-    ep_name: &str,
-) -> Result<ModelProto, BackendError> {
+pub fn build_fused_model(fp: &FusedPattern, ep_name: &str) -> Result<ModelProto, BackendError> {
     match fp {
         FusedPattern::Single(p) => build_model(p, ep_name),
         FusedPattern::ConvBatchNorm { conv, norm } => {

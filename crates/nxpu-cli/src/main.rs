@@ -296,8 +296,8 @@ mod tests {
 
     #[test]
     fn cli_short_flags() {
-        let cli = Cli::try_parse_from(["nxpu", "in.wgsl", "-t", "tflite", "-o", "out.tflite"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["nxpu", "in.wgsl", "-t", "tflite", "-o", "out.tflite"]).unwrap();
         assert_eq!(cli.target, "tflite");
         assert_eq!(cli.output.unwrap(), PathBuf::from("out.tflite"));
     }
@@ -411,9 +411,7 @@ mod tests {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "output".into());
-        let parent = base
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
+        let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
 
         let dest = parent.join(format!("{stem}_{}", "weights.bin"));
         assert_eq!(dest, PathBuf::from("/tmp/model_weights.bin"));
@@ -426,9 +424,7 @@ mod tests {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "output".into());
-        let parent = base
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
+        let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
 
         let dest = parent.join(format!("{stem}_{}", "data.bin"));
         assert_eq!(dest, PathBuf::from("output_data.bin"));

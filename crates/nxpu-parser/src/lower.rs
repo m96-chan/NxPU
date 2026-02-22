@@ -1236,12 +1236,24 @@ fn kernel_b(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         assert_eq!(module.entry_points.len(), 2);
 
-        let names: Vec<&str> = module.entry_points.iter().map(|ep| ep.name.as_str()).collect();
+        let names: Vec<&str> = module
+            .entry_points
+            .iter()
+            .map(|ep| ep.name.as_str())
+            .collect();
         assert!(names.contains(&"kernel_a"));
         assert!(names.contains(&"kernel_b"));
 
-        let ep_a = module.entry_points.iter().find(|ep| ep.name == "kernel_a").unwrap();
-        let ep_b = module.entry_points.iter().find(|ep| ep.name == "kernel_b").unwrap();
+        let ep_a = module
+            .entry_points
+            .iter()
+            .find(|ep| ep.name == "kernel_a")
+            .unwrap();
+        let ep_b = module
+            .entry_points
+            .iter()
+            .find(|ep| ep.name == "kernel_b")
+            .unwrap();
         assert_eq!(ep_a.workgroup_size, [64, 1, 1]);
         assert_eq!(ep_b.workgroup_size, [128, 1, 1]);
     }
@@ -1265,11 +1277,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // Verify the entry point function has expressions containing Binary and Math nodes.
         let func = &module.entry_points[0].function;
-        let has_binary = func.expressions.iter().any(|(_, e)| {
-            matches!(e, nxpu_ir::Expression::Binary { .. })
-        });
+        let has_binary = func
+            .expressions
+            .iter()
+            .any(|(_, e)| matches!(e, nxpu_ir::Expression::Binary { .. }));
         let has_math = func.expressions.iter().any(|(_, e)| {
-            matches!(e, nxpu_ir::Expression::Math { fun: nxpu_ir::MathFunction::Clamp, .. })
+            matches!(
+                e,
+                nxpu_ir::Expression::Math {
+                    fun: nxpu_ir::MathFunction::Clamp,
+                    ..
+                }
+            )
         });
         assert!(has_binary, "expected Binary expressions");
         assert!(has_math, "expected Math(Clamp) expression");
@@ -1289,7 +1308,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let func = &module.entry_points[0].function;
         let has_negate = func.expressions.iter().any(|(_, e)| {
-            matches!(e, nxpu_ir::Expression::Unary { op: nxpu_ir::UnaryOp::Negate, .. })
+            matches!(
+                e,
+                nxpu_ir::Expression::Unary {
+                    op: nxpu_ir::UnaryOp::Negate,
+                    ..
+                }
+            )
         });
         assert!(has_negate, "expected Unary(Negate) expression");
     }
@@ -1308,9 +1333,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let module = lower_module(&naga_module).expect("lowering failed");
 
         let func = &module.entry_points[0].function;
-        let has_select = func.expressions.iter().any(|(_, e)| {
-            matches!(e, nxpu_ir::Expression::Select { .. })
-        });
+        let has_select = func
+            .expressions
+            .iter()
+            .any(|(_, e)| matches!(e, nxpu_ir::Expression::Select { .. }));
         assert!(has_select, "expected Select expression");
     }
 
@@ -1332,9 +1358,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let module = lower_module(&naga_module).expect("lowering failed");
 
         let func = &module.entry_points[0].function;
-        let has_if = func.body.iter().any(|s| {
-            matches!(s, nxpu_ir::Statement::If { .. })
-        });
+        let has_if = func
+            .body
+            .iter()
+            .any(|s| matches!(s, nxpu_ir::Statement::If { .. }));
         assert!(has_if, "expected If statement");
     }
 
@@ -1356,9 +1383,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let module = lower_module(&naga_module).expect("lowering failed");
 
         let func = &module.entry_points[0].function;
-        let has_loop = func.body.iter().any(|s| {
-            matches!(s, nxpu_ir::Statement::Loop { .. })
-        });
+        let has_loop = func
+            .body
+            .iter()
+            .any(|s| matches!(s, nxpu_ir::Statement::Loop { .. }));
         assert!(has_loop, "expected Loop statement");
     }
 
@@ -1384,9 +1412,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // The entry point body should contain a Call statement.
         let func = &module.entry_points[0].function;
-        let has_call = func.body.iter().any(|s| {
-            matches!(s, nxpu_ir::Statement::Call { .. })
-        });
+        let has_call = func
+            .body
+            .iter()
+            .any(|s| matches!(s, nxpu_ir::Statement::Call { .. }));
         assert!(has_call, "expected Call statement");
     }
 
@@ -1403,9 +1432,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let module = lower_module(&naga_module).expect("lowering failed");
 
         let func = &module.entry_points[0].function;
-        let has_as = func.expressions.iter().any(|(_, e)| {
-            matches!(e, nxpu_ir::Expression::As { .. })
-        });
+        let has_as = func
+            .expressions
+            .iter()
+            .any(|(_, e)| matches!(e, nxpu_ir::Expression::As { .. }));
         assert!(has_as, "expected As (cast) expression");
     }
 
@@ -1422,9 +1452,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let module = lower_module(&naga_module).expect("lowering failed");
 
         let func = &module.entry_points[0].function;
-        let has_splat = func.expressions.iter().any(|(_, e)| {
-            matches!(e, nxpu_ir::Expression::Splat { .. })
-        });
+        let has_splat = func
+            .expressions
+            .iter()
+            .any(|(_, e)| matches!(e, nxpu_ir::Expression::Splat { .. }));
         assert!(has_splat, "expected Splat expression");
     }
 
@@ -1496,13 +1527,19 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 }";
         let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
         let module = lower_module(&naga_module).expect("lowering failed");
-        assert!(module.entry_points.is_empty(), "non-compute entry points should be skipped");
+        assert!(
+            module.entry_points.is_empty(),
+            "non-compute entry points should be skipped"
+        );
     }
 
     #[test]
     fn lower_array_size_constant() {
         assert_eq!(
-            lower_array_size(naga::ArraySize::Constant(core::num::NonZeroU32::new(42).unwrap())).unwrap(),
+            lower_array_size(naga::ArraySize::Constant(
+                core::num::NonZeroU32::new(42).unwrap()
+            ))
+            .unwrap(),
             nxpu_ir::ArraySize::Constant(42)
         );
     }
@@ -1561,9 +1598,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
         let module = lower_module(&naga_module).expect("lowering failed");
 
-        let has_workgroup = module.global_variables.iter().any(|(_, v)| {
-            v.space == nxpu_ir::AddressSpace::Workgroup
-        });
+        let has_workgroup = module
+            .global_variables
+            .iter()
+            .any(|(_, v)| v.space == nxpu_ir::AddressSpace::Workgroup);
         assert!(has_workgroup, "expected workgroup-space global variable");
     }
 
@@ -1601,9 +1639,10 @@ fn main() {
         let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
         let module = lower_module(&naga_module).expect("lowering failed");
 
-        let has_matrix = module.types.iter().any(|(_, ty)| {
-            matches!(ty.inner, nxpu_ir::TypeInner::Matrix { .. })
-        });
+        let has_matrix = module
+            .types
+            .iter()
+            .any(|(_, ty)| matches!(ty.inner, nxpu_ir::TypeInner::Matrix { .. }));
         assert!(has_matrix, "expected Matrix type");
     }
 }
