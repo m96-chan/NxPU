@@ -1,10 +1,11 @@
+#![warn(missing_docs)]
 //! Backend trait and plugin architecture for NxPU.
 //!
 //! Defines the [`Backend`] trait that all NPU code emitters implement,
 //! along with supporting types ([`BackendOptions`], [`BackendOutput`],
 //! [`BackendError`]) and a [`BackendRegistry`] for CLI dispatch.
 
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 
 use nxpu_ir::Module;
 
@@ -21,6 +22,17 @@ pub enum Precision {
     Int8,
 }
 
+impl fmt::Display for Precision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::BF16 => "BF16",
+            Self::Int8 => "I8",
+        })
+    }
+}
+
 /// Policy for choosing precision during compilation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PrecisionPolicy {
@@ -31,6 +43,16 @@ pub enum PrecisionPolicy {
     /// Automatically select based on the backend's preferred precision.
     #[default]
     Auto,
+}
+
+impl fmt::Display for PrecisionPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Keep => f.write_str("Keep"),
+            Self::Explicit(p) => write!(f, "Explicit({p})"),
+            Self::Auto => f.write_str("Auto"),
+        }
+    }
 }
 
 /// A backend that compiles NxPU IR to target-specific output.
@@ -75,6 +97,16 @@ pub struct BackendOptions {
     pub precision: PrecisionPolicy,
 }
 
+impl fmt::Display for BackendOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "BackendOptions {{ opt_level: {}, precision: {} }}",
+            self.opt_level, self.precision
+        )
+    }
+}
+
 /// The output produced by a backend.
 #[derive(Clone, Debug)]
 pub struct BackendOutput {
@@ -82,6 +114,17 @@ pub struct BackendOutput {
     pub files: Vec<OutputFile>,
     /// Non-fatal diagnostics.
     pub diagnostics: Vec<Diagnostic>,
+}
+
+impl fmt::Display for BackendOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} file(s), {} diagnostic(s)",
+            self.files.len(),
+            self.diagnostics.len()
+        )
+    }
 }
 
 /// A single output file.
@@ -93,6 +136,12 @@ pub struct OutputFile {
     pub content: OutputContent,
 }
 
+impl fmt::Display for OutputFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
 /// Content of an output file.
 #[derive(Clone, Debug)]
 pub enum OutputContent {
@@ -100,6 +149,15 @@ pub enum OutputContent {
     Text(String),
     /// Raw binary data.
     Binary(Vec<u8>),
+}
+
+impl fmt::Display for OutputContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(s) => write!(f, "Text({} chars)", s.len()),
+            Self::Binary(b) => write!(f, "Binary({} bytes)", b.len()),
+        }
+    }
 }
 
 /// A non-fatal diagnostic message from a backend.
@@ -111,6 +169,12 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+impl fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}] {}", self.level, self.message)
+    }
+}
+
 /// Severity level for diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagnosticLevel {
@@ -118,6 +182,15 @@ pub enum DiagnosticLevel {
     Warning,
     /// An informational note.
     Info,
+}
+
+impl fmt::Display for DiagnosticLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Warning => "Warning",
+            Self::Info => "Info",
+        })
+    }
 }
 
 /// Errors that can occur during backend compilation.
