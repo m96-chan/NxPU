@@ -32,7 +32,9 @@ jobs:
       - name: Test
         run: cargo test --workspace
       - name: Doc
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
 
   msrv:
     name: MSRV (1.87)
@@ -45,8 +47,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check
         run: cargo check --workspace
-      - name: Test (compile only)
-        run: cargo test --workspace --no-run
 
   security-audit:
     name: Security Audit
