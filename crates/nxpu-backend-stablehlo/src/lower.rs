@@ -7,10 +7,11 @@ use nxpu_analysis::analyze::data_type;
 use nxpu_analysis::analyze::{
     ActivationOp, ElementWiseOp, KernelPattern, PoolKind, ReduceOp, TensorBinding,
 };
+use nxpu_backend_core::BackendError;
 
 /// Build StableHLO MLIR text from a classified kernel pattern.
-pub fn build_mlir(pattern: &KernelPattern, ep_name: &str) -> String {
-    match pattern {
+pub fn build_mlir(pattern: &KernelPattern, ep_name: &str) -> Result<String, BackendError> {
+    let mlir = match pattern {
         KernelPattern::MatMul {
             inputs,
             output,
@@ -78,9 +79,12 @@ pub fn build_mlir(pattern: &KernelPattern, ep_name: &str) -> String {
             ..
         } => build_attention_mlir(query, key, value, output, d_k, ep_name),
         KernelPattern::Unknown { reason } => {
-            panic!("cannot lower Unknown pattern to StableHLO: {reason}")
+            return Err(BackendError::Unsupported(format!(
+                "cannot lower Unknown pattern to StableHLO: {reason}"
+            )));
         }
-    }
+    };
+    Ok(mlir)
 }
 
 fn onnx_to_mlir_type(onnx_dt: i32) -> &'static str {
@@ -726,7 +730,7 @@ mod tests {
             },
         };
 
-        let mlir = build_mlir(&pattern, "matmul_kernel");
+        let mlir = build_mlir(&pattern, "matmul_kernel").unwrap();
         assert!(mlir.contains("stablehlo.dot_general"));
         assert!(mlir.contains("module @matmul_kernel"));
         assert!(mlir.contains("%A"));
@@ -746,7 +750,7 @@ mod tests {
             dim_name: "N".into(),
         };
 
-        let mlir = build_mlir(&pattern, "vecadd");
+        let mlir = build_mlir(&pattern, "vecadd").unwrap();
         assert!(mlir.contains("stablehlo.add"));
         assert!(mlir.contains("module @vecadd"));
     }
@@ -767,7 +771,7 @@ mod tests {
                 output: make_tensor("c", TensorRole::Output),
                 dim_name: "N".into(),
             };
-            let mlir = build_mlir(&pattern, "test");
+            let mlir = build_mlir(&pattern, "test").unwrap();
             assert!(mlir.contains(expected), "missing {expected}");
         }
     }
@@ -794,7 +798,7 @@ mod tests {
                 pad_w: 0,
             },
         };
-        let mlir = build_mlir(&pattern, "conv2d");
+        let mlir = build_mlir(&pattern, "conv2d").unwrap();
         assert!(mlir.contains("stablehlo.convolution"));
     }
 
@@ -806,7 +810,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             dim_name: "N".into(),
         };
-        let mlir = build_mlir(&pattern, "relu");
+        let mlir = build_mlir(&pattern, "relu").unwrap();
         assert!(mlir.contains("stablehlo.maximum"));
     }
 
@@ -818,7 +822,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             dim_name: "N".into(),
         };
-        let mlir = build_mlir(&pattern, "tanh_test");
+        let mlir = build_mlir(&pattern, "tanh_test").unwrap();
         assert!(mlir.contains("stablehlo.tanh"));
     }
 
@@ -835,7 +839,7 @@ mod tests {
                 stride_w: 2,
             },
         };
-        let mlir = build_mlir(&pattern, "maxpool");
+        let mlir = build_mlir(&pattern, "maxpool").unwrap();
         assert!(mlir.contains("stablehlo.reduce_window"));
     }
 
@@ -847,7 +851,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             axis: 1,
         };
-        let mlir = build_mlir(&pattern, "reduce_sum");
+        let mlir = build_mlir(&pattern, "reduce_sum").unwrap();
         assert!(mlir.contains("stablehlo.reduce"));
     }
 
@@ -858,7 +862,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             perm: vec![1, 0],
         };
-        let mlir = build_mlir(&pattern, "transpose");
+        let mlir = build_mlir(&pattern, "transpose").unwrap();
         assert!(mlir.contains("stablehlo.transpose"));
     }
 
@@ -871,7 +875,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             epsilon: 1e-5,
         };
-        let mlir = build_mlir(&pattern, "batchnorm");
+        let mlir = build_mlir(&pattern, "batchnorm").unwrap();
         assert!(mlir.contains("stablehlo.batch_norm_inference"));
     }
 }

@@ -16,7 +16,7 @@ jobs:
     strategy:
       matrix:
         toolchain: [stable, nightly]
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -25,13 +25,14 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
+        if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
       - name: Doc
-        run: cargo doc --workspace --no-deps
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
   msrv:
     name: MSRV (1.87)
@@ -44,6 +45,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check
         run: cargo check --workspace
+      - name: Test (compile only)
+        run: cargo test --workspace --no-run
 
   security-audit:
     name: Security Audit

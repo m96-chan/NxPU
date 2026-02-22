@@ -7,11 +7,12 @@ use nxpu_analysis::analyze::data_type;
 use nxpu_analysis::analyze::{
     ActivationOp, ElementWiseOp, KernelPattern, PoolKind, ReduceOp, TensorBinding,
 };
+use nxpu_backend_core::BackendError;
 
 use crate::proto::*;
 
 /// Build a CoreML model from a classified kernel pattern.
-pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
+pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<Model, BackendError> {
     let (inputs, outputs, operations) = match pattern {
         KernelPattern::MatMul {
             inputs,
@@ -135,7 +136,9 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
             ..
         } => build_attention(query, key, value, output),
         KernelPattern::Unknown { reason } => {
-            panic!("cannot lower Unknown pattern to CoreML: {reason}")
+            return Err(BackendError::Unsupported(format!(
+                "cannot lower Unknown pattern to CoreML: {reason}"
+            )));
         }
     };
 
@@ -155,7 +158,7 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
 
     let output_names = outputs.iter().map(|b| b.name.clone()).collect();
 
-    Model {
+    Ok(Model {
         specification_version: SPECIFICATION_VERSION,
         description: Some(ModelDescription {
             input: feature_inputs,
@@ -182,7 +185,7 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Model {
                 }),
             }],
         })),
-    }
+    })
 }
 
 fn onnx_to_coreml_type(onnx_dt: i32) -> ArrayDataType {
@@ -480,7 +483,7 @@ mod tests {
             },
         };
 
-        let model = build_model(&pattern, "matmul_kernel");
+        let model = build_model(&pattern, "matmul_kernel").unwrap();
         assert_eq!(model.specification_version, SPECIFICATION_VERSION);
 
         let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
@@ -502,7 +505,7 @@ mod tests {
             dim_name: "N".into(),
         };
 
-        let model = build_model(&pattern, "vecadd");
+        let model = build_model(&pattern, "vecadd").unwrap();
         let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations[0].r#type, "add");
@@ -516,7 +519,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             dim_name: "N".into(),
         };
-        let model = build_model(&pattern, "relu");
+        let model = build_model(&pattern, "relu").unwrap();
         let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations[0].r#type, "relu");
@@ -535,7 +538,7 @@ mod tests {
                 stride_w: 2,
             },
         };
-        let model = build_model(&pattern, "maxpool");
+        let model = build_model(&pattern, "maxpool").unwrap();
         let model::Type::MlProgram(prog) = model.r#type.as_ref().unwrap();
         let block = prog.functions[0].block.as_ref().unwrap();
         assert_eq!(block.operations[0].r#type, "max_pool");

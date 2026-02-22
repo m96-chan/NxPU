@@ -199,6 +199,7 @@ impl<T> Arena<T> {
 
     /// Iterates over `(handle, &value)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (Handle<T>, &T)> {
+        // Safety: arena size bounded by u32::MAX (enforced in append)
         self.data
             .iter()
             .enumerate()
@@ -207,6 +208,7 @@ impl<T> Arena<T> {
 
     /// Iterates over `(handle, &mut value)` pairs.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Handle<T>, &mut T)> {
+        // Safety: arena size bounded by u32::MAX (enforced in append)
         self.data
             .iter_mut()
             .enumerate()
@@ -283,6 +285,7 @@ impl<T: Hash + Eq> UniqueArena<T> {
 
     /// Iterates over `(handle, &value)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (Handle<T>, &T)> {
+        // Safety: arena size bounded by u32::MAX (enforced in insert)
         self.data
             .iter()
             .enumerate()

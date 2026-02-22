@@ -9,6 +9,7 @@ use nxpu_analysis::analyze::{
     ActivationOp, Conv2DShape, ElementWiseOp, KernelPattern, PoolKind, PoolShape, ReduceOp,
     TensorBinding,
 };
+use nxpu_backend_core::BackendError;
 
 use crate::schema::{
     builtin_op, builtin_options_type, conv2d_options, pool2d_options, softmax_options, tensor_type,
@@ -19,8 +20,8 @@ use crate::schema::{
 const TFLITE_FILE_ID: &str = "TFL3";
 
 /// Build a TFLite FlatBuffer model from a classified kernel pattern.
-pub fn build_model(pattern: &KernelPattern) -> Vec<u8> {
-    match pattern {
+pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
+    let bytes = match pattern {
         KernelPattern::MatMul {
             inputs,
             output,
@@ -166,9 +167,12 @@ pub fn build_model(pattern: &KernelPattern) -> Vec<u8> {
             ..
         } => build_tflite_attention(query, key, value, output, d_k),
         KernelPattern::Unknown { reason } => {
-            panic!("cannot lower Unknown pattern to TFLite: {reason}")
+            return Err(BackendError::Unsupported(format!(
+                "cannot lower Unknown pattern to TFLite: {reason}"
+            )));
         }
-    }
+    };
+    Ok(bytes)
 }
 
 /// Convert ONNX data type to TFLite TensorType.
@@ -1328,7 +1332,7 @@ mod tests {
                 k: "K".into(),
             },
         };
-        let bytes = build_model(&pattern);
+        let bytes = build_model(&pattern).unwrap();
         assert!(bytes.len() > 8);
         assert_eq!(&bytes[4..8], b"TFL3");
     }
@@ -1344,7 +1348,7 @@ mod tests {
             output: make_tensor("z", TensorRole::Output),
             dim_name: "N".into(),
         };
-        let bytes = build_model(&pattern);
+        let bytes = build_model(&pattern).unwrap();
         assert!(bytes.len() > 8);
         assert_eq!(&bytes[4..8], b"TFL3");
     }
@@ -1366,7 +1370,7 @@ mod tests {
                 output: make_tensor("c", TensorRole::Output),
                 dim_name: "N".into(),
             };
-            let bytes = build_model(&pattern);
+            let bytes = build_model(&pattern).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
         }
     }
@@ -1393,7 +1397,7 @@ mod tests {
                 pad_w: 0,
             },
         };
-        let bytes = build_model(&pattern);
+        let bytes = build_model(&pattern).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -1410,7 +1414,7 @@ mod tests {
                 output: make_tensor("y", TensorRole::Output),
                 dim_name: "N".into(),
             };
-            let bytes = build_model(&pattern);
+            let bytes = build_model(&pattern).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
         }
     }
@@ -1429,7 +1433,7 @@ mod tests {
                     stride_w: 2,
                 },
             };
-            let bytes = build_model(&pattern);
+            let bytes = build_model(&pattern).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", kind);
         }
     }
@@ -1442,7 +1446,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             axis: 1,
         };
-        let bytes = build_model(&pattern);
+        let bytes = build_model(&pattern).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 }

@@ -259,11 +259,13 @@ fn rewrite_elem_precision(module: &mut Module, target_scalar: Scalar) -> bool {
     for (old_handle, size, old_stride) in array_types {
         let numerator = old_stride as u64 * target_scalar.width as u64;
         let f32_width = Scalar::F32.width as u64;
-        assert!(
-            numerator.is_multiple_of(f32_width),
-            "stride {old_stride} not evenly divisible when converting to {:?}",
-            target_scalar,
-        );
+        if !numerator.is_multiple_of(f32_width) {
+            log::warn!(
+                "stride {old_stride} not evenly divisible when converting to {:?}, skipping",
+                target_scalar,
+            );
+            continue;
+        }
         let new_stride = (numerator / f32_width) as u32;
         let new_handle = module.types.insert(Type {
             name: None,
@@ -401,17 +403,19 @@ impl Pass for MixedPrecisionPass {
 
             let new_ty = match type_info {
                 Some((true, size, stride, _)) => {
+                    let numerator = stride as u64 * target_scalar.width as u64;
+                    let f32_width = Scalar::F32.width as u64;
+                    if !numerator.is_multiple_of(f32_width) {
+                        log::warn!(
+                            "stride {stride} not evenly divisible when converting to {:?}, skipping",
+                            target_scalar,
+                        );
+                        continue;
+                    }
                     let target_handle = module.types.insert(Type {
                         name: None,
                         inner: TypeInner::Scalar(target_scalar),
                     });
-                    let numerator = stride as u64 * target_scalar.width as u64;
-                    let f32_width = Scalar::F32.width as u64;
-                    assert!(
-                        numerator.is_multiple_of(f32_width),
-                        "stride {stride} not evenly divisible when converting to {:?}",
-                        target_scalar,
-                    );
                     let new_stride = (numerator / f32_width) as u32;
                     Some(module.types.insert(Type {
                         name: None,

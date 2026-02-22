@@ -4,6 +4,7 @@
 //! element-wise ops) and emits ONNX (`.onnx`) model files using protobuf
 //! serialization via prost.
 
+use nxpu_analysis::{analyze, fusion};
 use nxpu_backend_core::{
     Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
     OutputContent, OutputFile,
@@ -11,15 +12,9 @@ use nxpu_backend_core::{
 use nxpu_ir::Module;
 use prost::Message;
 
-pub mod analyze;
-pub mod fusion;
 mod lower;
+#[doc(hidden)]
 pub mod proto;
-
-pub use analyze::{
-    ActivationOp, AnalysisError, Conv2DShape, ElementWiseOp, KernelPattern, MatMulShape, PoolKind,
-    PoolShape, ReduceOp, TensorBinding, classify_entry_point,
-};
 
 /// ONNX backend that compiles NxPU IR into `.onnx` model files.
 #[derive(Debug)]
@@ -49,7 +44,7 @@ impl Backend for OnnxBackend {
             let pattern = analyze::classify_entry_point(module, i).map_err(|e| {
                 BackendError::Unsupported(format!("entry point '{}': {e}", ep.name))
             })?;
-            if let KernelPattern::Unknown { reason } = &pattern {
+            if let analyze::KernelPattern::Unknown { reason } = &pattern {
                 return Err(BackendError::Unsupported(format!(
                     "entry point '{}': unrecognized pattern: {reason}",
                     ep.name
@@ -111,21 +106,21 @@ impl Backend for OnnxBackend {
     }
 }
 
-fn pattern_summary(pattern: &KernelPattern) -> &'static str {
+fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
     match pattern {
-        KernelPattern::MatMul { .. } => "MatMul",
-        KernelPattern::ElementWise { op, .. } => op.op_name(),
-        KernelPattern::Conv2D { .. } => "Conv",
-        KernelPattern::Pool { kind, .. } => kind.op_name(),
-        KernelPattern::Activation { op, .. } => op.op_name(),
-        KernelPattern::Reduce { op, .. } => op.op_name(),
-        KernelPattern::Transpose { .. } => "Transpose",
-        KernelPattern::Reshape { .. } => "Reshape",
-        KernelPattern::Normalization { .. } => "BatchNormalization",
-        KernelPattern::Concat { .. } => "Concat",
-        KernelPattern::Split { .. } => "Split",
-        KernelPattern::Attention { .. } => "Attention",
-        KernelPattern::Unknown { .. } => "Unknown",
+        analyze::KernelPattern::MatMul { .. } => "MatMul",
+        analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
+        analyze::KernelPattern::Conv2D { .. } => "Conv",
+        analyze::KernelPattern::Pool { kind, .. } => kind.op_name(),
+        analyze::KernelPattern::Activation { op, .. } => op.op_name(),
+        analyze::KernelPattern::Reduce { op, .. } => op.op_name(),
+        analyze::KernelPattern::Transpose { .. } => "Transpose",
+        analyze::KernelPattern::Reshape { .. } => "Reshape",
+        analyze::KernelPattern::Normalization { .. } => "BatchNormalization",
+        analyze::KernelPattern::Concat { .. } => "Concat",
+        analyze::KernelPattern::Split { .. } => "Split",
+        analyze::KernelPattern::Attention { .. } => "Attention",
+        analyze::KernelPattern::Unknown { .. } => "Unknown",
     }
 }
 

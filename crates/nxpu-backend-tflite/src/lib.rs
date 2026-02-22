@@ -70,7 +70,7 @@ impl Backend for TfLiteBackend {
                 message: format!("entry point '{}': classified as {}", ep.name, summary),
             });
 
-            let bytes = lower::build_model(&pattern);
+            let bytes = lower::build_model(&pattern)?;
 
             let filename = if module.entry_points.len() == 1 {
                 "output.tflite".into()

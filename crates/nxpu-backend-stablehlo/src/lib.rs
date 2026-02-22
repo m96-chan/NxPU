@@ -69,7 +69,7 @@ impl Backend for StableHloBackend {
                 message: format!("entry point '{}': StableHLO {}", ep.name, summary),
             });
 
-            let mlir = lower::build_mlir(&pattern, &ep.name);
+            let mlir = lower::build_mlir(&pattern, &ep.name)?;
 
             let filename = if module.entry_points.len() == 1 {
                 "output.mlir".into()

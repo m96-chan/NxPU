@@ -3,12 +3,12 @@
 //! Converts a [`KernelPattern`] into an ONNX [`ModelProto`] with the
 //! appropriate graph topology.
 
-use crate::analyze::{
+use crate::proto::*;
+use nxpu_analysis::analyze::{
     ActivationOp, Conv2DShape, ElementWiseOp, KernelPattern, MatMulShape, PoolKind, PoolShape,
     ReduceOp, TensorBinding,
 };
-use crate::fusion::{FusedActivation, FusedPattern};
-use crate::proto::*;
+use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
 use nxpu_backend_core::BackendError;
 
 /// Build an ONNX model from a classified kernel pattern.
@@ -103,7 +103,7 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<ModelProto,
 ///
 /// Handles single patterns, Conv+BatchNorm fusion, and activation fusion.
 pub fn build_fused_model(
-    fp: &crate::fusion::FusedPattern,
+    fp: &nxpu_analysis::fusion::FusedPattern,
     ep_name: &str,
 ) -> Result<ModelProto, BackendError> {
     match fp {
@@ -832,8 +832,8 @@ fn build_attention_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyze::TensorRole;
     use crate::proto::{data_type, tensor_shape_dimension, type_proto};
+    use nxpu_analysis::analyze::TensorRole;
     use nxpu_ir::Handle;
 
     fn dummy_handle() -> Handle<nxpu_ir::GlobalVariable> {
