@@ -10,7 +10,7 @@ repository.workspace = true
 nxpu-ir = { path = "../nxpu-ir" }
 nxpu-backend-core = { path = "../nxpu-backend-core" }
 nxpu-analysis = { path = "../nxpu-analysis" }
-thiserror = "2"
+thiserror.workspace = true
 
 [dev-dependencies]
 nxpu-parser = { path = "../nxpu-parser" }

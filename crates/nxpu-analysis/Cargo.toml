@@ -7,4 +7,4 @@ license.workspace = true
 [dependencies]
 nxpu-ir = { path = "../nxpu-ir" }
 nxpu-backend-core = { path = "../nxpu-backend-core" }
-thiserror = "2"
+thiserror.workspace = true

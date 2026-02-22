@@ -3,7 +3,7 @@
 //! Evaluates binary and unary operations on literal operands at compile time,
 //! replacing them with the resulting literal in the expression arena.
 
-use nxpu_ir::{BinaryOp, Expression, Function, Handle, Literal, MathFunction, Module, UnaryOp};
+use nxpu_ir::{Arena, BinaryOp, Expression, Handle, Literal, MathFunction, Module, UnaryOp};
 
 use crate::Pass;
 
@@ -18,27 +18,27 @@ impl Pass for ConstantFolding {
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
+        changed |= fold_expression_arena(&mut module.global_expressions);
         for (_, func) in module.functions.iter_mut() {
-            changed |= run_on_function(func);
+            changed |= fold_expression_arena(&mut func.expressions);
         }
         for ep in &mut module.entry_points {
-            changed |= run_on_function(&mut ep.function);
+            changed |= fold_expression_arena(&mut ep.function.expressions);
         }
         changed
     }
 }
 
-fn run_on_function(func: &mut Function) -> bool {
+fn fold_expression_arena(arena: &mut Arena<Expression>) -> bool {
     let mut changed = false;
 
-    // Collect handles first to avoid borrowing the arena while mutating.
-    let handles: Vec<Handle<Expression>> = func.expressions.iter().map(|(h, _)| h).collect();
+    let handles: Vec<Handle<Expression>> = arena.iter().map(|(h, _)| h).collect();
 
     for handle in handles {
-        let replacement = match &func.expressions[handle] {
+        let replacement = match &arena[handle] {
             Expression::Binary { op, left, right } => {
-                let left_val = &func.expressions[*left];
-                let right_val = &func.expressions[*right];
+                let left_val = &arena[*left];
+                let right_val = &arena[*right];
                 if let (Expression::Literal(l), Expression::Literal(r)) = (left_val, right_val) {
                     fold_binary(*op, *l, *r).map(Expression::Literal)
                 } else {
@@ -46,7 +46,7 @@ fn run_on_function(func: &mut Function) -> bool {
                 }
             }
             Expression::Unary { op, expr } => {
-                if let Expression::Literal(lit) = &func.expressions[*expr] {
+                if let Expression::Literal(lit) = &arena[*expr] {
                     fold_unary(*op, *lit).map(Expression::Literal)
                 } else {
                     None
@@ -60,16 +60,16 @@ fn run_on_function(func: &mut Function) -> bool {
                 arg3: _,
             } => fold_math(
                 *fun,
-                &func.expressions[*arg],
-                arg1.map(|h| &func.expressions[h]),
-                arg2.map(|h| &func.expressions[h]),
+                &arena[*arg],
+                arg1.map(|h| &arena[h]),
+                arg2.map(|h| &arena[h]),
             )
             .map(Expression::Literal),
             _ => None,
         };
 
         if let Some(new_expr) = replacement {
-            func.expressions[handle] = new_expr;
+            arena[handle] = new_expr;
             changed = true;
         }
     }
@@ -261,7 +261,7 @@ fn fold_math(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nxpu_ir::Literal;
+    use nxpu_ir::{Function, Literal};
 
     #[test]
     fn fold_f32_add() {
@@ -278,7 +278,7 @@ mod tests {
             right: two,
         });
 
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         match &func.expressions[add] {
             Expression::Literal(Literal::F32(v)) => assert_eq!(*v, 3.0),
@@ -301,7 +301,7 @@ mod tests {
             right: four,
         });
 
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         match &func.expressions[mul] {
             Expression::Literal(Literal::I32(v)) => assert_eq!(*v, 12),
@@ -320,7 +320,7 @@ mod tests {
             expr: five,
         });
 
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         match &func.expressions[neg] {
             Expression::Literal(Literal::F32(v)) => assert_eq!(*v, -5.0),
@@ -341,7 +341,7 @@ mod tests {
             right: lit,
         });
 
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(!changed);
     }
 
@@ -360,7 +360,7 @@ mod tests {
             right: b,
         });
 
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         match &func.expressions[cmp] {
             Expression::Literal(Literal::Bool(v)) => assert!(*v),
@@ -392,7 +392,7 @@ mod tests {
             right: c,
         });
 
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         // mul should be folded to 6.0, then add should be folded to 10.0.
         match &func.expressions[add] {
@@ -461,7 +461,7 @@ mod tests {
     fn fold_math_abs() {
         let mut func = Function::new("test");
         let h = make_math1(&mut func, MathFunction::Abs, -3.0);
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         match &func.expressions[h] {
             Expression::Literal(Literal::F32(v)) => assert_eq!(*v, 3.0),
@@ -473,7 +473,7 @@ mod tests {
     fn fold_math_sqrt() {
         let mut func = Function::new("test");
         let h = make_math1(&mut func, MathFunction::Sqrt, 9.0);
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         match &func.expressions[h] {
             Expression::Literal(Literal::F32(v)) => assert_eq!(*v, 3.0),
@@ -486,7 +486,7 @@ mod tests {
         let mut func = Function::new("test");
         let min_h = make_math2(&mut func, MathFunction::Min, 2.0, 5.0);
         let max_h = make_math2(&mut func, MathFunction::Max, 2.0, 5.0);
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         match &func.expressions[min_h] {
             Expression::Literal(Literal::F32(v)) => assert_eq!(*v, 2.0),
@@ -502,7 +502,7 @@ mod tests {
     fn fold_math_clamp() {
         let mut func = Function::new("test");
         let h = make_math3(&mut func, MathFunction::Clamp, 10.0, 0.0, 5.0);
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         match &func.expressions[h] {
             Expression::Literal(Literal::F32(v)) => assert_eq!(*v, 5.0),
@@ -514,7 +514,7 @@ mod tests {
     fn fold_math_trig() {
         let mut func = Function::new("test");
         let h = make_math1(&mut func, MathFunction::Sin, 0.0);
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         match &func.expressions[h] {
             Expression::Literal(Literal::F32(v)) => assert!(v.abs() < 1e-6),
@@ -527,7 +527,7 @@ mod tests {
         let mut func = Function::new("test");
         // fma(2.0, 3.0, 4.0) = 2*3 + 4 = 10
         let h = make_math3(&mut func, MathFunction::Fma, 2.0, 3.0, 4.0);
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(changed);
         match &func.expressions[h] {
             Expression::Literal(Literal::F32(v)) => assert_eq!(*v, 10.0),
@@ -550,7 +550,7 @@ mod tests {
             right: b,
         });
 
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(!changed);
         // Should remain a Binary expression (not folded to Inf).
         assert!(matches!(&func.expressions[div], Expression::Binary { .. }));
@@ -560,7 +560,7 @@ mod tests {
     fn no_fold_sqrt_negative() {
         let mut func = Function::new("test");
         let h = make_math1(&mut func, MathFunction::Sqrt, -1.0);
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(!changed);
         assert!(matches!(&func.expressions[h], Expression::Math { .. }));
     }
@@ -569,7 +569,7 @@ mod tests {
     fn no_fold_log_zero() {
         let mut func = Function::new("test");
         let h = make_math1(&mut func, MathFunction::Log, 0.0);
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(!changed);
         assert!(matches!(&func.expressions[h], Expression::Math { .. }));
     }
@@ -585,7 +585,33 @@ mod tests {
             arg2: None,
             arg3: None,
         });
-        let changed = run_on_function(&mut func);
+        let changed = fold_expression_arena(&mut func.expressions);
         assert!(!changed);
+    }
+
+    #[test]
+    fn fold_global_expression() {
+        use nxpu_ir::Module;
+
+        let mut module = Module::default();
+        let one = module
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        let two = module
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(3.0)));
+        let add = module.global_expressions.append(Expression::Binary {
+            op: BinaryOp::Add,
+            left: one,
+            right: two,
+        });
+
+        let pass = ConstantFolding;
+        let changed = pass.run(&mut module);
+        assert!(changed);
+        match &module.global_expressions[add] {
+            Expression::Literal(Literal::F32(v)) => assert_eq!(*v, 5.0),
+            other => panic!("expected Literal(F32(5.0)), got {other:?}"),
+        }
     }
 }

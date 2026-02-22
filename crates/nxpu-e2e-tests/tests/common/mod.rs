@@ -104,3 +104,19 @@ pub fn try_compile_wgsl(
 pub fn parse_wgsl(source: &str) -> Module {
     nxpu_parser::parse(source).expect("WGSL parse failed")
 }
+
+/// Compile a pre-built module with a backend, returning a Result.
+#[allow(dead_code)]
+pub fn try_compile_wgsl_from_module(
+    module: &Module,
+    backend: &dyn Backend,
+    opt_level: u8,
+) -> Result<BackendOutput, nxpu_backend_core::BackendError> {
+    backend.compile(
+        module,
+        &BackendOptions {
+            opt_level,
+            ..Default::default()
+        },
+    )
+}

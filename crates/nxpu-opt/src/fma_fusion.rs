@@ -3,9 +3,12 @@
 //! Detects `a * b + c` patterns and replaces them with `fma(a, b, c)`.
 //! This is a common NPU/GPU optimization that reduces two operations to one.
 
-use nxpu_ir::{BinaryOp, Expression, Function, Handle, MathFunction, Module};
+use std::collections::HashMap;
+
+use nxpu_ir::{Arena, BinaryOp, Expression, Function, Handle, MathFunction, Module};
 
 use crate::Pass;
+use crate::dce::expression_operands;
 
 /// Fuses multiply-add patterns into `fma` math operations.
 #[derive(Debug)]
@@ -28,9 +31,21 @@ impl Pass for FmaFusion {
     }
 }
 
+/// Count how many times each expression handle is referenced as an operand.
+fn build_ref_counts(arena: &Arena<Expression>) -> HashMap<Handle<Expression>, usize> {
+    let mut counts: HashMap<Handle<Expression>, usize> = HashMap::new();
+    for (_, expr) in arena.iter() {
+        for operand in expression_operands(expr) {
+            *counts.entry(operand).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
 fn run_on_function(func: &mut Function) -> bool {
     let mut changed = false;
 
+    let ref_counts = build_ref_counts(&func.expressions);
     let handles: Vec<Handle<Expression>> = func.expressions.iter().map(|(h, _)| h).collect();
 
     for handle in handles {
@@ -39,7 +54,7 @@ fn run_on_function(func: &mut Function) -> bool {
                 op: BinaryOp::Add,
                 left,
                 right,
-            } => try_fuse_fma(&func.expressions, *left, *right),
+            } => try_fuse_fma(&func.expressions, *left, *right, &ref_counts),
             _ => None,
         };
 
@@ -57,10 +72,14 @@ fn run_on_function(func: &mut Function) -> bool {
 /// Matches:
 /// - `(a * b) + c`  →  `fma(a, b, c)`
 /// - `c + (a * b)`  →  `fma(a, b, c)`
+///
+/// Skips fusion if the multiply expression is referenced more than once,
+/// since replacing it would change semantics for other users.
 fn try_fuse_fma(
     exprs: &nxpu_ir::Arena<Expression>,
     left: Handle<Expression>,
     right: Handle<Expression>,
+    ref_counts: &HashMap<Handle<Expression>, usize>,
 ) -> Option<Expression> {
     // Pattern 1: left = a * b, addend = right
     if let Expression::Binary {
@@ -69,6 +88,9 @@ fn try_fuse_fma(
         right: b,
     } = &exprs[left]
     {
+        if ref_counts.get(&left).copied().unwrap_or(0) > 1 {
+            return None;
+        }
         return Some(Expression::Math {
             fun: MathFunction::Fma,
             arg: *a,
@@ -85,6 +107,9 @@ fn try_fuse_fma(
         right: b,
     } = &exprs[right]
     {
+        if ref_counts.get(&right).copied().unwrap_or(0) > 1 {
+            return None;
+        }
         return Some(Expression::Math {
             fun: MathFunction::Fma,
             arg: *a,
@@ -231,5 +256,77 @@ mod tests {
 
         let changed = run_on_function(&mut func);
         assert!(!changed);
+    }
+
+    #[test]
+    fn no_fusion_multi_use_multiply() {
+        // mul is used by both add1 and add2, so fusion should be skipped.
+        let mut func = Function::new("test");
+        let a = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        let b = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(3.0)));
+        let c = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(4.0)));
+        let d = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(5.0)));
+        let mul = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Multiply,
+            left: a,
+            right: b,
+        });
+        // Two additions using the same multiply.
+        let _add1 = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Add,
+            left: mul,
+            right: c,
+        });
+        let _add2 = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Add,
+            left: mul,
+            right: d,
+        });
+
+        let changed = run_on_function(&mut func);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn fusion_single_use_multiply() {
+        // mul is only used once — fusion should proceed.
+        let mut func = Function::new("test");
+        let a = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        let b = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(3.0)));
+        let c = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(4.0)));
+        let mul = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Multiply,
+            left: a,
+            right: b,
+        });
+        let add = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Add,
+            left: mul,
+            right: c,
+        });
+
+        let changed = run_on_function(&mut func);
+        assert!(changed);
+        assert!(matches!(
+            &func.expressions[add],
+            Expression::Math {
+                fun: MathFunction::Fma,
+                ..
+            }
+        ));
     }
 }

@@ -73,7 +73,7 @@ impl Backend for MyVendorBackend {
         }
 
         // Use the shared analysis to classify entry points
-        // (add nxpu-backend-onnx as a dependency if needed)
+        // (add nxpu-analysis as a dependency if needed)
 
         let files = vec![OutputFile {
             name: "output.bin".into(),
@@ -108,23 +108,28 @@ nxpu-backend-myvendor = { path = "../nxpu-backend-myvendor" }
 
 ## 4. Using Shared Analysis
 
-Most backends reuse the pattern analysis from `nxpu-backend-onnx::analyze`:
+Most backends reuse the pattern analysis from `nxpu-analysis`:
 
 ```rust
-use nxpu_backend_onnx::analyze;
+use nxpu_analysis::{classify_entry_point, KernelPattern};
 
 fn compile(&self, module: &Module, _opts: &BackendOptions) -> Result<BackendOutput, BackendError> {
     for (i, ep) in module.entry_points.iter().enumerate() {
-        let pattern = analyze::classify_entry_point(module, i)
+        let pattern = classify_entry_point(module, i)
             .map_err(|e| BackendError::Unsupported(format!("{e}")))?;
 
         match &pattern {
-            analyze::KernelPattern::MatMul { inputs, output, shape } => {
+            KernelPattern::MatMul { inputs, output, shape } => {
                 // Emit vendor-specific MatMul
             }
-            analyze::KernelPattern::ElementWise { op, inputs, output, .. } => {
+            KernelPattern::ElementWise { op, inputs, output, .. } => {
                 // Emit vendor-specific elementwise op
             }
+            KernelPattern::Conv2D { input, weight, output, shape } => {
+                // Emit vendor-specific Conv2D
+            }
+            // ... handle other patterns
+            _ => {}
         }
     }
     // ...

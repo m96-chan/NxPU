@@ -10,6 +10,7 @@ mod fma_fusion;
 pub mod layout;
 pub mod quantize;
 pub mod shape;
+mod validation;
 
 pub use const_fold::ConstantFolding;
 pub use dce::DeadCodeElimination;
@@ -20,6 +21,7 @@ pub use quantize::{
     QuantizationParams,
 };
 pub use shape::ShapeInference;
+pub use validation::IrValidation;
 
 use std::fmt::Debug;
 
@@ -71,6 +73,7 @@ impl PassManager {
         match level {
             OptLevel::O0 => {}
             OptLevel::O1 | OptLevel::O2 => {
+                pm.add_pass(Box::new(IrValidation));
                 pm.add_pass(Box::new(ConstantFolding));
                 pm.add_pass(Box::new(FmaFusion));
                 pm.add_pass(Box::new(DeadCodeElimination));
@@ -86,12 +89,20 @@ impl PassManager {
 
     /// Runs all passes until a fixed point is reached or the iteration limit.
     pub fn run(&self, module: &mut Module) {
-        for _ in 0..MAX_ITERATIONS {
+        for iteration in 0..MAX_ITERATIONS {
             let mut changed = false;
             for pass in &self.passes {
-                changed |= pass.run(module);
+                let pass_changed = pass.run(module);
+                log::debug!(
+                    "pass '{}' iteration {}: changed={}",
+                    pass.name(),
+                    iteration,
+                    pass_changed
+                );
+                changed |= pass_changed;
             }
             if !changed {
+                log::debug!("fixed point reached after {} iteration(s)", iteration + 1);
                 break;
             }
         }

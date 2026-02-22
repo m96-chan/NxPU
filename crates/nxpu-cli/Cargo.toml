@@ -27,6 +27,8 @@ nxpu-backend-qualcomm = { path = "../nxpu-backend-qualcomm" }
 nxpu-backend-arm-ethos = { path = "../nxpu-backend-arm-ethos" }
 nxpu-backend-ceva = { path = "../nxpu-backend-ceva" }
 nxpu-backend-rockchip = { path = "../nxpu-backend-rockchip" }
-clap = { version = "4", features = ["derive"] }
-miette = { version = "7", features = ["fancy"] }
-thiserror = "2"
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+miette.workspace = true
+thiserror.workspace = true
