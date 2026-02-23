@@ -85,4 +85,4 @@ miette = { version = "7" }
 naga = { version = "28", features = ["wgsl-in"] }
 # dev-only: used by nxpu-e2e-tests
 tract-onnx = "0.21"
-ndarray = "0.16"
+ndarray = "0.17"
