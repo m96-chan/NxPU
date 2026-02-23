@@ -82,15 +82,20 @@ impl Backend for AmdBackend {
         ];
 
         for file in &mut output.files {
-            if std::path::Path::new(&file.name)
+            let is_onnx = std::path::Path::new(&file.name)
                 .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
-                && let OutputContent::Binary(bytes) = &file.content
-                && let Ok(mut model) = ModelProto::decode(bytes.as_slice())
-            {
-                model.metadata_props.extend(metadata_props.clone());
-                file.content = OutputContent::Binary(model.encode_to_vec());
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"));
+            if !is_onnx {
+                continue;
             }
+            let OutputContent::Binary(bytes) = &file.content else {
+                continue;
+            };
+            let Ok(mut model) = ModelProto::decode(bytes.as_slice()) else {
+                continue;
+            };
+            model.metadata_props.extend(metadata_props.clone());
+            file.content = OutputContent::Binary(model.encode_to_vec());
         }
 
         diagnostics.extend(output.diagnostics);
