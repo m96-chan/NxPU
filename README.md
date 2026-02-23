@@ -32,6 +32,7 @@ NPU hardware is fragmented — every vendor ships a different SDK, model format,
 - **One language, many targets** — Write WGSL once, emit ONNX, TFLite, CoreML, StableHLO, or vendor-specific formats
 - **Pattern recognition** — Automatically classifies compute kernels into MatMul, Conv2D, Attention, and 10+ other ML operations
 - **Optimization passes** — Constant folding, FMA fusion, dead code elimination, common subexpression elimination, and quantization
+- **Vendor-aware validation** — Operator support matrices for 8 NPU vendors with native/emulated/unsupported classification
 - **Pluggable backends** — Add new NPU targets by implementing a single trait
 
 ## Quick Start
@@ -99,14 +100,32 @@ The output `vecadd.onnx` can be loaded directly into any ONNX runtime.
 | `coreml` | `apple-ane` | `.mlmodel` | :white_check_mark: |
 | `stablehlo` | `xla` | `.mlir` (text) | :white_check_mark: |
 | `ir-dump` | `ir` | Text (stdout) | :white_check_mark: |
-| `samsung` | `exynos` | ONNX + SDK hint | :construction: Stub |
-| `mediatek` | `neuropilot` | TFLite + SDK hint | :construction: Stub |
-| `intel-npu` | `openvino` | ONNX + SDK hint | :construction: Stub |
-| `amd-xdna` | `amd-npu` | ONNX + SDK hint | :construction: Stub |
-| `qualcomm` | `hexagon-npu` | ONNX + SDK hint | :construction: Stub |
-| `arm-ethos` | `ethos-u` | TFLite + SDK hint | :construction: Stub |
-| `ceva` | `neupro` | ONNX + SDK hint | :construction: Stub |
-| `rockchip` | `rknn` | ONNX + SDK hint | :construction: Stub |
+| `intel-npu` | `openvino` | OpenVINO IR `.xml` + `.onnx` | :white_check_mark: |
+| `amd-xdna` | `amd-npu` | ONNX + XDNA metadata | :white_check_mark: |
+| `arm-ethos` | `ethos-u` | TFLite + optional Vela | :white_check_mark: |
+| `samsung` | `exynos` | ONNX + ONE toolchain hints | :white_check_mark: |
+| `qualcomm` | `hexagon-npu` | ONNX + QNN SDK hints | :white_check_mark: |
+| `mediatek` | `neuropilot` | TFLite + NeuroPilot hints | :white_check_mark: |
+| `rockchip` | `rknn` | ONNX + RKNN Toolkit hints | :white_check_mark: |
+| `ceva` | `neupro` | ONNX + CDNN compiler hints | :white_check_mark: |
+
+Each vendor backend includes an **operator support matrix** that validates patterns against the target NPU's capabilities, emitting warnings for emulated or unsupported operations.
+
+<details>
+<summary><b>Vendor backend details</b></summary>
+
+| Vendor | NPU Hardware | Native Precision | Output Format | SDK Toolchain |
+|:-------|:-------------|:-----------------|:--------------|:--------------|
+| **Intel** | Meteor Lake / Arrow Lake NPU | F16 | OpenVINO IR v11 (`.xml` + `.bin`) + ONNX fallback | OpenVINO (`ov::Core::read_model`) |
+| **AMD** | Ryzen AI XDNA | Int8, F16 | ONNX with XDNA metadata props | Vitis AI EP / ONNX Runtime |
+| **Arm** | Ethos-U55 (128 MAC) / U65 (512 MAC) | Int8 (U55), Int8+Int16 (U65) | TFLite + optional Vela compilation | `ethos-u-vela` compiler |
+| **Samsung** | Exynos NPU | F16, Int8 | ONNX | ONE toolchain (`one-import-onnx`, `one-codegen`) |
+| **Qualcomm** | Hexagon NPU | Int8, F16 | ONNX | QNN SDK (`qnn-onnx-converter`) |
+| **MediaTek** | Dimensity APU | Int8, F16 | TFLite | NeuroPilot SDK (`ncc-tflite`) |
+| **Rockchip** | RK3588 NPU (3 TOPS) | Int8, F16 | ONNX | RKNN Toolkit 2 (Python API) |
+| **CEVA** | NeuPro-S | Int8 | ONNX | CDNN compiler (`cdnn_cli`) |
+
+</details>
 
 ## Recognized ML Patterns
 

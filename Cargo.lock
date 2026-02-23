@@ -902,16 +902,19 @@ dependencies = [
 name = "nxpu-backend-amd"
 version = "0.2.0"
 dependencies = [
+ "nxpu-analysis",
  "nxpu-backend-core",
  "nxpu-backend-onnx",
  "nxpu-ir",
  "nxpu-parser",
+ "prost 0.14.3",
 ]
 
 [[package]]
 name = "nxpu-backend-arm-ethos"
 version = "0.2.0"
 dependencies = [
+ "nxpu-analysis",
  "nxpu-backend-core",
  "nxpu-backend-tflite",
  "nxpu-ir",
@@ -922,6 +925,7 @@ dependencies = [
 name = "nxpu-backend-ceva"
 version = "0.2.0"
 dependencies = [
+ "nxpu-analysis",
  "nxpu-backend-core",
  "nxpu-backend-onnx",
  "nxpu-ir",
@@ -952,6 +956,7 @@ dependencies = [
 name = "nxpu-backend-intel"
 version = "0.2.0"
 dependencies = [
+ "nxpu-analysis",
  "nxpu-backend-core",
  "nxpu-backend-onnx",
  "nxpu-ir",
@@ -962,6 +967,7 @@ dependencies = [
 name = "nxpu-backend-mediatek"
 version = "0.2.0"
 dependencies = [
+ "nxpu-analysis",
  "nxpu-backend-core",
  "nxpu-backend-tflite",
  "nxpu-ir",
@@ -984,6 +990,7 @@ dependencies = [
 name = "nxpu-backend-qualcomm"
 version = "0.2.0"
 dependencies = [
+ "nxpu-analysis",
  "nxpu-backend-core",
  "nxpu-backend-onnx",
  "nxpu-ir",
@@ -994,6 +1001,7 @@ dependencies = [
 name = "nxpu-backend-rockchip"
 version = "0.2.0"
 dependencies = [
+ "nxpu-analysis",
  "nxpu-backend-core",
  "nxpu-backend-onnx",
  "nxpu-ir",
@@ -1004,6 +1012,7 @@ dependencies = [
 name = "nxpu-backend-samsung"
 version = "0.2.0"
 dependencies = [
+ "nxpu-analysis",
  "nxpu-backend-core",
  "nxpu-backend-onnx",
  "nxpu-ir",
