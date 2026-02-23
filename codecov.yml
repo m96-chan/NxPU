@@ -1,0 +1,18 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        target: 80%
+
+comment:
+  layout: "reach,diff,flags,components"
+  behavior: default
+  require_changes: true
+
+ignore:
+  - "crates/nxpu-e2e-tests/**"
+  - "crates/nxpu-cli/**"
