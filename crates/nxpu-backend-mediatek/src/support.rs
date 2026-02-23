@@ -125,4 +125,29 @@ mod tests {
     fn hardware_name() {
         assert_eq!(MediaTekApuSupport.hardware_name(), "MediaTek APU");
     }
+
+    #[test]
+    fn bf16_emulated() {
+        let s = MediaTekApuSupport;
+        assert_eq!(
+            s.op_support("Conv", Precision::BF16),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn bf16_unknown_unsupported() {
+        let s = MediaTekApuSupport;
+        assert_eq!(
+            s.op_support("FakeOp", Precision::BF16),
+            PerformanceTier::Unsupported
+        );
+    }
+
+    #[test]
+    fn native_and_emulated_lists() {
+        let s = MediaTekApuSupport;
+        assert!(s.native_ops().contains(&"Conv"));
+        assert!(s.emulated_ops().contains(&"Attention"));
+    }
 }

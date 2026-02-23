@@ -140,4 +140,53 @@ mod tests {
         assert!(s.native_ops().contains(&"MatMul"));
         assert!(s.emulated_ops().contains(&"Attention"));
     }
+
+    #[test]
+    fn native_at_f16() {
+        let s = AmdXdnaSupport;
+        assert_eq!(
+            s.op_support("MatMul", Precision::F16),
+            PerformanceTier::Native
+        );
+        assert_eq!(
+            s.op_support("Conv", Precision::F16),
+            PerformanceTier::Native
+        );
+    }
+
+    #[test]
+    fn emulated_at_f16() {
+        let s = AmdXdnaSupport;
+        assert_eq!(
+            s.op_support("Attention", Precision::F16),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn bf16_emulated() {
+        let s = AmdXdnaSupport;
+        assert_eq!(
+            s.op_support("MatMul", Precision::BF16),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn bf16_unknown_unsupported() {
+        let s = AmdXdnaSupport;
+        assert_eq!(
+            s.op_support("FakeOp", Precision::BF16),
+            PerformanceTier::Unsupported
+        );
+    }
+
+    #[test]
+    fn f32_unknown_unsupported() {
+        let s = AmdXdnaSupport;
+        assert_eq!(
+            s.op_support("FakeOp", Precision::F32),
+            PerformanceTier::Unsupported
+        );
+    }
 }

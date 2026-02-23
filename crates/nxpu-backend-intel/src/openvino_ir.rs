@@ -461,4 +461,252 @@ mod tests {
         let xml = build_ir_xml(&patterns, "test_relu");
         assert!(xml.contains("type=\"ReLU\""));
     }
+
+    use nxpu_analysis::{Conv2DShape, PoolKind, PoolShape, ReduceOp};
+
+    #[test]
+    fn conv2d_ir_xml() {
+        let patterns = vec![KernelPattern::Conv2D {
+            input: dummy_binding("input", TensorRole::Input),
+            weight: dummy_binding("weight", TensorRole::Input),
+            output: dummy_binding("output", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "C".into(),
+                channels_out: "K".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                kernel_h_val: 3,
+                kernel_w_val: 3,
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 1,
+                pad_w: 1,
+            },
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_conv2d");
+        assert!(xml.contains("type=\"Convolution\""));
+        assert!(xml.contains("strides=\"1,1\""));
+        assert!(xml.contains("kernel=\"3,3\""));
+    }
+
+    #[test]
+    fn elementwise_sub_ir_xml() {
+        let patterns = vec![KernelPattern::ElementWise {
+            op: ElementWiseOp::Sub,
+            inputs: [
+                dummy_binding("X", TensorRole::Input),
+                dummy_binding("Y", TensorRole::Input),
+            ],
+            output: dummy_binding("Z", TensorRole::Output),
+            dim_name: "N".into(),
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_sub");
+        assert!(xml.contains("type=\"Subtract\""));
+    }
+
+    #[test]
+    fn elementwise_mul_ir_xml() {
+        let patterns = vec![KernelPattern::ElementWise {
+            op: ElementWiseOp::Mul,
+            inputs: [
+                dummy_binding("X", TensorRole::Input),
+                dummy_binding("Y", TensorRole::Input),
+            ],
+            output: dummy_binding("Z", TensorRole::Output),
+            dim_name: "N".into(),
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_mul");
+        assert!(xml.contains("type=\"Multiply\""));
+    }
+
+    #[test]
+    fn elementwise_div_ir_xml() {
+        let patterns = vec![KernelPattern::ElementWise {
+            op: ElementWiseOp::Div,
+            inputs: [
+                dummy_binding("X", TensorRole::Input),
+                dummy_binding("Y", TensorRole::Input),
+            ],
+            output: dummy_binding("Z", TensorRole::Output),
+            dim_name: "N".into(),
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_div");
+        assert!(xml.contains("type=\"Divide\""));
+    }
+
+    #[test]
+    fn sigmoid_ir_xml() {
+        let patterns = vec![KernelPattern::Activation {
+            op: ActivationOp::Sigmoid,
+            input: dummy_binding("X", TensorRole::Input),
+            output: dummy_binding("Y", TensorRole::Output),
+            dim_name: "N".into(),
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_sigmoid");
+        assert!(xml.contains("type=\"Sigmoid\""));
+    }
+
+    #[test]
+    fn tanh_ir_xml() {
+        let patterns = vec![KernelPattern::Activation {
+            op: ActivationOp::Tanh,
+            input: dummy_binding("X", TensorRole::Input),
+            output: dummy_binding("Y", TensorRole::Output),
+            dim_name: "N".into(),
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_tanh");
+        assert!(xml.contains("type=\"Tanh\""));
+    }
+
+    #[test]
+    fn softmax_ir_xml() {
+        let patterns = vec![KernelPattern::Activation {
+            op: ActivationOp::Softmax,
+            input: dummy_binding("X", TensorRole::Input),
+            output: dummy_binding("Y", TensorRole::Output),
+            dim_name: "N".into(),
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_softmax");
+        assert!(xml.contains("type=\"SoftMax\""));
+    }
+
+    #[test]
+    fn maxpool_ir_xml() {
+        let patterns = vec![KernelPattern::Pool {
+            kind: PoolKind::Max,
+            input: dummy_binding("input", TensorRole::Input),
+            output: dummy_binding("output", TensorRole::Output),
+            shape: PoolShape {
+                kernel_h: 2,
+                kernel_w: 2,
+                stride_h: 2,
+                stride_w: 2,
+            },
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_maxpool");
+        assert!(xml.contains("type=\"MaxPool\""));
+    }
+
+    #[test]
+    fn avgpool_ir_xml() {
+        let patterns = vec![KernelPattern::Pool {
+            kind: PoolKind::Avg,
+            input: dummy_binding("input", TensorRole::Input),
+            output: dummy_binding("output", TensorRole::Output),
+            shape: PoolShape {
+                kernel_h: 2,
+                kernel_w: 2,
+                stride_h: 2,
+                stride_w: 2,
+            },
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_avgpool");
+        assert!(xml.contains("type=\"AvgPool\""));
+    }
+
+    #[test]
+    fn reduce_sum_ir_xml() {
+        let patterns = vec![KernelPattern::Reduce {
+            op: ReduceOp::Sum,
+            input: dummy_binding("input", TensorRole::Input),
+            output: dummy_binding("output", TensorRole::Output),
+            axis: 0,
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_reduce_sum");
+        assert!(xml.contains("type=\"ReduceSum\""));
+        assert!(xml.contains("axis=\"0\""));
+    }
+
+    #[test]
+    fn reduce_mean_ir_xml() {
+        let patterns = vec![KernelPattern::Reduce {
+            op: ReduceOp::Mean,
+            input: dummy_binding("input", TensorRole::Input),
+            output: dummy_binding("output", TensorRole::Output),
+            axis: 1,
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_reduce_mean");
+        assert!(xml.contains("type=\"ReduceMean\""));
+    }
+
+    #[test]
+    fn normalization_ir_xml() {
+        let patterns = vec![KernelPattern::Normalization {
+            input: dummy_binding("input", TensorRole::Input),
+            scale: dummy_binding("scale", TensorRole::Input),
+            bias: dummy_binding("bias", TensorRole::Input),
+            output: dummy_binding("output", TensorRole::Output),
+            epsilon: 1e-5,
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_batchnorm");
+        assert!(xml.contains("type=\"BatchNormInference\""));
+        assert!(xml.contains("epsilon"));
+    }
+
+    #[test]
+    fn transpose_ir_xml() {
+        let patterns = vec![KernelPattern::Transpose {
+            input: dummy_binding("input", TensorRole::Input),
+            output: dummy_binding("output", TensorRole::Output),
+            perm: vec![1, 0],
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_transpose");
+        assert!(xml.contains("type=\"Transpose\""));
+    }
+
+    #[test]
+    fn attention_ir_xml() {
+        let patterns = vec![KernelPattern::Attention {
+            query: dummy_binding("Q", TensorRole::Input),
+            key: dummy_binding("K", TensorRole::Input),
+            value: dummy_binding("V", TensorRole::Input),
+            output: dummy_binding("out", TensorRole::Output),
+            d_k: "D".into(),
+            seq_len: "S".into(),
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_attention");
+        assert!(xml.contains("type=\"ScaledDotProductAttention\""));
+    }
+
+    #[test]
+    fn unknown_ir_xml() {
+        let patterns = vec![KernelPattern::Unknown {
+            reason: "test".into(),
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_unknown");
+        assert!(xml.contains("type=\"Unknown(test)\""));
+    }
+
+    #[test]
+    fn concat_ir_xml() {
+        let patterns = vec![KernelPattern::Concat {
+            inputs: vec![
+                dummy_binding("A", TensorRole::Input),
+                dummy_binding("B", TensorRole::Input),
+            ],
+            output: dummy_binding("out", TensorRole::Output),
+            axis: 0,
+        }];
+
+        let xml = build_ir_xml(&patterns, "test_concat");
+        assert!(xml.contains("type=\"Concat\""));
+    }
 }

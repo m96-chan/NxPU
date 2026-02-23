@@ -110,4 +110,38 @@ mod tests {
     fn hardware_name() {
         assert_eq!(CevaNeuProSupport.hardware_name(), "CEVA NeuPro");
     }
+
+    #[test]
+    fn f16_emulated() {
+        let s = CevaNeuProSupport;
+        assert_eq!(
+            s.op_support("Conv", Precision::F16),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn f16_unknown_unsupported() {
+        let s = CevaNeuProSupport;
+        assert_eq!(
+            s.op_support("FakeOp", Precision::F16),
+            PerformanceTier::Unsupported
+        );
+    }
+
+    #[test]
+    fn f32_emulated() {
+        let s = CevaNeuProSupport;
+        assert_eq!(
+            s.op_support("Conv", Precision::F32),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn native_and_emulated_lists() {
+        let s = CevaNeuProSupport;
+        assert!(s.native_ops().contains(&"Conv"));
+        assert!(s.emulated_ops().contains(&"MatMul"));
+    }
 }

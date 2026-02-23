@@ -193,4 +193,58 @@ mod tests {
         assert_eq!(EthosU55Support.hardware_name(), "Arm Ethos-U55");
         assert_eq!(EthosU65Support.hardware_name(), "Arm Ethos-U65");
     }
+
+    #[test]
+    fn u55_bf16_emulated() {
+        let s = EthosU55Support;
+        assert_eq!(
+            s.op_support("Conv", Precision::BF16),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn u55_f32_unknown_unsupported() {
+        let s = EthosU55Support;
+        assert_eq!(
+            s.op_support("FakeOp", Precision::F32),
+            PerformanceTier::Unsupported
+        );
+    }
+
+    #[test]
+    fn u65_bf16_emulated() {
+        let s = EthosU65Support;
+        assert_eq!(
+            s.op_support("Conv", Precision::BF16),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn u65_f32_emulated() {
+        let s = EthosU65Support;
+        assert_eq!(
+            s.op_support("Conv", Precision::F32),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn u65_f16_unsupported() {
+        let s = EthosU65Support;
+        assert_eq!(
+            s.op_support("FakeOp", Precision::F16),
+            PerformanceTier::Unsupported
+        );
+    }
+
+    #[test]
+    fn u65_int8_emulated() {
+        let s = EthosU65Support;
+        assert_eq!(
+            s.op_support("Sigmoid", Precision::Int8),
+            PerformanceTier::Emulated
+        );
+    }
 }

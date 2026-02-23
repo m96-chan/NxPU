@@ -216,4 +216,85 @@ mod tests {
             .collect();
         assert!(messages.iter().any(|m| m.contains("read_model")));
     }
+
+    fn load_and_compile(example: &str, opts: &BackendOptions) -> BackendOutput {
+        let source = std::fs::read_to_string(format!(
+            "{}/../../examples/{example}.wgsl",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let module = nxpu_parser::parse(&source).unwrap();
+        IntelBackend.compile(&module, opts).unwrap()
+    }
+
+    #[test]
+    fn compile_conv2d_emits_convolution() {
+        let output = load_and_compile("conv2d", &BackendOptions::default());
+        let xml_file = output.files.iter().find(|f| f.name == "model.xml").unwrap();
+        let xml = match &xml_file.content {
+            OutputContent::Text(t) => t,
+            _ => panic!("expected text"),
+        };
+        assert!(xml.contains("type=\"Convolution\""));
+    }
+
+    #[test]
+    fn compile_relu_emits_relu_layer() {
+        let output = load_and_compile("relu", &BackendOptions::default());
+        let xml_file = output.files.iter().find(|f| f.name == "model.xml").unwrap();
+        let xml = match &xml_file.content {
+            OutputContent::Text(t) => t,
+            _ => panic!("expected text"),
+        };
+        assert!(xml.contains("type=\"ReLU\""));
+    }
+
+    #[test]
+    fn compile_attention() {
+        let output = load_and_compile("attention", &BackendOptions::default());
+        assert!(!output.files.is_empty());
+    }
+
+    #[test]
+    fn compile_maxpool() {
+        let output = load_and_compile("maxpool", &BackendOptions::default());
+        assert!(!output.files.is_empty());
+    }
+
+    #[test]
+    fn compile_reduce_sum() {
+        let output = load_and_compile("reduce_sum", &BackendOptions::default());
+        assert!(!output.files.is_empty());
+    }
+
+    #[test]
+    fn compile_batchnorm() {
+        let output = load_and_compile("batchnorm", &BackendOptions::default());
+        assert!(!output.files.is_empty());
+    }
+
+    #[test]
+    fn resolve_precision_explicit_and_keep() {
+        use nxpu_backend_core::PrecisionPolicy;
+
+        // Explicit(F16) with preferred Int8 => F16
+        let opts_explicit = BackendOptions {
+            precision: PrecisionPolicy::Explicit(Precision::F16),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_precision(&opts_explicit, Precision::Int8),
+            Precision::F16
+        );
+
+        // Keep with preferred Int8 => F32
+        let opts_keep = BackendOptions {
+            precision: PrecisionPolicy::Keep,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_precision(&opts_keep, Precision::Int8),
+            Precision::F32
+        );
+    }
 }

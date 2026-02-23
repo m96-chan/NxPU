@@ -116,4 +116,29 @@ mod tests {
     fn hardware_name() {
         assert_eq!(RknnNpuSupport.hardware_name(), "Rockchip RKNN NPU");
     }
+
+    #[test]
+    fn f32_emulated() {
+        let s = RknnNpuSupport;
+        assert_eq!(
+            s.op_support("MatMul", Precision::F32),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn f32_unknown_unsupported() {
+        let s = RknnNpuSupport;
+        assert_eq!(
+            s.op_support("FakeOp", Precision::F32),
+            PerformanceTier::Unsupported
+        );
+    }
+
+    #[test]
+    fn native_and_emulated_lists() {
+        let s = RknnNpuSupport;
+        assert!(s.native_ops().contains(&"Conv"));
+        assert!(s.emulated_ops().contains(&"Attention"));
+    }
 }

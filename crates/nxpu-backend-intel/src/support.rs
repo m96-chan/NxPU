@@ -151,4 +151,61 @@ mod tests {
         assert!(s.native_ops().contains(&"MatMul"));
         assert!(s.emulated_ops().contains(&"Attention"));
     }
+
+    #[test]
+    fn int8_core_ops_native() {
+        let s = IntelNpuSupport;
+        assert_eq!(
+            s.op_support("MatMul", Precision::Int8),
+            PerformanceTier::Native
+        );
+        assert_eq!(
+            s.op_support("Conv", Precision::Int8),
+            PerformanceTier::Native
+        );
+        assert_eq!(
+            s.op_support("Add", Precision::Int8),
+            PerformanceTier::Native
+        );
+        assert_eq!(
+            s.op_support("Relu", Precision::Int8),
+            PerformanceTier::Native
+        );
+    }
+
+    #[test]
+    fn int8_non_core_emulated() {
+        let s = IntelNpuSupport;
+        assert_eq!(
+            s.op_support("Sigmoid", Precision::Int8),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn bf16_emulated() {
+        let s = IntelNpuSupport;
+        assert_eq!(
+            s.op_support("MatMul", Precision::BF16),
+            PerformanceTier::Emulated
+        );
+    }
+
+    #[test]
+    fn bf16_unknown_unsupported() {
+        let s = IntelNpuSupport;
+        assert_eq!(
+            s.op_support("FakeOp", Precision::BF16),
+            PerformanceTier::Unsupported
+        );
+    }
+
+    #[test]
+    fn f32_unknown_unsupported() {
+        let s = IntelNpuSupport;
+        assert_eq!(
+            s.op_support("FakeOp", Precision::F32),
+            PerformanceTier::Unsupported
+        );
+    }
 }

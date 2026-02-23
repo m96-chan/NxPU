@@ -161,4 +161,71 @@ mod tests {
             .any(|d| d.message.contains("emulated"));
         assert!(has_emulated_warning);
     }
+
+    fn load_and_compile(example: &str, opts: &BackendOptions) -> BackendOutput {
+        let source = std::fs::read_to_string(format!(
+            "{}/../../examples/{example}.wgsl",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let module = nxpu_parser::parse(&source).unwrap();
+        CevaBackend.compile(&module, opts).unwrap()
+    }
+
+    #[test]
+    fn compile_conv2d() {
+        let output = load_and_compile("conv2d", &BackendOptions::default());
+        assert!(!output.files.is_empty());
+        for file in &output.files {
+            match &file.content {
+                OutputContent::Binary(b) => assert!(!b.is_empty()),
+                OutputContent::Text(t) => assert!(!t.is_empty()),
+            }
+        }
+    }
+
+    #[test]
+    fn compile_relu() {
+        let output = load_and_compile("relu", &BackendOptions::default());
+        assert!(!output.files.is_empty());
+        for file in &output.files {
+            match &file.content {
+                OutputContent::Binary(b) => assert!(!b.is_empty()),
+                OutputContent::Text(t) => assert!(!t.is_empty()),
+            }
+        }
+    }
+
+    #[test]
+    fn compile_attention() {
+        let output = load_and_compile("attention", &BackendOptions::default());
+        assert!(!output.files.is_empty());
+        for file in &output.files {
+            match &file.content {
+                OutputContent::Binary(b) => assert!(!b.is_empty()),
+                OutputContent::Text(t) => assert!(!t.is_empty()),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_precision_explicit_and_keep() {
+        let explicit_opts = BackendOptions {
+            precision: PrecisionPolicy::Explicit(Precision::F16),
+            ..BackendOptions::default()
+        };
+        assert_eq!(
+            resolve_precision(&explicit_opts, Precision::Int8),
+            Precision::F16
+        );
+
+        let keep_opts = BackendOptions {
+            precision: PrecisionPolicy::Keep,
+            ..BackendOptions::default()
+        };
+        assert_eq!(
+            resolve_precision(&keep_opts, Precision::Int8),
+            Precision::F32
+        );
+    }
 }
