@@ -214,4 +214,102 @@ mod tests {
         let pass = IrValidation;
         assert!(!pass.run(&mut module));
     }
+
+    #[test]
+    fn zero_workgroup_size_all_dimensions() {
+        let mut module = Module::default();
+        module.entry_points.push(EntryPoint {
+            name: "bad".into(),
+            workgroup_size: [0, 0, 0],
+            function: Function::new("bad"),
+        });
+
+        let warnings = collect_warnings(&module);
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[0].message.contains("workgroup_size[0] = 0"));
+        assert!(warnings[1].message.contains("workgroup_size[1] = 0"));
+        assert!(warnings[2].message.contains("workgroup_size[2] = 0"));
+    }
+
+    #[test]
+    fn zero_workgroup_size_y_only() {
+        let mut module = Module::default();
+        module.entry_points.push(EntryPoint {
+            name: "ep".into(),
+            workgroup_size: [64, 0, 1],
+            function: Function::new("ep"),
+        });
+
+        let warnings = collect_warnings(&module);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("workgroup_size[1] = 0"));
+    }
+
+    #[test]
+    fn multiple_entry_points_partial_invalid() {
+        let mut module = Module::default();
+        module.entry_points.push(EntryPoint {
+            name: "good".into(),
+            workgroup_size: [64, 1, 1],
+            function: Function::new("good"),
+        });
+        module.entry_points.push(EntryPoint {
+            name: "bad".into(),
+            workgroup_size: [0, 1, 1],
+            function: Function::new("bad"),
+        });
+
+        let warnings = collect_warnings(&module);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("bad"));
+    }
+
+    #[test]
+    fn warning_display() {
+        let w = ValidationWarning {
+            message: "test message".into(),
+        };
+        assert_eq!(format!("{w}"), "test message");
+    }
+
+    #[test]
+    fn pass_name() {
+        let pass = IrValidation;
+        assert_eq!(pass.name(), "ir-validation");
+    }
+
+    #[test]
+    fn valid_expression_with_binary_op() {
+        let mut module = Module::default();
+        let mut func = Function::new("main");
+        let a = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let b = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        func.expressions.append(Expression::Binary {
+            op: nxpu_ir::BinaryOp::Add,
+            left: a,
+            right: b,
+        });
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        assert!(collect_warnings(&module).is_empty());
+    }
+
+    #[test]
+    fn valid_helper_function_no_warnings() {
+        let mut module = Module::default();
+        let mut func = Function::new("helper");
+        func.expressions
+            .append(Expression::Literal(Literal::F32(42.0)));
+        module.functions.append(func);
+
+        assert!(collect_warnings(&module).is_empty());
+    }
 }

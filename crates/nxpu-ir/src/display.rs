@@ -614,4 +614,447 @@ mod tests {
         let dump = dump_module(&module);
         assert!(dump.contains("Types:"));
     }
+
+    #[test]
+    fn display_scalar_kind_all_variants() {
+        assert_eq!(format!("{}", ScalarKind::Bool), "bool");
+        assert_eq!(format!("{}", ScalarKind::Sint), "sint");
+        assert_eq!(format!("{}", ScalarKind::Uint), "uint");
+        assert_eq!(format!("{}", ScalarKind::Float), "float");
+        assert_eq!(format!("{}", ScalarKind::BFloat), "bfloat");
+    }
+
+    #[test]
+    fn display_scalar_bfloat() {
+        assert_eq!(format!("{}", Scalar::BF16), "bf16");
+    }
+
+    #[test]
+    fn display_storage_access_all_variants() {
+        assert_eq!(format!("{}", StorageAccess::LOAD), "read");
+        assert_eq!(format!("{}", StorageAccess::STORE), "write");
+        assert_eq!(
+            format!("{}", StorageAccess::LOAD | StorageAccess::STORE),
+            "read_write"
+        );
+        assert_eq!(format!("{}", StorageAccess::EMPTY), "none");
+    }
+
+    #[test]
+    fn display_address_space_all_variants() {
+        assert_eq!(format!("{}", AddressSpace::Function), "function");
+        assert_eq!(format!("{}", AddressSpace::Private), "private");
+        assert_eq!(format!("{}", AddressSpace::Workgroup), "workgroup");
+        assert_eq!(format!("{}", AddressSpace::Uniform), "uniform");
+        assert_eq!(
+            format!(
+                "{}",
+                AddressSpace::Storage {
+                    access: StorageAccess::LOAD
+                }
+            ),
+            "storage, read"
+        );
+    }
+
+    #[test]
+    fn display_builtin_all_variants() {
+        assert_eq!(
+            format!("{}", BuiltIn::GlobalInvocationId),
+            "global_invocation_id"
+        );
+        assert_eq!(
+            format!("{}", BuiltIn::LocalInvocationId),
+            "local_invocation_id"
+        );
+        assert_eq!(
+            format!("{}", BuiltIn::LocalInvocationIndex),
+            "local_invocation_index"
+        );
+        assert_eq!(format!("{}", BuiltIn::WorkgroupId), "workgroup_id");
+        assert_eq!(format!("{}", BuiltIn::NumWorkgroups), "num_workgroups");
+    }
+
+    #[test]
+    fn display_binding_location() {
+        let b = Binding::Location { location: 3 };
+        assert_eq!(format!("{b}"), "@location(3)");
+    }
+
+    #[test]
+    fn display_literal_all_variants() {
+        assert_eq!(format!("{}", Literal::Bool(false)), "false");
+        assert_eq!(format!("{}", Literal::I32(-7)), "-7i");
+        assert_eq!(format!("{}", Literal::U32(42)), "42u");
+        assert_eq!(format!("{}", Literal::F32(1.5)), "1.5f");
+        assert_eq!(format!("{}", Literal::F64(2.5)), "2.5lf");
+        assert_eq!(format!("{}", Literal::AbstractInt(99)), "99");
+        assert_eq!(format!("{}", Literal::AbstractFloat(1.23)), "1.23");
+    }
+
+    #[test]
+    fn display_unary_op_all_variants() {
+        assert_eq!(format!("{}", UnaryOp::Negate), "-");
+        assert_eq!(format!("{}", UnaryOp::LogicalNot), "!");
+        assert_eq!(format!("{}", UnaryOp::BitwiseNot), "~");
+    }
+
+    #[test]
+    fn display_binary_op_all_variants() {
+        assert_eq!(format!("{}", BinaryOp::Add), "+");
+        assert_eq!(format!("{}", BinaryOp::Subtract), "-");
+        assert_eq!(format!("{}", BinaryOp::Multiply), "*");
+        assert_eq!(format!("{}", BinaryOp::Divide), "/");
+        assert_eq!(format!("{}", BinaryOp::Modulo), "%");
+        assert_eq!(format!("{}", BinaryOp::Equal), "==");
+        assert_eq!(format!("{}", BinaryOp::NotEqual), "!=");
+        assert_eq!(format!("{}", BinaryOp::Less), "<");
+        assert_eq!(format!("{}", BinaryOp::LessEqual), "<=");
+        assert_eq!(format!("{}", BinaryOp::Greater), ">");
+        assert_eq!(format!("{}", BinaryOp::GreaterEqual), ">=");
+        assert_eq!(format!("{}", BinaryOp::LogicalAnd), "&&");
+        assert_eq!(format!("{}", BinaryOp::LogicalOr), "||");
+        assert_eq!(format!("{}", BinaryOp::BitwiseAnd), "&");
+        assert_eq!(format!("{}", BinaryOp::BitwiseOr), "|");
+        assert_eq!(format!("{}", BinaryOp::BitwiseXor), "^");
+        assert_eq!(format!("{}", BinaryOp::ShiftLeft), "<<");
+        assert_eq!(format!("{}", BinaryOp::ShiftRight), ">>");
+    }
+
+    #[test]
+    fn display_swizzle_component_all_variants() {
+        assert_eq!(format!("{}", SwizzleComponent::X), "x");
+        assert_eq!(format!("{}", SwizzleComponent::Y), "y");
+        assert_eq!(format!("{}", SwizzleComponent::Z), "z");
+        assert_eq!(format!("{}", SwizzleComponent::W), "w");
+    }
+
+    #[test]
+    fn display_atomic_function_all_variants() {
+        assert_eq!(format!("{}", AtomicFunction::Add), "atomicAdd");
+        assert_eq!(format!("{}", AtomicFunction::Subtract), "atomicSub");
+        assert_eq!(format!("{}", AtomicFunction::And), "atomicAnd");
+        assert_eq!(format!("{}", AtomicFunction::ExclusiveOr), "atomicXor");
+        assert_eq!(format!("{}", AtomicFunction::InclusiveOr), "atomicOr");
+        assert_eq!(format!("{}", AtomicFunction::Min), "atomicMin");
+        assert_eq!(format!("{}", AtomicFunction::Max), "atomicMax");
+        assert_eq!(
+            format!("{}", AtomicFunction::Exchange { compare: None }),
+            "atomicExchange"
+        );
+        let cmp_handle = {
+            let mut arena = crate::Arena::new();
+            arena.append(Expression::Literal(Literal::U32(0)))
+        };
+        assert!(
+            format!(
+                "{}",
+                AtomicFunction::Exchange {
+                    compare: Some(cmp_handle)
+                }
+            )
+            .starts_with("atomicCompareExchange(")
+        );
+    }
+
+    #[test]
+    fn display_barrier_all_variants() {
+        assert_eq!(format!("{}", Barrier::STORAGE), "storageBarrier");
+        assert_eq!(format!("{}", Barrier::WORKGROUP), "workgroupBarrier");
+        assert_eq!(
+            format!("{}", Barrier::STORAGE | Barrier::WORKGROUP),
+            "storageBarrier | workgroupBarrier"
+        );
+        assert_eq!(format!("{}", Barrier::EMPTY), "<no barrier>");
+    }
+
+    #[test]
+    fn format_type_named() {
+        let mut types = UniqueArena::new();
+        let h = types.insert(Type {
+            name: Some("MyStruct".into()),
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        assert_eq!(format_type(&types[h], &types), "MyStruct");
+    }
+
+    #[test]
+    fn format_type_inner_all_variants() {
+        let mut types = UniqueArena::new();
+        let f32_ty = types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+
+        // Scalar
+        assert_eq!(
+            format_type_inner(&TypeInner::Scalar(Scalar::F32), &types),
+            "f32"
+        );
+
+        // Vector
+        assert_eq!(
+            format_type_inner(
+                &TypeInner::Vector {
+                    size: VectorSize::Tri,
+                    scalar: Scalar::F32
+                },
+                &types
+            ),
+            "vec3<f32>"
+        );
+
+        // Matrix
+        assert_eq!(
+            format_type_inner(
+                &TypeInner::Matrix {
+                    columns: VectorSize::Quad,
+                    rows: VectorSize::Quad,
+                    scalar: Scalar::F32
+                },
+                &types
+            ),
+            "mat4x4<f32>"
+        );
+
+        // Atomic
+        assert_eq!(
+            format_type_inner(&TypeInner::Atomic(Scalar::U32), &types),
+            "atomic<u32>"
+        );
+
+        // Pointer
+        assert_eq!(
+            format_type_inner(
+                &TypeInner::Pointer {
+                    base: f32_ty,
+                    space: AddressSpace::Function
+                },
+                &types
+            ),
+            "ptr<function, f32>"
+        );
+
+        // Array (constant)
+        assert_eq!(
+            format_type_inner(
+                &TypeInner::Array {
+                    base: f32_ty,
+                    size: ArraySize::Constant(16),
+                    stride: 4
+                },
+                &types
+            ),
+            "array<f32, 16> /*stride 4*/"
+        );
+
+        // Array (dynamic)
+        assert_eq!(
+            format_type_inner(
+                &TypeInner::Array {
+                    base: f32_ty,
+                    size: ArraySize::Dynamic,
+                    stride: 4
+                },
+                &types
+            ),
+            "array<f32> /*stride 4*/"
+        );
+
+        // Struct
+        assert_eq!(
+            format_type_inner(
+                &TypeInner::Struct {
+                    members: vec![],
+                    span: 16
+                },
+                &types
+            ),
+            "struct(0 members, span 16)"
+        );
+
+        // Tensor (mixed dims)
+        assert_eq!(
+            format_type_inner(
+                &TypeInner::Tensor {
+                    scalar: Scalar::F32,
+                    shape: crate::TensorShape {
+                        dims: vec![
+                            crate::Dimension::Fixed(224),
+                            crate::Dimension::Dynamic(Some("batch".into())),
+                            crate::Dimension::Dynamic(None),
+                        ],
+                    }
+                },
+                &types
+            ),
+            "tensor<f32>[224, batch, ?]"
+        );
+    }
+
+    #[test]
+    fn dump_module_with_globals_and_entry_point() {
+        use crate::{EntryPoint, Expression, Function, GlobalVariable, ResourceBinding, Statement};
+
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let arr_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+
+        module.global_variables.append(GlobalVariable {
+            name: Some("a".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        module.global_variables.append(GlobalVariable {
+            name: None,
+            space: AddressSpace::Private,
+            binding: None,
+            ty: f32_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let lit = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let gv = func.expressions.append(Expression::GlobalVariable(
+            module.global_variables.next_handle(),
+        ));
+        func.body.push(Statement::Store {
+            pointer: gv,
+            value: lit,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [256, 1, 1],
+            function: func,
+        });
+
+        let dump = dump_module(&module);
+        assert!(dump.contains("Global Variables:"));
+        assert!(dump.contains("@group(0) @binding(0)"));
+        assert!(dump.contains("a:"));
+        assert!(dump.contains("storage, read"));
+        assert!(dump.contains("Entry Points:"));
+        assert!(dump.contains("@compute @workgroup_size(256, 1, 1)"));
+        assert!(dump.contains("Expressions:"));
+        assert!(dump.contains("Body:"));
+        assert!(dump.contains("Store"));
+    }
+
+    #[test]
+    fn dump_module_with_if_and_loop() {
+        use crate::{EntryPoint, Expression, Function, Statement};
+
+        let mut module = Module::default();
+        let mut func = Function::new("main");
+
+        let cond = func
+            .expressions
+            .append(Expression::Literal(Literal::Bool(true)));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        func.body.push(Statement::If {
+            condition: cond,
+            accept: vec![Statement::Return { value: Some(val) }],
+            reject: vec![Statement::Return { value: None }],
+        });
+        func.body.push(Statement::Loop {
+            body: vec![Statement::Break],
+            continuing: vec![Statement::Continue],
+            break_if: Some(cond),
+        });
+        func.body.push(Statement::Barrier(Barrier::STORAGE));
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let dump = dump_module(&module);
+        assert!(dump.contains("If ("));
+        assert!(dump.contains("} else {"));
+        assert!(dump.contains("Return"));
+        assert!(dump.contains("Loop {"));
+        assert!(dump.contains("Continuing {"));
+        assert!(dump.contains("BreakIf("));
+        assert!(dump.contains("Break"));
+        assert!(dump.contains("Continue"));
+        assert!(dump.contains("Barrier(storageBarrier)"));
+    }
+
+    #[test]
+    fn dump_module_with_helper_function() {
+        use crate::{Function, FunctionArgument, FunctionResult};
+
+        let mut module = Module::default();
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+
+        let mut func = Function::new("helper");
+        func.arguments.push(FunctionArgument {
+            name: Some("x".into()),
+            ty: f32_ty,
+            binding: None,
+        });
+        func.result = Some(FunctionResult {
+            ty: f32_ty,
+            binding: None,
+        });
+        module.functions.append(func);
+
+        let dump = dump_module(&module);
+        assert!(dump.contains("Functions:"));
+        assert!(dump.contains("fn helper(x: f32)"));
+        assert!(dump.contains("-> f32"));
+    }
+
+    #[test]
+    fn display_vector_size() {
+        assert_eq!(format!("{}", VectorSize::Bi), "2");
+        assert_eq!(format!("{}", VectorSize::Tri), "3");
+        assert_eq!(format!("{}", VectorSize::Quad), "4");
+    }
+
+    #[test]
+    fn display_math_function_all_variants() {
+        // Spot-check a representative sample beyond what existing tests cover
+        assert_eq!(format!("{}", MathFunction::Abs), "abs");
+        assert_eq!(format!("{}", MathFunction::Clamp), "clamp");
+        assert_eq!(format!("{}", MathFunction::Fma), "fma");
+        assert_eq!(format!("{}", MathFunction::Sin), "sin");
+        assert_eq!(format!("{}", MathFunction::Tanh), "tanh");
+        assert_eq!(format!("{}", MathFunction::Sqrt), "sqrt");
+        assert_eq!(format!("{}", MathFunction::Pow), "pow");
+        assert_eq!(format!("{}", MathFunction::Mix), "mix");
+        assert_eq!(format!("{}", MathFunction::SmoothStep), "smoothStep");
+        assert_eq!(format!("{}", MathFunction::InverseSqrt), "inverseSqrt");
+    }
 }
