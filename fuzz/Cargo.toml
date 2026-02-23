@@ -1,0 +1,25 @@
+[package]
+name = "nxpu-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+naga = { version = "28", features = ["wgsl-in"] }
+nxpu-parser = { path = "../crates/nxpu-parser" }
+
+[workspace]
+
+[[bin]]
+name = "fuzz_parse"
+path = "fuzz_targets/fuzz_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_lower"
+path = "fuzz_targets/fuzz_lower.rs"
+doc = false

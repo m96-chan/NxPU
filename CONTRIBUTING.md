@@ -28,6 +28,18 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Fuzz Testing
+
+The WGSL parser has fuzz targets under `fuzz/`. Requires nightly Rust:
+
+```sh
+cargo install cargo-fuzz
+cargo +nightly fuzz run fuzz_parse   # Fuzz the WGSL parser (naga)
+cargo +nightly fuzz run fuzz_lower   # Fuzz parse + IR lowering
+```
+
+Stop with `Ctrl+C`. Crashes are saved in `fuzz/artifacts/`. If you find one, please open an issue.
+
 ## Pull Request Guidelines
 
 1. Fork the repository and create a feature branch from `main`.
