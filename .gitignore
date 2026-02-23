@@ -13,6 +13,10 @@
 .DS_Store
 Thumbs.db
 
+# Fuzz
+fuzz/target/
+fuzz/artifacts/
+
 # Build artifacts
 *.o
 *.so
