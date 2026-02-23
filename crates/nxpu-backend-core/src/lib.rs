@@ -349,4 +349,123 @@ mod tests {
         reg.register(Box::new(TestBackend));
         assert!(reg.find("test-target").is_some());
     }
+
+    #[test]
+    fn display_precision_all_variants() {
+        assert_eq!(format!("{}", Precision::F32), "F32");
+        assert_eq!(format!("{}", Precision::F16), "F16");
+        assert_eq!(format!("{}", Precision::BF16), "BF16");
+        assert_eq!(format!("{}", Precision::Int8), "I8");
+    }
+
+    #[test]
+    fn display_precision_policy_all_variants() {
+        assert_eq!(format!("{}", PrecisionPolicy::Keep), "Keep");
+        assert_eq!(format!("{}", PrecisionPolicy::Auto), "Auto");
+        assert_eq!(
+            format!("{}", PrecisionPolicy::Explicit(Precision::F16)),
+            "Explicit(F16)"
+        );
+    }
+
+    #[test]
+    fn display_backend_options() {
+        let opts = BackendOptions {
+            opt_level: 2,
+            precision: PrecisionPolicy::Explicit(Precision::Int8),
+        };
+        let s = format!("{opts}");
+        assert!(s.contains("opt_level: 2"));
+        assert!(s.contains("Explicit(I8)"));
+    }
+
+    #[test]
+    fn display_backend_output() {
+        let output = BackendOutput {
+            files: vec![
+                OutputFile {
+                    name: "a.bin".into(),
+                    content: OutputContent::Binary(vec![1, 2, 3]),
+                },
+                OutputFile {
+                    name: "b.txt".into(),
+                    content: OutputContent::Text("hello".into()),
+                },
+            ],
+            diagnostics: vec![Diagnostic {
+                level: DiagnosticLevel::Info,
+                message: "done".into(),
+            }],
+        };
+        assert_eq!(format!("{output}"), "2 file(s), 1 diagnostic(s)");
+    }
+
+    #[test]
+    fn display_output_file() {
+        let f = OutputFile {
+            name: "model.onnx".into(),
+            content: OutputContent::Binary(vec![]),
+        };
+        assert_eq!(format!("{f}"), "model.onnx");
+    }
+
+    #[test]
+    fn display_output_content_all_variants() {
+        assert_eq!(
+            format!("{}", OutputContent::Text("abc".into())),
+            "Text(3 chars)"
+        );
+        assert_eq!(
+            format!("{}", OutputContent::Binary(vec![0; 100])),
+            "Binary(100 bytes)"
+        );
+    }
+
+    #[test]
+    fn display_diagnostic_and_level() {
+        let warn = Diagnostic {
+            level: DiagnosticLevel::Warning,
+            message: "deprecated op".into(),
+        };
+        assert_eq!(format!("{warn}"), "[Warning] deprecated op");
+
+        let info = Diagnostic {
+            level: DiagnosticLevel::Info,
+            message: "classified as Add".into(),
+        };
+        assert_eq!(format!("{info}"), "[Info] classified as Add");
+    }
+
+    #[test]
+    fn display_diagnostic_level_all_variants() {
+        assert_eq!(format!("{}", DiagnosticLevel::Warning), "Warning");
+        assert_eq!(format!("{}", DiagnosticLevel::Info), "Info");
+    }
+
+    #[test]
+    fn registry_empty_list_targets() {
+        let reg = BackendRegistry::new();
+        assert!(reg.list_targets().is_empty());
+    }
+
+    #[test]
+    fn registry_default_is_empty() {
+        let reg = BackendRegistry::default();
+        assert!(reg.list_targets().is_empty());
+    }
+
+    #[test]
+    fn preferred_precision_default() {
+        let backend = IrDumpBackend;
+        assert_eq!(backend.preferred_precision(), Precision::F32);
+    }
+
+    #[test]
+    fn backend_error_display() {
+        let e1 = BackendError::Unsupported("int64 tensors".into());
+        assert_eq!(format!("{e1}"), "unsupported: int64 tensors");
+
+        let e2 = BackendError::Other("internal failure".into());
+        assert_eq!(format!("{e2}"), "internal failure");
+    }
 }
