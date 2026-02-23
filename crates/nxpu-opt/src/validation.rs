@@ -288,12 +288,11 @@ mod tests {
         let b = func
             .expressions
             .append(Expression::Literal(Literal::F32(2.0)));
-        func.expressions
-            .append(Expression::Binary {
-                op: nxpu_ir::BinaryOp::Add,
-                left: a,
-                right: b,
-            });
+        func.expressions.append(Expression::Binary {
+            op: nxpu_ir::BinaryOp::Add,
+            left: a,
+            right: b,
+        });
         module.entry_points.push(EntryPoint {
             name: "main".into(),
             workgroup_size: [1, 1, 1],

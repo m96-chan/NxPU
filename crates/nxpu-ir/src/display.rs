@@ -746,13 +746,15 @@ mod tests {
             let mut arena = crate::Arena::new();
             arena.append(Expression::Literal(Literal::U32(0)))
         };
-        assert!(format!(
-            "{}",
-            AtomicFunction::Exchange {
-                compare: Some(cmp_handle)
-            }
-        )
-        .starts_with("atomicCompareExchange("));
+        assert!(
+            format!(
+                "{}",
+                AtomicFunction::Exchange {
+                    compare: Some(cmp_handle)
+                }
+            )
+            .starts_with("atomicCompareExchange(")
+        );
     }
 
     #[test]
@@ -785,7 +787,10 @@ mod tests {
         });
 
         // Scalar
-        assert_eq!(format_type_inner(&TypeInner::Scalar(Scalar::F32), &types), "f32");
+        assert_eq!(
+            format_type_inner(&TypeInner::Scalar(Scalar::F32), &types),
+            "f32"
+        );
 
         // Vector
         assert_eq!(
@@ -889,9 +894,7 @@ mod tests {
 
     #[test]
     fn dump_module_with_globals_and_entry_point() {
-        use crate::{
-            EntryPoint, Expression, Function, GlobalVariable, ResourceBinding, Statement,
-        };
+        use crate::{EntryPoint, Expression, Function, GlobalVariable, ResourceBinding, Statement};
 
         let mut module = Module::default();
 
@@ -935,9 +938,9 @@ mod tests {
         let lit = func
             .expressions
             .append(Expression::Literal(Literal::F32(1.0)));
-        let gv = func
-            .expressions
-            .append(Expression::GlobalVariable(module.global_variables.next_handle()));
+        let gv = func.expressions.append(Expression::GlobalVariable(
+            module.global_variables.next_handle(),
+        ));
         func.body.push(Statement::Store {
             pointer: gv,
             value: lit,
