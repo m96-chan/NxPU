@@ -27,6 +27,9 @@ jobs:
         env:
           RUSTDOCFLAGS: "--enable-index-page -Zunstable-options"
 
+      - name: Add CNAME
+        run: cp docs/CNAME target/doc/CNAME
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v4
         with:
