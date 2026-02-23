@@ -84,5 +84,5 @@ clap = { version = "4", features = ["derive"] }
 miette = { version = "7" }
 naga = { version = "28", features = ["wgsl-in"] }
 # dev-only: used by nxpu-e2e-tests
-tract-onnx = "0.21"
+tract-onnx = "0.22"
 ndarray = "0.16"
