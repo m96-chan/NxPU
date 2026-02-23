@@ -76,7 +76,7 @@ wildcard_imports = "allow"
 
 [workspace.dependencies]
 thiserror = "2"
-prost = "0.13"
+prost = "0.14"
 flatbuffers = "25"
 log = "0.4"
 env_logger = "0.11"
