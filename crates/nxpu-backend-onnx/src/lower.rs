@@ -249,39 +249,158 @@ pub fn build_fused_model(
             base, activation, ..
         } => {
             let mut model = build_fused_model(base, ep_name, weights)?;
-            if let (Some(graph), FusedActivation::Relu) = (model.graph.as_mut(), activation) {
-                // Rename the last output to an intermediate and add a Relu node.
-                if let Some(last_output) = graph.output.last_mut() {
-                    let original_name = last_output.name.clone();
-                    let intermediate_name = format!("{original_name}_pre_relu");
+            let onnx_op = match activation {
+                FusedActivation::Relu => Some("Relu"),
+                FusedActivation::Sigmoid => Some("Sigmoid"),
+                FusedActivation::Tanh => Some("Tanh"),
+                FusedActivation::None => None,
+            };
 
-                    // Rename graph output to intermediate.
-                    last_output.name = intermediate_name.clone();
-
-                    // Rename the last node's output to the intermediate.
-                    if let Some(last_node) = graph.node.last_mut() {
-                        for out in &mut last_node.output {
-                            if *out == original_name {
-                                *out = intermediate_name.clone();
-                            }
-                        }
-                    }
-
-                    // Add the Relu node.
-                    graph.node.push(NodeProto::simple(
-                        "Relu",
-                        "relu_0",
-                        vec![intermediate_name],
-                        vec![original_name.clone()],
+            if let Some(op_name) = onnx_op {
+                append_activation_node(&mut model, op_name);
+            }
+            Ok(model)
+        }
+        FusedPattern::MatMulBias { matmul, bias_add } => {
+            let (inputs, output, shape) = match matmul {
+                KernelPattern::MatMul {
+                    inputs,
+                    output,
+                    shape,
+                } => (inputs, output, shape),
+                _ => {
+                    return Err(BackendError::Unsupported(
+                        "MatMulBias matmul must be MatMul".into(),
                     ));
+                }
+            };
+            let bias_binding = match bias_add.as_ref() {
+                KernelPattern::ElementWise {
+                    op: ElementWiseOp::Add,
+                    inputs: bias_inputs,
+                    output: bias_output,
+                    ..
+                } => {
+                    // The bias is the input that is NOT the matmul output.
+                    let bias = if bias_inputs[0].name == output.name {
+                        &bias_inputs[1]
+                    } else {
+                        &bias_inputs[0]
+                    };
+                    (bias, bias_output)
+                }
+                _ => {
+                    return Err(BackendError::Unsupported(
+                        "MatMulBias bias_add must be ElementWise Add".into(),
+                    ));
+                }
+            };
+            let (bias, gemm_output) = bias_binding;
 
-                    // Restore the original output name.
-                    if let Some(last_output) = graph.output.last_mut() {
-                        last_output.name = original_name;
+            let a_name = &inputs[0].name;
+            let b_name = &inputs[1].name;
+            let c_name = &bias.name;
+            let out_name = &gemm_output.name;
+
+            let gemm_node = NodeProto::with_attrs(
+                "Gemm",
+                "gemm_0",
+                vec![a_name.clone(), b_name.clone(), c_name.clone()],
+                vec![out_name.clone()],
+                vec![
+                    AttributeProto::float("alpha", 1.0),
+                    AttributeProto::float("beta", 1.0),
+                ],
+            );
+
+            let graph = GraphProto {
+                name: ep_name.into(),
+                initializer: vec![],
+                node: vec![gemm_node],
+                input: vec![
+                    ValueInfoProto::tensor(
+                        a_name,
+                        inputs[0].elem_type,
+                        vec![
+                            TensorShapeDimension::symbolic(&shape.m),
+                            TensorShapeDimension::symbolic(&shape.k),
+                        ],
+                    ),
+                    ValueInfoProto::tensor(
+                        b_name,
+                        inputs[1].elem_type,
+                        vec![
+                            TensorShapeDimension::symbolic(&shape.k),
+                            TensorShapeDimension::symbolic(&shape.n),
+                        ],
+                    ),
+                    ValueInfoProto::tensor(
+                        c_name,
+                        bias.elem_type,
+                        vec![TensorShapeDimension::symbolic(&shape.n)],
+                    ),
+                ],
+                output: vec![ValueInfoProto::tensor(
+                    out_name,
+                    gemm_output.elem_type,
+                    vec![
+                        TensorShapeDimension::symbolic(&shape.m),
+                        TensorShapeDimension::symbolic(&shape.n),
+                    ],
+                )],
+            };
+
+            let mut graph = graph;
+            inject_weights(&mut graph, weights);
+
+            Ok(ModelProto {
+                ir_version: 7,
+                producer_name: "nxpu".into(),
+                producer_version: env!("CARGO_PKG_VERSION").into(),
+                graph: Some(graph),
+                opset_import: vec![OperatorSetIdProto {
+                    domain: String::new(),
+                    version: 13,
+                }],
+                metadata_props: vec![],
+            })
+        }
+    }
+}
+
+/// Append an activation node (Relu, Sigmoid, Tanh) to the model's graph,
+/// renaming the last output to an intermediate and adding the activation.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
+fn append_activation_node(model: &mut ModelProto, op_name: &str) {
+    if let Some(graph) = model.graph.as_mut() {
+        if let Some(last_output) = graph.output.last_mut() {
+            let original_name = last_output.name.clone();
+            let intermediate_name = format!("{original_name}_pre_{}", op_name.to_lowercase());
+
+            // Rename graph output to intermediate.
+            last_output.name = intermediate_name.clone();
+
+            // Rename the last node's output to the intermediate.
+            if let Some(last_node) = graph.node.last_mut() {
+                for out in &mut last_node.output {
+                    if *out == original_name {
+                        *out = intermediate_name.clone();
                     }
                 }
             }
-            Ok(model)
+
+            // Add the activation node.
+            graph.node.push(NodeProto::simple(
+                op_name,
+                format!("{}_0", op_name.to_lowercase()),
+                vec![intermediate_name],
+                vec![original_name.clone()],
+            ));
+
+            // Restore the original output name.
+            if let Some(last_output) = graph.output.last_mut() {
+                last_output.name = original_name;
+            }
         }
     }
 }

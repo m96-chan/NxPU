@@ -3,7 +3,7 @@
 //! Emits TFLite FlatBuffer (`.tflite`) models from NxPU IR.
 //! Targets: MediaTek APU (NeuroPilot), Google Edge TPU, Arm Ethos NPU (Vela).
 
-use nxpu_analysis::analyze;
+use nxpu_analysis::{analyze, fusion};
 use nxpu_backend_core::{
     Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
     OutputContent, OutputFile,
@@ -35,9 +35,8 @@ impl Backend for TfLiteBackend {
             return Err(BackendError::Other("no entry points in module".into()));
         }
 
-        let mut files = Vec::new();
-        let mut diagnostics = Vec::new();
-
+        // 1. Classify all entry points.
+        let mut patterns = Vec::new();
         for (i, ep) in module.entry_points.iter().enumerate() {
             let pattern = analyze::classify_entry_point(module, i).map_err(|e| {
                 BackendError::Unsupported(format!("entry point '{}': {e}", ep.name))
@@ -48,34 +47,51 @@ impl Backend for TfLiteBackend {
                     ep.name
                 )));
             }
+            patterns.push(pattern);
+        }
 
-            let summary = match &pattern {
-                analyze::KernelPattern::MatMul { .. } => "BATCH_MATMUL",
-                analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
-                analyze::KernelPattern::Conv2D { .. } => "CONV_2D",
-                analyze::KernelPattern::Pool { kind, .. } => kind.op_name(),
-                analyze::KernelPattern::Activation { op, .. } => op.op_name(),
-                analyze::KernelPattern::Reduce { op, .. } => op.op_name(),
-                analyze::KernelPattern::Transpose { .. } => "TRANSPOSE",
-                analyze::KernelPattern::Reshape { .. } => "RESHAPE",
-                analyze::KernelPattern::Normalization { .. } => "BatchNormalization",
-                analyze::KernelPattern::Concat { .. } => "CONCATENATION",
-                analyze::KernelPattern::Split { .. } => "SPLIT",
-                analyze::KernelPattern::Attention { .. } => "Attention",
-                analyze::KernelPattern::Unknown { .. } => "Unknown",
+        // 2. Fuse adjacent patterns.
+        let fused = fusion::fuse_patterns(patterns);
+
+        // 3. Lower each fused pattern.
+        let mut files = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        for (fp, ep_idx) in &fused {
+            let ep_name = if *ep_idx < module.entry_points.len() {
+                &module.entry_points[*ep_idx].name
+            } else {
+                "fused"
+            };
+
+            let summary = match fp {
+                fusion::FusedPattern::Single(p) => pattern_summary(p).to_string(),
+                fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm (fused)".into(),
+                fusion::FusedPattern::WithActivation {
+                    base, activation, ..
+                } => {
+                    let base_name = match base.as_ref() {
+                        fusion::FusedPattern::Single(p) => pattern_summary(p),
+                        fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",
+                        fusion::FusedPattern::MatMulBias { .. } => "Gemm",
+                        _ => "fused",
+                    };
+                    format!("{base_name}+{activation:?}")
+                }
+                fusion::FusedPattern::MatMulBias { .. } => "Gemm (fused)".into(),
             };
 
             diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Info,
-                message: format!("entry point '{}': classified as {}", ep.name, summary),
+                message: format!("entry point '{ep_name}': classified as {summary}"),
             });
 
-            let bytes = lower::build_model(&pattern)?;
+            let bytes = lower::build_fused_model(fp)?;
 
-            let filename = if module.entry_points.len() == 1 {
+            let filename = if fused.len() == 1 {
                 "output.tflite".into()
             } else {
-                format!("{}.tflite", ep.name)
+                format!("{ep_name}.tflite")
             };
 
             files.push(OutputFile {
@@ -85,6 +101,24 @@ impl Backend for TfLiteBackend {
         }
 
         Ok(BackendOutput { files, diagnostics })
+    }
+}
+
+fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
+    match pattern {
+        analyze::KernelPattern::MatMul { .. } => "BATCH_MATMUL",
+        analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
+        analyze::KernelPattern::Conv2D { .. } => "CONV_2D",
+        analyze::KernelPattern::Pool { kind, .. } => kind.op_name(),
+        analyze::KernelPattern::Activation { op, .. } => op.op_name(),
+        analyze::KernelPattern::Reduce { op, .. } => op.op_name(),
+        analyze::KernelPattern::Transpose { .. } => "TRANSPOSE",
+        analyze::KernelPattern::Reshape { .. } => "RESHAPE",
+        analyze::KernelPattern::Normalization { .. } => "BatchNormalization",
+        analyze::KernelPattern::Concat { .. } => "CONCATENATION",
+        analyze::KernelPattern::Split { .. } => "SPLIT",
+        analyze::KernelPattern::Attention { .. } => "Attention",
+        analyze::KernelPattern::Unknown { .. } => "Unknown",
     }
 }
 

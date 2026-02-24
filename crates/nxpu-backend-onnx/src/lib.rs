@@ -79,10 +79,12 @@ impl Backend for OnnxBackend {
                     let base_name = match base.as_ref() {
                         fusion::FusedPattern::Single(p) => pattern_summary(p),
                         fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",
+                        fusion::FusedPattern::MatMulBias { .. } => "Gemm",
                         _ => "fused",
                     };
                     format!("{base_name}+{activation:?}")
                 }
+                fusion::FusedPattern::MatMulBias { .. } => "Gemm (fused)".into(),
             };
 
             diagnostics.push(Diagnostic {

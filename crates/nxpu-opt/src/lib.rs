@@ -7,6 +7,7 @@
 mod const_fold;
 mod dce;
 mod fma_fusion;
+pub mod fusion;
 pub mod layout;
 pub mod quantize;
 pub mod shape;
@@ -15,6 +16,7 @@ mod validation;
 pub use const_fold::ConstantFolding;
 pub use dce::DeadCodeElimination;
 pub use fma_fusion::FmaFusion;
+pub use fusion::OperatorFusion;
 pub use layout::LayoutTransform;
 pub use quantize::{
     CalibrationData, F32ToBf16, F32ToF16, F32ToInt8, MixedPrecisionPass, MixedPrecisionPolicy,
@@ -41,7 +43,7 @@ pub trait Pass: Debug {
 pub enum OptLevel {
     /// No optimizations.
     O0,
-    /// Basic optimizations (constant folding, FMA fusion, DCE).
+    /// Basic optimizations (constant folding, FMA fusion, operator fusion, DCE).
     O1,
     /// Aggressive optimizations (same as O1 for now).
     O2,
@@ -82,6 +84,7 @@ impl PassManager {
                 pm.add_pre_pass(Box::new(IrValidation));
                 pm.add_pass(Box::new(ConstantFolding));
                 pm.add_pass(Box::new(FmaFusion));
+                pm.add_pass(Box::new(OperatorFusion));
                 pm.add_pass(Box::new(DeadCodeElimination));
             }
         }

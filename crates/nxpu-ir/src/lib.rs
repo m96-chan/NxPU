@@ -21,6 +21,7 @@ pub use expr::{
 };
 pub use func::{EntryPoint, Function, FunctionArgument, FunctionResult, LocalVariable};
 pub use global::{AddressSpace, Binding, BuiltIn, GlobalVariable, ResourceBinding, StorageAccess};
+pub use graph::ActivationFunction;
 pub use stmt::{Barrier, Block, Statement};
 pub use types::{
     ArraySize, Bytes, Dimension, MemoryLayout, Scalar, ScalarKind, StructMember, TensorShape, Type,
