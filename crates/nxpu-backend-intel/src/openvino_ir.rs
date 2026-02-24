@@ -679,6 +679,9 @@ mod tests {
             output: dummy_binding("out", TensorRole::Output),
             d_k: "D".into(),
             seq_len: "S".into(),
+            num_heads: 1,
+            num_kv_heads: 1,
+            causal: false,
         }];
 
         let xml = build_ir_xml(&patterns, "test_attention");
