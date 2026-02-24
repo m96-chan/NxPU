@@ -101,6 +101,23 @@ pub struct BackendOptions {
     /// (e.g. ONNX `metadata_props`, TFLite buffer info). Backends that do not
     /// support memory plan metadata may ignore this field.
     pub memory_plan: Option<MemoryPlan>,
+    /// Optional per-tensor quantization parameters from calibration.
+    ///
+    /// When present, backends embed these parameters in the compiled output
+    /// (e.g. ONNX `metadata_props`, TFLite companion JSON) so downstream
+    /// tools can correctly dequantize tensors.
+    pub quantization_params: Vec<QuantParam>,
+}
+
+/// A per-tensor quantization parameter entry.
+#[derive(Clone, Debug)]
+pub struct QuantParam {
+    /// Tensor name.
+    pub name: String,
+    /// Quantization scale factor.
+    pub scale: f32,
+    /// Quantization zero point.
+    pub zero_point: i32,
 }
 
 impl fmt::Display for BackendOptions {
@@ -110,10 +127,15 @@ impl fmt::Display for BackendOptions {
         } else {
             ""
         };
+        let quant = if self.quantization_params.is_empty() {
+            String::new()
+        } else {
+            format!(", quant_params: {}", self.quantization_params.len())
+        };
         write!(
             f,
-            "BackendOptions {{ opt_level: {}, precision: {}{} }}",
-            self.opt_level, self.precision, mem
+            "BackendOptions {{ opt_level: {}, precision: {}{}{} }}",
+            self.opt_level, self.precision, mem, quant
         )
     }
 }
@@ -701,6 +723,7 @@ mod tests {
                 allocations: vec![],
                 peak_bytes: 0,
             }),
+            ..Default::default()
         };
         let s = format!("{opts}");
         assert!(s.contains("memory_plan: yes"));
@@ -712,6 +735,7 @@ mod tests {
             opt_level: 1,
             precision: PrecisionPolicy::Auto,
             memory_plan: None,
+            ..Default::default()
         };
         let s = format!("{opts}");
         assert!(!s.contains("memory_plan"));

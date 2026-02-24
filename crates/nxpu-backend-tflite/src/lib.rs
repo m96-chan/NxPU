@@ -29,7 +29,7 @@ impl Backend for TfLiteBackend {
     fn compile(
         &self,
         module: &Module,
-        _opts: &BackendOptions,
+        opts: &BackendOptions,
     ) -> Result<BackendOutput, BackendError> {
         if module.entry_points.is_empty() {
             return Err(BackendError::Other("no entry points in module".into()));
@@ -97,6 +97,25 @@ impl Backend for TfLiteBackend {
             files.push(OutputFile {
                 name: filename,
                 content: OutputContent::Binary(bytes),
+            });
+        }
+
+        // 4. Emit quantization parameters as a companion JSON file.
+        if !opts.quantization_params.is_empty() {
+            let mut json = String::from("{\n  \"quantization_params\": [\n");
+            for (i, qp) in opts.quantization_params.iter().enumerate() {
+                if i > 0 {
+                    json.push_str(",\n");
+                }
+                json.push_str(&format!(
+                    "    {{\"name\": \"{}\", \"scale\": {}, \"zero_point\": {}}}",
+                    qp.name, qp.scale, qp.zero_point
+                ));
+            }
+            json.push_str("\n  ]\n}\n");
+            files.push(OutputFile {
+                name: "quant_params.json".into(),
+                content: OutputContent::Text(json),
             });
         }
 
@@ -567,6 +586,65 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             _ => panic!("expected WithActivation"),
         };
         assert_eq!(summary, "Gemm+Relu");
+    }
+
+    #[test]
+    fn compile_with_quantization_params_emits_json() {
+        let source = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+struct Params { N: u32 }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.N) { return; }
+  c[idx] = a[idx] + b[idx];
+}
+"#;
+
+        let module = nxpu_parser::parse(source).unwrap();
+        let backend = TfLiteBackend;
+        let opts = BackendOptions {
+            quantization_params: vec![
+                nxpu_backend_core::QuantParam {
+                    name: "x".into(),
+                    scale: 0.5,
+                    zero_point: 0,
+                },
+                nxpu_backend_core::QuantParam {
+                    name: "y".into(),
+                    scale: 0.25,
+                    zero_point: 128,
+                },
+            ],
+            ..Default::default()
+        };
+        let output = backend.compile(&module, &opts).unwrap();
+
+        // Should have the .tflite file plus quant_params.json
+        assert!(output.files.len() >= 2);
+
+        let json_file = output
+            .files
+            .iter()
+            .find(|f| f.name == "quant_params.json")
+            .expect("expected quant_params.json file");
+
+        let json_text = match &json_file.content {
+            OutputContent::Text(t) => t,
+            _ => panic!("expected text content for quant_params.json"),
+        };
+
+        assert!(json_text.contains("\"name\": \"x\""));
+        assert!(json_text.contains("\"scale\": 0.5"));
+        assert!(json_text.contains("\"zero_point\": 0"));
+        assert!(json_text.contains("\"name\": \"y\""));
+        assert!(json_text.contains("\"scale\": 0.25"));
+        assert!(json_text.contains("\"zero_point\": 128"));
     }
 
     #[test]

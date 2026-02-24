@@ -176,38 +176,797 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
     Ok(bytes)
 }
 
+// ---- Multi-op graph builder types ----
+
+/// A tensor descriptor used when building multi-op TFLite subgraphs.
+struct TensorInfo {
+    name: String,
+    elem_type: i32,
+    shape: Vec<i32>,
+}
+
+/// An operator descriptor used when building multi-op TFLite subgraphs.
+struct OpDesc {
+    opcode: i32,
+    inputs: Vec<i32>,
+    outputs: Vec<i32>,
+}
+
+/// An intermediate graph description that can be serialised to a TFLite
+/// FlatBuffer by [`build_from_graph_desc`].
+struct GraphDesc {
+    tensors: Vec<TensorInfo>,
+    ops: Vec<OpDesc>,
+    graph_inputs: Vec<i32>,
+    graph_outputs: Vec<i32>,
+    graph_name: String,
+}
+
+/// Serialise a [`GraphDesc`] into a TFLite FlatBuffer.
+///
+/// Creates one buffer slot per tensor plus the mandatory sentinel buffer at
+/// index 0.  Deduplicates operator codes so each unique opcode appears only
+/// once in the `operator_codes` vector.
+fn build_from_graph_desc(desc: &GraphDesc) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::with_capacity(2048);
+
+    // --- strings ---
+    let tensor_name_offsets: Vec<_> = desc
+        .tensors
+        .iter()
+        .map(|t| fbb.create_string(&t.name))
+        .collect();
+    let graph_desc_str = fbb.create_string("nxpu");
+    let sg_name_str = fbb.create_string(&desc.graph_name);
+
+    // --- shape vectors ---
+    let shape_offsets: Vec<_> = desc
+        .tensors
+        .iter()
+        .map(|t| fbb.create_vector(&t.shape))
+        .collect();
+
+    // --- op input/output index vectors ---
+    let op_input_offsets: Vec<_> = desc
+        .ops
+        .iter()
+        .map(|o| fbb.create_vector(&o.inputs))
+        .collect();
+    let op_output_offsets: Vec<_> = desc
+        .ops
+        .iter()
+        .map(|o| fbb.create_vector(&o.outputs))
+        .collect();
+
+    // --- graph-level input/output index vectors ---
+    let sg_inputs_vec = fbb.create_vector(&desc.graph_inputs);
+    let sg_outputs_vec = fbb.create_vector(&desc.graph_outputs);
+
+    // --- buffers: sentinel(0) + one per tensor ---
+    let num_tensors = desc.tensors.len();
+    let mut buf_offsets = Vec::with_capacity(num_tensors + 1);
+    for _ in 0..=num_tensors {
+        let start = fbb.start_table();
+        buf_offsets.push(fbb.end_table(start));
+    }
+    let buffers_vec = fbb.create_vector(&buf_offsets);
+
+    // --- tensors ---
+    let mut tensor_offsets = Vec::with_capacity(num_tensors);
+    for (i, ti) in desc.tensors.iter().enumerate() {
+        let t = {
+            let start = fbb.start_table();
+            fbb.push_slot_always(vt::tensor::SHAPE, shape_offsets[i]);
+            fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(ti.elem_type), 0);
+            fbb.push_slot::<u32>(vt::tensor::BUFFER, (i + 1) as u32, 0);
+            fbb.push_slot_always(vt::tensor::NAME, tensor_name_offsets[i]);
+            fbb.end_table(start)
+        };
+        tensor_offsets.push(t);
+    }
+    let tensors_vec = fbb.create_vector(&tensor_offsets);
+
+    // --- deduplicated operator codes ---
+    let mut unique_opcodes: Vec<i32> = Vec::new();
+    for op in &desc.ops {
+        if !unique_opcodes.contains(&op.opcode) {
+            unique_opcodes.push(op.opcode);
+        }
+    }
+    let mut opcode_offsets = Vec::with_capacity(unique_opcodes.len());
+    for &opcode in &unique_opcodes {
+        let deprecated_code = if opcode <= 127 { opcode as i8 } else { 127 };
+        let oc = {
+            let start = fbb.start_table();
+            fbb.push_slot::<i8>(
+                vt::operator_code::DEPRECATED_BUILTIN_CODE,
+                deprecated_code,
+                0,
+            );
+            fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
+            fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, opcode, 0);
+            fbb.end_table(start)
+        };
+        opcode_offsets.push(oc);
+    }
+    let operator_codes_vec = fbb.create_vector(&opcode_offsets);
+
+    // --- operators ---
+    let mut operator_offsets = Vec::with_capacity(desc.ops.len());
+    for (i, op) in desc.ops.iter().enumerate() {
+        let opcode_index = unique_opcodes.iter().position(|&c| c == op.opcode).unwrap() as u32;
+        let o = {
+            let start = fbb.start_table();
+            fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, opcode_index, 0);
+            fbb.push_slot_always(vt::operator::INPUTS, op_input_offsets[i]);
+            fbb.push_slot_always(vt::operator::OUTPUTS, op_output_offsets[i]);
+            fbb.end_table(start)
+        };
+        operator_offsets.push(o);
+    }
+    let operators_vec = fbb.create_vector(&operator_offsets);
+
+    // --- subgraph ---
+    let subgraph = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::sub_graph::TENSORS, tensors_vec);
+        fbb.push_slot_always(vt::sub_graph::INPUTS, sg_inputs_vec);
+        fbb.push_slot_always(vt::sub_graph::OUTPUTS, sg_outputs_vec);
+        fbb.push_slot_always(vt::sub_graph::OPERATORS, operators_vec);
+        fbb.push_slot_always(vt::sub_graph::NAME, sg_name_str);
+        fbb.end_table(start)
+    };
+    let subgraphs_vec = fbb.create_vector(&[subgraph]);
+
+    // --- model ---
+    let model = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::model::VERSION, 3, 0);
+        fbb.push_slot_always(vt::model::OPERATOR_CODES, operator_codes_vec);
+        fbb.push_slot_always(vt::model::SUBGRAPHS, subgraphs_vec);
+        fbb.push_slot_always(vt::model::DESCRIPTION, graph_desc_str);
+        fbb.push_slot_always(vt::model::BUFFERS, buffers_vec);
+        fbb.end_table(start)
+    };
+
+    fbb.finish(model, Some(TFLITE_FILE_ID));
+    fbb.finished_data().to_vec()
+}
+
+// ---- FusedPattern graph collectors ----
+
+/// Build a [`GraphDesc`] for `ConvBatchNorm`: CONV_2D → MUL(scale) → ADD(bias).
+///
+/// Tensor layout:
+/// - 0: input  (4-D)
+/// - 1: weight (4-D)
+/// - 2: scale  (1-D)
+/// - 3: bias   (1-D)
+/// - 4: conv_out (4-D, intermediate)
+/// - 5: bn_mul   (4-D, intermediate)
+/// - 6: output   (4-D)
+///
+/// Graph inputs: [0,1,2,3]  Graph outputs: [6]
+fn collect_conv_batchnorm_graph(
+    conv: &KernelPattern,
+    norm: &KernelPattern,
+) -> Result<GraphDesc, BackendError> {
+    let (input, weight, conv_shape) = match conv {
+        KernelPattern::Conv2D {
+            input,
+            weight,
+            shape,
+            ..
+        } => (input, weight, shape),
+        _ => {
+            return Err(BackendError::Other(
+                "ConvBatchNorm: conv slot is not Conv2D".into(),
+            ));
+        }
+    };
+    let (scale, bias, output) = match norm {
+        KernelPattern::Normalization {
+            scale,
+            bias,
+            output,
+            ..
+        } => (scale, bias, output),
+        _ => {
+            return Err(BackendError::Other(
+                "ConvBatchNorm: norm slot is not Normalization".into(),
+            ));
+        }
+    };
+
+    let _ = conv_shape; // shape info not needed for symbolic dims
+    let shape_4d = vec![-1i32, -1, -1, -1];
+    let shape_1d = vec![-1i32];
+
+    Ok(GraphDesc {
+        tensors: vec![
+            TensorInfo {
+                name: input.name.clone(),
+                elem_type: input.elem_type,
+                shape: shape_4d.clone(),
+            }, // 0
+            TensorInfo {
+                name: weight.name.clone(),
+                elem_type: weight.elem_type,
+                shape: shape_4d.clone(),
+            }, // 1
+            TensorInfo {
+                name: scale.name.clone(),
+                elem_type: scale.elem_type,
+                shape: shape_1d.clone(),
+            }, // 2
+            TensorInfo {
+                name: bias.name.clone(),
+                elem_type: bias.elem_type,
+                shape: shape_1d.clone(),
+            }, // 3
+            TensorInfo {
+                name: "conv_out".into(),
+                elem_type: input.elem_type,
+                shape: shape_4d.clone(),
+            }, // 4
+            TensorInfo {
+                name: "bn_mul".into(),
+                elem_type: input.elem_type,
+                shape: shape_4d.clone(),
+            }, // 5
+            TensorInfo {
+                name: output.name.clone(),
+                elem_type: output.elem_type,
+                shape: shape_4d,
+            }, // 6
+        ],
+        ops: vec![
+            OpDesc {
+                opcode: builtin_op::CONV_2D,
+                inputs: vec![0, 1],
+                outputs: vec![4],
+            },
+            OpDesc {
+                opcode: builtin_op::MUL,
+                inputs: vec![4, 2],
+                outputs: vec![5],
+            },
+            OpDesc {
+                opcode: builtin_op::ADD,
+                inputs: vec![5, 3],
+                outputs: vec![6],
+            },
+        ],
+        graph_inputs: vec![0, 1, 2, 3],
+        graph_outputs: vec![6],
+        graph_name: "conv_batchnorm".into(),
+    })
+}
+
+/// Build a [`GraphDesc`] for `MatMulBias`: BATCH_MATMUL → ADD(bias).
+///
+/// Tensor layout:
+/// - 0: A      (2-D)
+/// - 1: B      (2-D)
+/// - 2: bias   (1-D)
+/// - 3: mm_out (2-D, intermediate)
+/// - 4: output (2-D)
+///
+/// Graph inputs: [0,1,2]  Graph outputs: [4]
+fn collect_matmul_bias_graph(
+    matmul: &KernelPattern,
+    bias_add: &KernelPattern,
+) -> Result<GraphDesc, BackendError> {
+    let (mm_inputs, mm_output) = match matmul {
+        KernelPattern::MatMul { inputs, output, .. } => (inputs, output),
+        _ => {
+            return Err(BackendError::Other(
+                "MatMulBias: matmul slot is not MatMul".into(),
+            ));
+        }
+    };
+    let (bias, output) = match bias_add {
+        KernelPattern::ElementWise { inputs, output, .. } => (&inputs[1], output),
+        _ => {
+            return Err(BackendError::Other(
+                "MatMulBias: bias_add slot is not ElementWise".into(),
+            ));
+        }
+    };
+
+    let shape_2d = vec![-1i32, -1];
+    let shape_1d = vec![-1i32];
+
+    Ok(GraphDesc {
+        tensors: vec![
+            TensorInfo {
+                name: mm_inputs[0].name.clone(),
+                elem_type: mm_inputs[0].elem_type,
+                shape: shape_2d.clone(),
+            }, // 0: A
+            TensorInfo {
+                name: mm_inputs[1].name.clone(),
+                elem_type: mm_inputs[1].elem_type,
+                shape: shape_2d.clone(),
+            }, // 1: B
+            TensorInfo {
+                name: bias.name.clone(),
+                elem_type: bias.elem_type,
+                shape: shape_1d,
+            }, // 2: bias
+            TensorInfo {
+                name: mm_output.name.clone(),
+                elem_type: mm_output.elem_type,
+                shape: shape_2d.clone(),
+            }, // 3: mm_out
+            TensorInfo {
+                name: output.name.clone(),
+                elem_type: output.elem_type,
+                shape: shape_2d,
+            }, // 4: output
+        ],
+        ops: vec![
+            OpDesc {
+                opcode: builtin_op::BATCH_MATMUL,
+                inputs: vec![0, 1],
+                outputs: vec![3],
+            },
+            OpDesc {
+                opcode: builtin_op::ADD,
+                inputs: vec![3, 2],
+                outputs: vec![4],
+            },
+        ],
+        graph_inputs: vec![0, 1, 2],
+        graph_outputs: vec![4],
+        graph_name: "gemm".into(),
+    })
+}
+
+/// Build a [`GraphDesc`] for a single [`KernelPattern`].
+///
+/// Handles the patterns that can be represented as a simple 1-op (or
+/// already-multi-op for Normalization/Attention) subgraph.  Returns an error
+/// for patterns that are better handled by the specialised builders (e.g.
+/// Attention), causing the caller to fall back to [`build_model`].
+fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendError> {
+    match pattern {
+        KernelPattern::MatMul {
+            inputs,
+            output,
+            shape,
+        } => {
+            let shape_2d = vec![-1i32, -1];
+            Ok(GraphDesc {
+                tensors: vec![
+                    TensorInfo {
+                        name: inputs[0].name.clone(),
+                        elem_type: inputs[0].elem_type,
+                        shape: shape_2d.clone(),
+                    },
+                    TensorInfo {
+                        name: inputs[1].name.clone(),
+                        elem_type: inputs[1].elem_type,
+                        shape: shape_2d.clone(),
+                    },
+                    TensorInfo {
+                        name: output.name.clone(),
+                        elem_type: output.elem_type,
+                        shape: shape_2d,
+                    },
+                ],
+                ops: vec![OpDesc {
+                    opcode: builtin_op::BATCH_MATMUL,
+                    inputs: vec![0, 1],
+                    outputs: vec![2],
+                }],
+                graph_inputs: vec![0, 1],
+                graph_outputs: vec![2],
+                graph_name: format!("matmul_{}x{}x{}", shape.m, shape.n, shape.k),
+            })
+        }
+        KernelPattern::ElementWise {
+            op, inputs, output, ..
+        } => {
+            let opcode = match op {
+                ElementWiseOp::Add => builtin_op::ADD,
+                ElementWiseOp::Sub => builtin_op::SUB,
+                ElementWiseOp::Mul => builtin_op::MUL,
+                ElementWiseOp::Div => builtin_op::DIV,
+            };
+            let shape_1d = vec![-1i32];
+            Ok(GraphDesc {
+                tensors: vec![
+                    TensorInfo {
+                        name: inputs[0].name.clone(),
+                        elem_type: inputs[0].elem_type,
+                        shape: shape_1d.clone(),
+                    },
+                    TensorInfo {
+                        name: inputs[1].name.clone(),
+                        elem_type: inputs[1].elem_type,
+                        shape: shape_1d.clone(),
+                    },
+                    TensorInfo {
+                        name: output.name.clone(),
+                        elem_type: output.elem_type,
+                        shape: shape_1d,
+                    },
+                ],
+                ops: vec![OpDesc {
+                    opcode,
+                    inputs: vec![0, 1],
+                    outputs: vec![2],
+                }],
+                graph_inputs: vec![0, 1],
+                graph_outputs: vec![2],
+                graph_name: format!("{}_1d", op.op_name().to_lowercase()),
+            })
+        }
+        KernelPattern::Conv2D {
+            input,
+            weight,
+            output,
+            ..
+        } => {
+            let shape_4d = vec![-1i32, -1, -1, -1];
+            Ok(GraphDesc {
+                tensors: vec![
+                    TensorInfo {
+                        name: input.name.clone(),
+                        elem_type: input.elem_type,
+                        shape: shape_4d.clone(),
+                    },
+                    TensorInfo {
+                        name: weight.name.clone(),
+                        elem_type: weight.elem_type,
+                        shape: shape_4d.clone(),
+                    },
+                    TensorInfo {
+                        name: output.name.clone(),
+                        elem_type: output.elem_type,
+                        shape: shape_4d,
+                    },
+                ],
+                ops: vec![OpDesc {
+                    opcode: builtin_op::CONV_2D,
+                    inputs: vec![0, 1],
+                    outputs: vec![2],
+                }],
+                graph_inputs: vec![0, 1],
+                graph_outputs: vec![2],
+                graph_name: "conv2d".into(),
+            })
+        }
+        KernelPattern::Pool {
+            kind,
+            input,
+            output,
+            ..
+        } => {
+            let opcode = match kind {
+                PoolKind::Max => builtin_op::MAX_POOL_2D,
+                PoolKind::Avg => builtin_op::AVERAGE_POOL_2D,
+            };
+            let shape_4d = vec![-1i32, -1, -1, -1];
+            Ok(GraphDesc {
+                tensors: vec![
+                    TensorInfo {
+                        name: input.name.clone(),
+                        elem_type: input.elem_type,
+                        shape: shape_4d.clone(),
+                    },
+                    TensorInfo {
+                        name: output.name.clone(),
+                        elem_type: output.elem_type,
+                        shape: shape_4d,
+                    },
+                ],
+                ops: vec![OpDesc {
+                    opcode,
+                    inputs: vec![0],
+                    outputs: vec![1],
+                }],
+                graph_inputs: vec![0],
+                graph_outputs: vec![1],
+                graph_name: "pool".into(),
+            })
+        }
+        KernelPattern::Activation {
+            op, input, output, ..
+        } => {
+            let opcode = match op {
+                ActivationOp::Relu => builtin_op::RELU,
+                ActivationOp::Sigmoid => builtin_op::LOGISTIC,
+                ActivationOp::Tanh => builtin_op::TANH,
+                ActivationOp::Softmax => builtin_op::SOFTMAX,
+            };
+            let shape_1d = vec![-1i32];
+            Ok(GraphDesc {
+                tensors: vec![
+                    TensorInfo {
+                        name: input.name.clone(),
+                        elem_type: input.elem_type,
+                        shape: shape_1d.clone(),
+                    },
+                    TensorInfo {
+                        name: output.name.clone(),
+                        elem_type: output.elem_type,
+                        shape: shape_1d,
+                    },
+                ],
+                ops: vec![OpDesc {
+                    opcode,
+                    inputs: vec![0],
+                    outputs: vec![1],
+                }],
+                graph_inputs: vec![0],
+                graph_outputs: vec![1],
+                graph_name: format!("{}_1d", op.op_name().to_lowercase()),
+            })
+        }
+        KernelPattern::Reduce {
+            op, input, output, ..
+        } => {
+            let opcode = match op {
+                ReduceOp::Sum => builtin_op::SUM,
+                ReduceOp::Mean => builtin_op::MEAN,
+                ReduceOp::Max => builtin_op::REDUCE_MAX,
+                ReduceOp::Min => builtin_op::REDUCE_MIN,
+            };
+            Ok(GraphDesc {
+                tensors: vec![
+                    TensorInfo {
+                        name: input.name.clone(),
+                        elem_type: input.elem_type,
+                        shape: vec![-1, -1],
+                    },
+                    TensorInfo {
+                        name: output.name.clone(),
+                        elem_type: output.elem_type,
+                        shape: vec![-1],
+                    },
+                ],
+                ops: vec![OpDesc {
+                    opcode,
+                    inputs: vec![0],
+                    outputs: vec![1],
+                }],
+                graph_inputs: vec![0],
+                graph_outputs: vec![1],
+                graph_name: format!("{}_reduce", op.op_name().to_lowercase()),
+            })
+        }
+        KernelPattern::Transpose { input, output, .. } => Ok(GraphDesc {
+            tensors: vec![
+                TensorInfo {
+                    name: input.name.clone(),
+                    elem_type: input.elem_type,
+                    shape: vec![-1, -1],
+                },
+                TensorInfo {
+                    name: output.name.clone(),
+                    elem_type: output.elem_type,
+                    shape: vec![-1, -1],
+                },
+            ],
+            ops: vec![OpDesc {
+                opcode: builtin_op::TRANSPOSE,
+                inputs: vec![0],
+                outputs: vec![1],
+            }],
+            graph_inputs: vec![0],
+            graph_outputs: vec![1],
+            graph_name: "transpose".into(),
+        }),
+        KernelPattern::Reshape { input, output, .. } => Ok(GraphDesc {
+            tensors: vec![
+                TensorInfo {
+                    name: input.name.clone(),
+                    elem_type: input.elem_type,
+                    shape: vec![-1],
+                },
+                TensorInfo {
+                    name: output.name.clone(),
+                    elem_type: output.elem_type,
+                    shape: vec![-1],
+                },
+            ],
+            ops: vec![OpDesc {
+                opcode: builtin_op::RESHAPE,
+                inputs: vec![0],
+                outputs: vec![1],
+            }],
+            graph_inputs: vec![0],
+            graph_outputs: vec![1],
+            graph_name: "reshape".into(),
+        }),
+        KernelPattern::Normalization {
+            input,
+            scale,
+            bias,
+            output,
+            ..
+        } => {
+            // Expand to MUL(input, scale) → ADD(mul_result, bias)
+            let shape_4d = vec![-1i32, -1, -1, -1];
+            let shape_1d = vec![-1i32];
+            Ok(GraphDesc {
+                tensors: vec![
+                    TensorInfo {
+                        name: input.name.clone(),
+                        elem_type: input.elem_type,
+                        shape: shape_4d.clone(),
+                    }, // 0
+                    TensorInfo {
+                        name: scale.name.clone(),
+                        elem_type: scale.elem_type,
+                        shape: shape_1d.clone(),
+                    }, // 1
+                    TensorInfo {
+                        name: bias.name.clone(),
+                        elem_type: bias.elem_type,
+                        shape: shape_1d,
+                    }, // 2
+                    TensorInfo {
+                        name: "batchnorm_mul".into(),
+                        elem_type: input.elem_type,
+                        shape: shape_4d.clone(),
+                    }, // 3
+                    TensorInfo {
+                        name: output.name.clone(),
+                        elem_type: output.elem_type,
+                        shape: shape_4d,
+                    }, // 4
+                ],
+                ops: vec![
+                    OpDesc {
+                        opcode: builtin_op::MUL,
+                        inputs: vec![0, 1],
+                        outputs: vec![3],
+                    },
+                    OpDesc {
+                        opcode: builtin_op::ADD,
+                        inputs: vec![3, 2],
+                        outputs: vec![4],
+                    },
+                ],
+                graph_inputs: vec![0, 1, 2],
+                graph_outputs: vec![4],
+                graph_name: "batchnorm".into(),
+            })
+        }
+        KernelPattern::Concat { inputs, output, .. } => {
+            let shape_1d = vec![-1i32];
+            let mut tensors: Vec<TensorInfo> = inputs
+                .iter()
+                .map(|t| TensorInfo {
+                    name: t.name.clone(),
+                    elem_type: t.elem_type,
+                    shape: shape_1d.clone(),
+                })
+                .collect();
+            tensors.push(TensorInfo {
+                name: output.name.clone(),
+                elem_type: output.elem_type,
+                shape: shape_1d,
+            });
+            let n = inputs.len() as i32;
+            let input_indices: Vec<i32> = (0..n).collect();
+            Ok(GraphDesc {
+                graph_inputs: input_indices.clone(),
+                graph_outputs: vec![n],
+                ops: vec![OpDesc {
+                    opcode: builtin_op::CONCATENATION,
+                    inputs: input_indices,
+                    outputs: vec![n],
+                }],
+                tensors,
+                graph_name: "concat".into(),
+            })
+        }
+        // Patterns that are complex (Attention, Split) fall back to build_model.
+        KernelPattern::Attention { .. } | KernelPattern::Split { .. } => Err(BackendError::Other(
+            "complex pattern: use build_model fallback".into(),
+        )),
+        KernelPattern::Unknown { reason } => Err(BackendError::Unsupported(format!(
+            "cannot lower Unknown pattern to TFLite: {reason}"
+        ))),
+    }
+}
+
+/// Return the TFLite builtin opcode for a [`FusedActivation`], or `None` if
+/// the activation is `None` (no trailing op needed).
+fn activation_opcode(act: &nxpu_analysis::fusion::FusedActivation) -> Option<i32> {
+    use nxpu_analysis::fusion::FusedActivation;
+    match act {
+        FusedActivation::None => None,
+        FusedActivation::Relu => Some(builtin_op::RELU),
+        FusedActivation::Sigmoid => Some(builtin_op::LOGISTIC),
+        FusedActivation::Tanh => Some(builtin_op::TANH),
+    }
+}
+
+/// Append a trailing activation operator to a [`GraphDesc`] in place.
+///
+/// The current graph output tensor becomes the activation's input; a new
+/// output tensor (named `<old_output>_act`) is appended and becomes the new
+/// graph output.
+fn append_activation(
+    desc: &mut GraphDesc,
+    act: &nxpu_analysis::fusion::FusedActivation,
+    act_opcode: i32,
+) {
+    let old_out_idx = *desc.graph_outputs.last().unwrap();
+    let old_out = &desc.tensors[old_out_idx as usize];
+    let act_tensor = TensorInfo {
+        name: format!("{}_act", old_out.name),
+        elem_type: old_out.elem_type,
+        shape: old_out.shape.clone(),
+    };
+    let act_tensor_idx = desc.tensors.len() as i32;
+    desc.tensors.push(act_tensor);
+    desc.ops.push(OpDesc {
+        opcode: act_opcode,
+        inputs: vec![old_out_idx],
+        outputs: vec![act_tensor_idx],
+    });
+    // Replace graph outputs with the new activation output.
+    *desc.graph_outputs.last_mut().unwrap() = act_tensor_idx;
+    let _ = act; // only used for naming via caller
+}
+
 /// Build a TFLite FlatBuffer model from a fused pattern.
 ///
 /// Handles single patterns, Conv+BatchNorm, MatMul+Bias (Gemm), and
-/// activation fusion.
+/// activation fusion.  All fused combinations now emit proper multi-operator
+/// subgraphs instead of delegating to the unfused single-op builder.
 pub fn build_fused_model(fp: &FusedPattern) -> Result<Vec<u8>, BackendError> {
+    use nxpu_analysis::fusion::FusedActivation;
+
     match fp {
         FusedPattern::Single(p) => build_model(p),
-        FusedPattern::ConvBatchNorm { conv, .. } => {
-            // Lower just the conv; TFLite doesn't have a native fused
-            // Conv+BatchNorm, so we emit the conv and the BN is folded
-            // into weights at a higher level.
-            build_model(conv)
+        FusedPattern::ConvBatchNorm { conv, norm } => {
+            let desc = collect_conv_batchnorm_graph(conv, norm)?;
+            Ok(build_from_graph_desc(&desc))
         }
         FusedPattern::MatMulBias { matmul, bias_add } => {
-            // For TFLite, emit as BATCH_MATMUL followed by ADD in a
-            // single model. For now, lower just the matmul; the bias is
-            // handled separately.
-            // A full implementation would build a multi-operator subgraph.
-            // For simplicity, lower the primary pattern.
-            let _ = bias_add;
-            build_model(matmul)
+            let desc = collect_matmul_bias_graph(matmul, bias_add)?;
+            Ok(build_from_graph_desc(&desc))
         }
         FusedPattern::WithActivation {
             base, activation, ..
         } => {
-            // For WithActivation, we lower the base and note the fused
-            // activation. TFLite operators that support fused activation
-            // (Conv2D, Add, etc.) set the activation enum in their options.
-            // For operators that don't support inline activation, we just
-            // lower the base pattern for now.
-            let _ = activation;
-            build_fused_model(base)
+            if matches!(activation, FusedActivation::None) {
+                return build_fused_model(base);
+            }
+            let act_opcode = match activation_opcode(activation) {
+                Some(c) => c,
+                None => return build_fused_model(base),
+            };
+
+            // Collect the base graph descriptor, then append the activation op.
+            let mut desc = match base.as_ref() {
+                FusedPattern::Single(p) => match collect_single_graph(p) {
+                    Ok(d) => d,
+                    // Fall back to build_model for complex single patterns
+                    // (Attention, Split) and just return it without activation.
+                    Err(_) => return build_model(p),
+                },
+                FusedPattern::ConvBatchNorm { conv, norm } => {
+                    collect_conv_batchnorm_graph(conv, norm)?
+                }
+                FusedPattern::MatMulBias { matmul, bias_add } => {
+                    collect_matmul_bias_graph(matmul, bias_add)?
+                }
+                FusedPattern::WithActivation { .. } => {
+                    // Nested WithActivation should not occur in practice.
+                    return build_fused_model(base);
+                }
+            };
+
+            append_activation(&mut desc, activation, act_opcode);
+            Ok(build_from_graph_desc(&desc))
         }
     }
 }
@@ -1486,5 +2245,1012 @@ mod tests {
         };
         let bytes = build_model(&pattern).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    // ---- build_fused_model tests ----
+
+    fn make_conv2d() -> KernelPattern {
+        KernelPattern::Conv2D {
+            input: make_tensor("x", TensorRole::Input),
+            weight: make_tensor("w", TensorRole::Input),
+            output: make_tensor("conv_out", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "IC".into(),
+                channels_out: "OC".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                kernel_h_val: 3,
+                kernel_w_val: 3,
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 0,
+                pad_w: 0,
+            },
+        }
+    }
+
+    fn make_normalization(input_name: &str, output_name: &str) -> KernelPattern {
+        KernelPattern::Normalization {
+            input: make_tensor(input_name, TensorRole::Input),
+            scale: make_tensor("gamma", TensorRole::Input),
+            bias: make_tensor("beta", TensorRole::Input),
+            output: make_tensor(output_name, TensorRole::Output),
+            epsilon: 1e-5,
+        }
+    }
+
+    fn make_matmul() -> KernelPattern {
+        KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("mm_out", TensorRole::Output),
+            shape: MatMulShape {
+                m: "M".into(),
+                n: "N".into(),
+                k: "K".into(),
+            },
+        }
+    }
+
+    fn make_bias_add(input_name: &str, output_name: &str) -> KernelPattern {
+        KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor(input_name, TensorRole::Input),
+                make_tensor("bias", TensorRole::Input),
+            ],
+            output: make_tensor(output_name, TensorRole::Output),
+            dim_name: "N".into(),
+        }
+    }
+
+    fn make_activation(op: ActivationOp, input_name: &str, output_name: &str) -> KernelPattern {
+        KernelPattern::Activation {
+            op,
+            input: make_tensor(input_name, TensorRole::Input),
+            output: make_tensor(output_name, TensorRole::Output),
+            dim_name: "N".into(),
+        }
+    }
+
+    #[test]
+    fn fused_model_conv_batchnorm() {
+        use nxpu_analysis::fusion::FusedPattern;
+
+        let fused = FusedPattern::ConvBatchNorm {
+            conv: make_conv2d(),
+            norm: Box::new(make_normalization("conv_out", "bn_out")),
+        };
+
+        let bytes = build_fused_model(&fused).unwrap();
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_model_matmul_bias() {
+        use nxpu_analysis::fusion::FusedPattern;
+
+        let fused = FusedPattern::MatMulBias {
+            matmul: make_matmul(),
+            bias_add: Box::new(make_bias_add("mm_out", "out")),
+        };
+
+        let bytes = build_fused_model(&fused).unwrap();
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_model_single_matmul() {
+        use nxpu_analysis::fusion::FusedPattern;
+
+        let fused = FusedPattern::Single(make_matmul());
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_model_with_activation_on_single_matmul() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(make_matmul())),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(make_activation(ActivationOp::Relu, "mm_out", "relu_out")),
+        };
+
+        let bytes = build_fused_model(&fused).unwrap();
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_model_with_sigmoid_on_single_elementwise() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(add)),
+            activation: FusedActivation::Sigmoid,
+            activation_pattern: Box::new(make_activation(ActivationOp::Sigmoid, "c", "sig_out")),
+        };
+
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_model_with_tanh_on_single_elementwise() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let mul = KernelPattern::ElementWise {
+            op: ElementWiseOp::Mul,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(mul)),
+            activation: FusedActivation::Tanh,
+            activation_pattern: Box::new(make_activation(ActivationOp::Tanh, "c", "tanh_out")),
+        };
+
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_model_with_activation_on_conv_batchnorm() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::ConvBatchNorm {
+                conv: make_conv2d(),
+                norm: Box::new(make_normalization("conv_out", "bn_out")),
+            }),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(make_activation(ActivationOp::Relu, "bn_out", "relu_out")),
+        };
+
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_model_with_activation_on_matmul_bias() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::MatMulBias {
+                matmul: make_matmul(),
+                bias_add: Box::new(make_bias_add("mm_out", "gemm_out")),
+            }),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(make_activation(
+                ActivationOp::Relu,
+                "gemm_out",
+                "relu_out",
+            )),
+        };
+
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_model_with_activation_none_returns_base() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(make_matmul())),
+            activation: FusedActivation::None,
+            activation_pattern: Box::new(make_activation(ActivationOp::Relu, "mm_out", "out")),
+        };
+
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_model_with_nested_with_activation() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        // Nested WithActivation: should recurse into base
+        let inner = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(make_matmul())),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(make_activation(ActivationOp::Relu, "mm_out", "relu_out")),
+        };
+        let outer = FusedPattern::WithActivation {
+            base: Box::new(inner),
+            activation: FusedActivation::Sigmoid,
+            activation_pattern: Box::new(make_activation(
+                ActivationOp::Sigmoid,
+                "relu_out",
+                "sig_out",
+            )),
+        };
+
+        // Should not panic; the nested WithActivation causes a recursive call
+        let bytes = build_fused_model(&outer).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    // ---- collect_single_graph tests for each pattern ----
+
+    #[test]
+    fn fused_single_conv2d() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(make_conv2d());
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_pool_max() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(KernelPattern::Pool {
+            kind: PoolKind::Max,
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            shape: PoolShape {
+                kernel_h: 2,
+                kernel_w: 2,
+                stride_h: 2,
+                stride_w: 2,
+            },
+        });
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_pool_avg() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(KernelPattern::Pool {
+            kind: PoolKind::Avg,
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            shape: PoolShape {
+                kernel_h: 2,
+                kernel_w: 2,
+                stride_h: 2,
+                stride_w: 2,
+            },
+        });
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_activation_relu() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(make_activation(ActivationOp::Relu, "x", "y"));
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_activation_sigmoid() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(make_activation(ActivationOp::Sigmoid, "x", "y"));
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_activation_tanh() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(make_activation(ActivationOp::Tanh, "x", "y"));
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_activation_softmax() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(make_activation(ActivationOp::Softmax, "x", "y"));
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_reduce_all_ops() {
+        use nxpu_analysis::fusion::FusedPattern;
+        for op in [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min] {
+            let fused = FusedPattern::Single(KernelPattern::Reduce {
+                op,
+                input: make_tensor("x", TensorRole::Input),
+                output: make_tensor("y", TensorRole::Output),
+                axis: 1,
+            });
+            let bytes = build_fused_model(&fused).unwrap();
+            assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
+        }
+    }
+
+    #[test]
+    fn fused_single_transpose() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(KernelPattern::Transpose {
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            perm: vec![1, 0],
+        });
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_reshape() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(KernelPattern::Reshape {
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+        });
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_normalization() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(make_normalization("x", "y"));
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_concat() {
+        use nxpu_analysis::fusion::FusedPattern;
+        let fused = FusedPattern::Single(KernelPattern::Concat {
+            inputs: vec![
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            axis: 0,
+        });
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_single_elementwise_all_ops() {
+        use nxpu_analysis::fusion::FusedPattern;
+        for op in [
+            ElementWiseOp::Add,
+            ElementWiseOp::Sub,
+            ElementWiseOp::Mul,
+            ElementWiseOp::Div,
+        ] {
+            let fused = FusedPattern::Single(KernelPattern::ElementWise {
+                op,
+                inputs: [
+                    make_tensor("a", TensorRole::Input),
+                    make_tensor("b", TensorRole::Input),
+                ],
+                output: make_tensor("c", TensorRole::Output),
+                dim_name: "N".into(),
+            });
+            let bytes = build_fused_model(&fused).unwrap();
+            assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
+        }
+    }
+
+    // ---- activation_opcode tests ----
+
+    #[test]
+    fn activation_opcode_none() {
+        use nxpu_analysis::fusion::FusedActivation;
+        assert!(activation_opcode(&FusedActivation::None).is_none());
+    }
+
+    #[test]
+    fn activation_opcode_relu() {
+        use nxpu_analysis::fusion::FusedActivation;
+        let code = activation_opcode(&FusedActivation::Relu).unwrap();
+        assert_eq!(code, builtin_op::RELU);
+    }
+
+    #[test]
+    fn activation_opcode_sigmoid() {
+        use nxpu_analysis::fusion::FusedActivation;
+        let code = activation_opcode(&FusedActivation::Sigmoid).unwrap();
+        assert_eq!(code, builtin_op::LOGISTIC);
+    }
+
+    #[test]
+    fn activation_opcode_tanh() {
+        use nxpu_analysis::fusion::FusedActivation;
+        let code = activation_opcode(&FusedActivation::Tanh).unwrap();
+        assert_eq!(code, builtin_op::TANH);
+    }
+
+    // ---- Error case tests ----
+
+    #[test]
+    fn conv_batchnorm_wrong_conv_slot() {
+        // Pass a MatMul in the conv slot - should error
+        let result =
+            collect_conv_batchnorm_graph(&make_matmul(), &make_normalization("conv_out", "bn_out"));
+        match result {
+            Err(e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("conv slot is not Conv2D"),
+                    "unexpected error: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for wrong conv slot"),
+        }
+    }
+
+    #[test]
+    fn conv_batchnorm_wrong_norm_slot() {
+        // Pass a MatMul in the norm slot - should error
+        let result = collect_conv_batchnorm_graph(&make_conv2d(), &make_matmul());
+        match result {
+            Err(e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("norm slot is not Normalization"),
+                    "unexpected error: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for wrong norm slot"),
+        }
+    }
+
+    #[test]
+    fn matmul_bias_wrong_matmul_slot() {
+        // Pass an ElementWise in the matmul slot - should error
+        let add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let result = collect_matmul_bias_graph(&add, &make_bias_add("c", "out"));
+        match result {
+            Err(e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("matmul slot is not MatMul"),
+                    "unexpected error: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for wrong matmul slot"),
+        }
+    }
+
+    #[test]
+    fn matmul_bias_wrong_bias_slot() {
+        // Pass a MatMul in the bias_add slot - should error
+        let result = collect_matmul_bias_graph(&make_matmul(), &make_matmul());
+        match result {
+            Err(e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("bias_add slot is not ElementWise"),
+                    "unexpected error: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for wrong bias_add slot"),
+        }
+    }
+
+    #[test]
+    fn fused_conv_batchnorm_wrong_inner_errors() {
+        use nxpu_analysis::fusion::FusedPattern;
+
+        // ConvBatchNorm with wrong conv slot returns error from build_fused_model
+        let fused = FusedPattern::ConvBatchNorm {
+            conv: make_matmul(), // wrong: should be Conv2D
+            norm: Box::new(make_normalization("x", "y")),
+        };
+        assert!(build_fused_model(&fused).is_err());
+    }
+
+    #[test]
+    fn fused_matmul_bias_wrong_inner_errors() {
+        use nxpu_analysis::fusion::FusedPattern;
+
+        // MatMulBias with wrong matmul slot returns error
+        let fused = FusedPattern::MatMulBias {
+            matmul: make_conv2d(), // wrong: should be MatMul
+            bias_add: Box::new(make_bias_add("x", "y")),
+        };
+        assert!(build_fused_model(&fused).is_err());
+    }
+
+    // ---- collect_single_graph error cases ----
+
+    #[test]
+    fn collect_single_graph_unknown_errors() {
+        let pattern = KernelPattern::Unknown {
+            reason: "test".into(),
+        };
+        let result = collect_single_graph(&pattern);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn collect_single_graph_attention_falls_back() {
+        // Attention should return an error from collect_single_graph
+        let pattern = KernelPattern::Attention {
+            query: make_tensor("q", TensorRole::Input),
+            key: make_tensor("k", TensorRole::Input),
+            value: make_tensor("v", TensorRole::Input),
+            output: make_tensor("o", TensorRole::Output),
+            d_k: "D".into(),
+            seq_len: "S".into(),
+        };
+        let result = collect_single_graph(&pattern);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn collect_single_graph_split_falls_back() {
+        // Split should return an error from collect_single_graph
+        let pattern = KernelPattern::Split {
+            input: make_tensor("x", TensorRole::Input),
+            outputs: vec![
+                make_tensor("o1", TensorRole::Output),
+                make_tensor("o2", TensorRole::Output),
+            ],
+            axis: 0,
+        };
+        let result = collect_single_graph(&pattern);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fused_with_activation_on_attention_falls_back_to_build_model() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        // WithActivation wrapping a Single(Attention) should fall back
+        // to build_model for the base since collect_single_graph fails.
+        let attention = KernelPattern::Attention {
+            query: make_tensor("q", TensorRole::Input),
+            key: make_tensor("k", TensorRole::Input),
+            value: make_tensor("v", TensorRole::Input),
+            output: make_tensor("o", TensorRole::Output),
+            d_k: "D".into(),
+            seq_len: "S".into(),
+        };
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(attention)),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(make_activation(ActivationOp::Relu, "o", "relu_out")),
+        };
+
+        // Falls back to build_model which handles Attention
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    // ---- build_from_graph_desc tests ----
+
+    #[test]
+    fn build_from_graph_desc_simple() {
+        let desc = GraphDesc {
+            tensors: vec![
+                TensorInfo {
+                    name: "in".into(),
+                    elem_type: data_type::FLOAT,
+                    shape: vec![-1],
+                },
+                TensorInfo {
+                    name: "out".into(),
+                    elem_type: data_type::FLOAT,
+                    shape: vec![-1],
+                },
+            ],
+            ops: vec![OpDesc {
+                opcode: builtin_op::RELU,
+                inputs: vec![0],
+                outputs: vec![1],
+            }],
+            graph_inputs: vec![0],
+            graph_outputs: vec![1],
+            graph_name: "test".into(),
+        };
+        let bytes = build_from_graph_desc(&desc);
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_from_graph_desc_deduplicates_opcodes() {
+        // Two ops with the same opcode should result in one entry in operator_codes
+        let desc = GraphDesc {
+            tensors: vec![
+                TensorInfo {
+                    name: "a".into(),
+                    elem_type: data_type::FLOAT,
+                    shape: vec![-1],
+                },
+                TensorInfo {
+                    name: "b".into(),
+                    elem_type: data_type::FLOAT,
+                    shape: vec![-1],
+                },
+                TensorInfo {
+                    name: "c".into(),
+                    elem_type: data_type::FLOAT,
+                    shape: vec![-1],
+                },
+            ],
+            ops: vec![
+                OpDesc {
+                    opcode: builtin_op::RELU,
+                    inputs: vec![0],
+                    outputs: vec![1],
+                },
+                OpDesc {
+                    opcode: builtin_op::RELU,
+                    inputs: vec![1],
+                    outputs: vec![2],
+                },
+            ],
+            graph_inputs: vec![0],
+            graph_outputs: vec![2],
+            graph_name: "dedup_test".into(),
+        };
+        let bytes = build_from_graph_desc(&desc);
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    // ---- append_activation tests ----
+
+    #[test]
+    fn append_activation_adds_op_and_tensor() {
+        use nxpu_analysis::fusion::FusedActivation;
+
+        let mut desc = GraphDesc {
+            tensors: vec![
+                TensorInfo {
+                    name: "in".into(),
+                    elem_type: data_type::FLOAT,
+                    shape: vec![-1],
+                },
+                TensorInfo {
+                    name: "out".into(),
+                    elem_type: data_type::FLOAT,
+                    shape: vec![-1],
+                },
+            ],
+            ops: vec![OpDesc {
+                opcode: builtin_op::RELU,
+                inputs: vec![0],
+                outputs: vec![1],
+            }],
+            graph_inputs: vec![0],
+            graph_outputs: vec![1],
+            graph_name: "test".into(),
+        };
+
+        append_activation(&mut desc, &FusedActivation::Sigmoid, builtin_op::LOGISTIC);
+
+        // Should have added a new tensor and op
+        assert_eq!(desc.tensors.len(), 3);
+        assert_eq!(desc.ops.len(), 2);
+        assert_eq!(desc.ops[1].opcode, builtin_op::LOGISTIC);
+        assert_eq!(desc.ops[1].inputs, vec![1]); // old output
+        assert_eq!(desc.ops[1].outputs, vec![2]); // new tensor
+        assert_eq!(desc.graph_outputs, vec![2]); // updated
+        assert!(desc.tensors[2].name.contains("_act"));
+    }
+
+    // ---- onnx_to_tflite_type tests ----
+
+    #[test]
+    fn onnx_to_tflite_type_all_variants() {
+        assert_eq!(onnx_to_tflite_type(data_type::FLOAT), tensor_type::FLOAT32);
+        assert_eq!(
+            onnx_to_tflite_type(data_type::FLOAT16),
+            tensor_type::FLOAT16
+        );
+        assert_eq!(onnx_to_tflite_type(data_type::INT32), tensor_type::INT32);
+        assert_eq!(onnx_to_tflite_type(data_type::UINT32), tensor_type::UINT32);
+        assert_eq!(onnx_to_tflite_type(data_type::BOOL), tensor_type::BOOL);
+        assert_eq!(onnx_to_tflite_type(data_type::INT8), tensor_type::INT8);
+        // Unknown type falls back to FLOAT32
+        assert_eq!(onnx_to_tflite_type(9999), tensor_type::FLOAT32);
+    }
+
+    // ---- WithActivation on single patterns via collect_single_graph ----
+
+    #[test]
+    fn fused_with_activation_on_single_conv2d() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(make_conv2d())),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(make_activation(
+                ActivationOp::Relu,
+                "conv_out",
+                "relu_out",
+            )),
+        };
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_with_activation_on_single_pool() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let pool = KernelPattern::Pool {
+            kind: PoolKind::Max,
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("pool_out", TensorRole::Output),
+            shape: PoolShape {
+                kernel_h: 2,
+                kernel_w: 2,
+                stride_h: 2,
+                stride_w: 2,
+            },
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(pool)),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(make_activation(
+                ActivationOp::Relu,
+                "pool_out",
+                "relu_out",
+            )),
+        };
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_with_activation_on_single_reduce() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let reduce = KernelPattern::Reduce {
+            op: ReduceOp::Sum,
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("red_out", TensorRole::Output),
+            axis: 1,
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(reduce)),
+            activation: FusedActivation::Sigmoid,
+            activation_pattern: Box::new(make_activation(
+                ActivationOp::Sigmoid,
+                "red_out",
+                "sig_out",
+            )),
+        };
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_with_activation_on_single_transpose() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let transpose = KernelPattern::Transpose {
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("t_out", TensorRole::Output),
+            perm: vec![1, 0],
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(transpose)),
+            activation: FusedActivation::Tanh,
+            activation_pattern: Box::new(make_activation(ActivationOp::Tanh, "t_out", "tanh_out")),
+        };
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_with_activation_on_single_reshape() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let reshape = KernelPattern::Reshape {
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("r_out", TensorRole::Output),
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(reshape)),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(make_activation(ActivationOp::Relu, "r_out", "relu_out")),
+        };
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_with_activation_on_single_normalization() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(make_normalization("x", "n_out"))),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(make_activation(ActivationOp::Relu, "n_out", "relu_out")),
+        };
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_with_activation_on_single_concat() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let concat = KernelPattern::Concat {
+            inputs: vec![
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("cat_out", TensorRole::Output),
+            axis: 0,
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(concat)),
+            activation: FusedActivation::Sigmoid,
+            activation_pattern: Box::new(make_activation(
+                ActivationOp::Sigmoid,
+                "cat_out",
+                "sig_out",
+            )),
+        };
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn fused_with_activation_on_single_activation() {
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        // Relu followed by Tanh via WithActivation
+        let relu = make_activation(ActivationOp::Relu, "x", "relu_out");
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(relu)),
+            activation: FusedActivation::Tanh,
+            activation_pattern: Box::new(make_activation(
+                ActivationOp::Tanh,
+                "relu_out",
+                "tanh_out",
+            )),
+        };
+        let bytes = build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    // ---- build_model edge cases ----
+
+    #[test]
+    fn build_model_unknown_returns_error() {
+        let pattern = KernelPattern::Unknown {
+            reason: "test error".into(),
+        };
+        let result = build_model(&pattern);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("cannot lower Unknown pattern"));
+    }
+
+    #[test]
+    fn build_model_softmax() {
+        let pattern = KernelPattern::Activation {
+            op: ActivationOp::Softmax,
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let bytes = build_model(&pattern).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_model_transpose() {
+        let pattern = KernelPattern::Transpose {
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            perm: vec![1, 0],
+        };
+        let bytes = build_model(&pattern).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_model_reshape() {
+        let pattern = KernelPattern::Reshape {
+            input: make_tensor("x", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+        };
+        let bytes = build_model(&pattern).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_model_normalization() {
+        let pattern = make_normalization("x", "y");
+        let bytes = build_model(&pattern).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_model_concat() {
+        let pattern = KernelPattern::Concat {
+            inputs: vec![
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            axis: 0,
+        };
+        let bytes = build_model(&pattern).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_model_split() {
+        let pattern = KernelPattern::Split {
+            input: make_tensor("x", TensorRole::Input),
+            outputs: vec![
+                make_tensor("o1", TensorRole::Output),
+                make_tensor("o2", TensorRole::Output),
+            ],
+            axis: 0,
+        };
+        let bytes = build_model(&pattern).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_model_attention() {
+        let pattern = KernelPattern::Attention {
+            query: make_tensor("q", TensorRole::Input),
+            key: make_tensor("k", TensorRole::Input),
+            value: make_tensor("v", TensorRole::Input),
+            output: make_tensor("o", TensorRole::Output),
+            d_k: "D".into(),
+            seq_len: "S".into(),
+        };
+        let bytes = build_model(&pattern).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_model_all_reduce_ops() {
+        for op in [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min] {
+            let pattern = KernelPattern::Reduce {
+                op,
+                input: make_tensor("x", TensorRole::Input),
+                output: make_tensor("y", TensorRole::Output),
+                axis: 1,
+            };
+            let bytes = build_model(&pattern).unwrap();
+            assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
+        }
     }
 }
