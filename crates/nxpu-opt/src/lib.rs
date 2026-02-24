@@ -25,7 +25,9 @@ pub use const_fold::ConstantFolding;
 pub use dce::DeadCodeElimination;
 pub use fma_fusion::FmaFusion;
 pub use fusion::OperatorFusion;
-pub use layout::LayoutTransform;
+pub use layout::{
+    LayoutTransform, TransposeInsertion, TransposeRecord, layout_permutation, reorder_dims,
+};
 pub use memory::{LiveInterval, MemoryPlanning, plan_memory};
 // Re-export canonical memory plan types from nxpu-backend-core (via memory module).
 pub use memory::{BufferAllocation, MemoryPlan, TensorId};

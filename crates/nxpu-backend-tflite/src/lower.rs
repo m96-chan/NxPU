@@ -2080,6 +2080,40 @@ fn build_tflite_split(input: &TensorBinding, outputs: &[TensorBinding]) -> Vec<u
     fbb.finished_data().to_vec()
 }
 
+/// Build a standalone TFLite Transpose model for layout conversion.
+///
+/// If `perm` is a non-identity permutation, this builds a single-op TFLite
+/// model containing a Transpose node.  Returns `None` if the permutation is
+/// an identity (no transpose needed) or empty.
+///
+/// This is used by the TFLite backend when the source IR has a different
+/// memory layout (e.g. NCHW) than TFLite's expected NHWC layout.
+#[allow(dead_code)] // Infrastructure for layout conversion; wired in by backends as needed.
+pub fn build_layout_transpose(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    perm: &[i64],
+) -> Option<Vec<u8>> {
+    // Identity check
+    let is_identity = perm.iter().enumerate().all(|(i, &p)| p as usize == i);
+    if is_identity || perm.is_empty() {
+        return None;
+    }
+
+    let ndim = perm.len();
+    let in_shape: Vec<i32> = (0..ndim).map(|_| -1i32).collect();
+    let out_shape: Vec<i32> = (0..ndim).map(|_| -1i32).collect();
+
+    Some(build_tflite_unary(
+        input,
+        output,
+        &in_shape,
+        &out_shape,
+        builtin_op::TRANSPOSE,
+        "layout_transpose",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3252,5 +3286,31 @@ mod tests {
             let bytes = build_model(&pattern).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
         }
+    }
+
+    #[test]
+    fn build_layout_transpose_nchw_to_nhwc() {
+        let input = make_tensor("input_nchw", TensorRole::Input);
+        let output = make_tensor("input_nhwc", TensorRole::Output);
+        let perm = [0i64, 2, 3, 1]; // NCHW -> NHWC
+        let bytes = build_layout_transpose(&input, &output, &perm);
+        assert!(bytes.is_some());
+        let bytes = bytes.unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_layout_transpose_identity_returns_none() {
+        let input = make_tensor("x", TensorRole::Input);
+        let output = make_tensor("y", TensorRole::Output);
+        let perm = [0i64, 1, 2, 3]; // identity
+        assert!(build_layout_transpose(&input, &output, &perm).is_none());
+    }
+
+    #[test]
+    fn build_layout_transpose_empty_returns_none() {
+        let input = make_tensor("x", TensorRole::Input);
+        let output = make_tensor("y", TensorRole::Output);
+        assert!(build_layout_transpose(&input, &output, &[]).is_none());
     }
 }
