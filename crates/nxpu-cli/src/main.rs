@@ -325,6 +325,68 @@ fn run() -> miette::Result<()> {
         }
     }
 
+    // 6c. Compute tiling plans and vectorization hints for each entry point.
+    let mut tiling_plans = Vec::new();
+    let mut vectorization_hints = Vec::new();
+    for i in 0..module.entry_points.len() {
+        if let Ok(pattern) = nxpu_analysis::classify_entry_point(&module, i) {
+            // Tiling plans.
+            match &pattern {
+                nxpu_analysis::KernelPattern::MatMul { shape, .. } => {
+                    let m = shape.m.parse::<u32>().unwrap_or(256);
+                    let n = shape.n.parse::<u32>().unwrap_or(256);
+                    let k = shape.k.parse::<u32>().unwrap_or(256);
+                    let defaults = nxpu_opt::TilingDefaults::default();
+                    let plan =
+                        nxpu_opt::tile_matmul(&nxpu_opt::TilingMatMulShape { m, n, k }, &defaults);
+                    tiling_plans.push(nxpu_backend_core::TilingPlanInfo {
+                        op_name: plan.op_name,
+                        tiles: plan
+                            .tiles
+                            .iter()
+                            .map(|t| (t.dim_name.clone(), t.tile_size))
+                            .collect(),
+                        reuse_factor: plan.reuse_factor,
+                    });
+                }
+                nxpu_analysis::KernelPattern::Conv2D { shape, .. } => {
+                    let oh = shape.height.parse::<u32>().unwrap_or(32);
+                    let ow = shape.width.parse::<u32>().unwrap_or(32);
+                    let defaults = nxpu_opt::TilingDefaults::default();
+                    let plan = nxpu_opt::tile_conv2d(
+                        &nxpu_opt::TilingConv2DShape {
+                            oh,
+                            ow,
+                            kh: shape.kernel_h_val as u32,
+                            kw: shape.kernel_w_val as u32,
+                        },
+                        &defaults,
+                    );
+                    tiling_plans.push(nxpu_backend_core::TilingPlanInfo {
+                        op_name: plan.op_name,
+                        tiles: plan
+                            .tiles
+                            .iter()
+                            .map(|t| (t.dim_name.clone(), t.tile_size))
+                            .collect(),
+                        reuse_factor: plan.reuse_factor,
+                    });
+                }
+                _ => {}
+            }
+            // Vectorization hints.
+            for hint in nxpu_opt::analyze_vectorization(&pattern, 128) {
+                vectorization_hints.push(nxpu_backend_core::VectorizationHintInfo {
+                    op_name: hint.op_name,
+                    dim_name: hint.dim_name,
+                    lanes: hint.vector_width.lanes,
+                    is_reduction: hint.is_reduction,
+                    is_contiguous: hint.is_contiguous,
+                });
+            }
+        }
+    }
+
     let opts = BackendOptions {
         opt_level: match cli.opt_level {
             OptLevel::O0 => 0,
@@ -335,8 +397,8 @@ fn run() -> miette::Result<()> {
         memory_plan: Some(memory_plan),
         quantization_params,
         per_channel_params,
-        tiling_plans: Vec::new(),
-        vectorization_hints: Vec::new(),
+        tiling_plans,
+        vectorization_hints,
     };
 
     let output = backend
@@ -531,6 +593,18 @@ mod tests {
     fn cli_dynamic_batch_flag() {
         let cli = Cli::try_parse_from(["nxpu", "model.wgsl", "--dynamic-batch"]).unwrap();
         assert!(cli.dynamic_batch);
+    }
+
+    #[test]
+    fn cli_estimate_latency_flag() {
+        let cli = Cli::try_parse_from(["nxpu", "model.wgsl", "--estimate-latency"]).unwrap();
+        assert!(cli.estimate_latency);
+    }
+
+    #[test]
+    fn cli_estimate_latency_default_off() {
+        let cli = Cli::try_parse_from(["nxpu", "model.wgsl"]).unwrap();
+        assert!(!cli.estimate_latency);
     }
 
     #[test]
