@@ -37,6 +37,10 @@ struct Cli {
     #[arg(long)]
     emit_memory_plan: bool,
 
+    /// Dump operation schedule to stderr (dataflow analysis + scheduling)
+    #[arg(long)]
+    emit_schedule: bool,
+
     /// Validate and optimize without producing output
     #[arg(long)]
     dry_run: bool,
@@ -182,6 +186,14 @@ fn run() -> miette::Result<()> {
     let memory_plan = nxpu_opt::plan_memory(&module);
     if cli.emit_memory_plan {
         eprint!("{memory_plan}");
+    }
+
+    // 4c. Optionally dump schedule to stderr.
+    if cli.emit_schedule {
+        let schedules = nxpu_opt::compute_schedules(&module);
+        for (name, dfg, schedule) in &schedules {
+            eprintln!("{}", nxpu_opt::format_schedule(name, dfg, schedule));
+        }
     }
 
     // 5. Dry-run: stop here.
@@ -411,6 +423,7 @@ mod tests {
         assert_eq!(cli.opt_level, OptLevel::O1);
         assert!(!cli.emit_ir);
         assert!(!cli.emit_memory_plan);
+        assert!(!cli.emit_schedule);
         assert!(!cli.dry_run);
         assert!(!cli.dynamic_batch);
         assert_eq!(cli.precision, PrecisionPolicy::Auto);
@@ -433,6 +446,7 @@ mod tests {
             "2",
             "--emit-ir",
             "--emit-memory-plan",
+            "--emit-schedule",
             "--precision",
             "f16",
         ])
@@ -443,6 +457,7 @@ mod tests {
         assert_eq!(cli.opt_level, OptLevel::O2);
         assert!(cli.emit_ir);
         assert!(cli.emit_memory_plan);
+        assert!(cli.emit_schedule);
         assert_eq!(cli.precision, PrecisionPolicy::Explicit(Precision::F16));
     }
 

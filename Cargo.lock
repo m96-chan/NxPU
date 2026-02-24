@@ -1050,6 +1050,7 @@ dependencies = [
  "env_logger",
  "log",
  "miette",
+ "nxpu-analysis",
  "nxpu-backend-amd",
  "nxpu-backend-arm-ethos",
  "nxpu-backend-ceva",
@@ -1107,6 +1108,7 @@ name = "nxpu-opt"
 version = "0.3.0"
 dependencies = [
  "log",
+ "nxpu-analysis",
  "nxpu-backend-core",
  "nxpu-ir",
  "thiserror",
