@@ -1106,6 +1106,37 @@ pub fn inject_per_channel_qdq(
     }
 }
 
+/// Inserts a Transpose node into an ONNX graph for layout conversion.
+///
+/// If `perm` is a non-identity permutation, this adds a Transpose node that
+/// reads from `input_name` and writes to `output_name`.  The caller is
+/// responsible for wiring the surrounding graph so that the right tensors
+/// flow through the transpose.
+///
+/// This is used by the ONNX backend when the source IR has a different
+/// memory layout (e.g. NHWC) than the ONNX-expected layout (NCHW).
+#[allow(dead_code)] // Infrastructure for layout conversion; wired in by backends as needed.
+pub fn maybe_add_layout_transpose(
+    graph: &mut GraphProto,
+    perm: &[i64],
+    input_name: &str,
+    output_name: &str,
+) {
+    // Identity check: if perm is [0, 1, 2, ...] there is nothing to do.
+    let is_identity = perm.iter().enumerate().all(|(i, &p)| p as usize == i);
+    if is_identity || perm.is_empty() {
+        return;
+    }
+
+    graph.node.push(NodeProto::with_attrs(
+        "Transpose",
+        format!("layout_transpose_{output_name}"),
+        vec![input_name.into()],
+        vec![output_name.into()],
+        vec![AttributeProto::ints("perm", perm.to_vec())],
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2202,5 +2233,53 @@ mod tests {
         assert_eq!(graph.node.len(), 1);
         assert_eq!(graph.node[0].op_type, "Conv");
         assert!(graph.initializer.is_empty());
+    }
+
+    #[test]
+    fn layout_transpose_adds_node() {
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![],
+            input: vec![],
+            output: vec![],
+        };
+        maybe_add_layout_transpose(&mut graph, &[0, 3, 1, 2], "input_nhwc", "input_nchw");
+        assert_eq!(graph.node.len(), 1);
+        assert_eq!(graph.node[0].op_type, "Transpose");
+        assert_eq!(graph.node[0].input, vec!["input_nhwc"]);
+        assert_eq!(graph.node[0].output, vec!["input_nchw"]);
+        let perm_attr = graph.node[0]
+            .attribute
+            .iter()
+            .find(|a| a.name == "perm")
+            .expect("expected perm attribute");
+        assert_eq!(perm_attr.ints, vec![0, 3, 1, 2]);
+    }
+
+    #[test]
+    fn layout_transpose_identity_is_noop() {
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![],
+            input: vec![],
+            output: vec![],
+        };
+        maybe_add_layout_transpose(&mut graph, &[0, 1, 2, 3], "x", "y");
+        assert!(graph.node.is_empty());
+    }
+
+    #[test]
+    fn layout_transpose_empty_perm_is_noop() {
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![],
+            input: vec![],
+            output: vec![],
+        };
+        maybe_add_layout_transpose(&mut graph, &[], "x", "y");
+        assert!(graph.node.is_empty());
     }
 }
