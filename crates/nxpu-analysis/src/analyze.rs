@@ -750,6 +750,44 @@ fn extract_loop_bound_literals(body: &[Statement], exprs: &Arena<Expression>) ->
                 }) {
                     bounds.push(n);
                 }
+                // naga 28 pattern: for-loop condition lowered as
+                //   Emit; ...; If(cond) { } else { Break }  at the start of the loop body,
+                // where cond is `Binary { Less|LessEqual, _, Literal(U32(n)) }`.
+                // Skip leading Emit statements to find the If.
+                if let Some(Statement::If {
+                    condition,
+                    accept,
+                    reject,
+                }) = body.iter().find(|s| !matches!(s, Statement::Emit(_)))
+                {
+                    if accept.is_empty() && matches!(reject.as_slice(), [Statement::Break]) {
+                        if let Some(&Expression::Binary {
+                            op: BinaryOp::Less | BinaryOp::LessEqual,
+                            right,
+                            ..
+                        }) = exprs.try_get(*condition)
+                        {
+                            if let Some(&Expression::Literal(Literal::U32(n))) =
+                                exprs.try_get(right)
+                            {
+                                bounds.push(n);
+                            }
+                        }
+                    } else if reject.is_empty() && matches!(accept.as_slice(), [Statement::Break]) {
+                        if let Some(&Expression::Binary {
+                            op: BinaryOp::GreaterEqual | BinaryOp::Greater,
+                            right,
+                            ..
+                        }) = exprs.try_get(*condition)
+                        {
+                            if let Some(&Expression::Literal(Literal::U32(n))) =
+                                exprs.try_get(right)
+                            {
+                                bounds.push(n);
+                            }
+                        }
+                    }
+                }
                 // Recurse into nested loops.
                 bounds.extend(extract_loop_bound_literals(body, exprs));
                 bounds.extend(extract_loop_bound_literals(continuing, exprs));
@@ -2176,6 +2214,45 @@ mod tests {
         }];
         let bounds = extract_loop_bound_literals(&body, &func.expressions);
         assert!(bounds.is_empty());
+    }
+
+    /// naga 28 lowers `for (var kh = 0u; kh < 5u; ...)` as:
+    ///   Loop { body: [Emit, Emit, If(kh<5) {} else {Break}, ...], break_if: None }
+    #[test]
+    fn extract_loop_bounds_if_else_break_pattern() {
+        let mut func = Function::new("test");
+        let local = func.local_variables.append(LocalVariable {
+            name: Some("kh".into()),
+            ty: {
+                let mut types = UniqueArena::new();
+                types.insert(Type {
+                    name: None,
+                    inner: TypeInner::Scalar(Scalar::U32),
+                })
+            },
+            init: None,
+        });
+        let load = func.expressions.append(Expression::LocalVariable(local));
+        let lit5 = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(5)));
+        let cmp = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Less,
+            left: load,
+            right: lit5,
+        });
+        // Simulate If(cond){} else {Break} inside loop body (skipping Emit)
+        let body = vec![Statement::Loop {
+            body: vec![Statement::If {
+                condition: cmp,
+                accept: vec![],
+                reject: vec![Statement::Break],
+            }],
+            continuing: vec![],
+            break_if: None,
+        }];
+        let bounds = extract_loop_bound_literals(&body, &func.expressions);
+        assert_eq!(bounds, vec![5]);
     }
 
     #[test]

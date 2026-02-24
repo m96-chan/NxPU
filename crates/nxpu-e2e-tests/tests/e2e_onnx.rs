@@ -104,6 +104,22 @@ fn conv2d_produces_conv_node() {
     assert_eq!(graph.node[0].op_type, "Conv");
 }
 
+#[test]
+fn conv2d_5x5_stride2_pad1_attributes() {
+    let source = common::load_example("conv2d_5x5");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.as_ref().unwrap();
+    assert_eq!(graph.node[0].op_type, "Conv");
+    let attrs = &graph.node[0].attribute;
+    let ks = attrs.iter().find(|a| a.name == "kernel_shape").unwrap();
+    let st = attrs.iter().find(|a| a.name == "strides").unwrap();
+    let pa = attrs.iter().find(|a| a.name == "pads").unwrap();
+    assert_eq!(ks.ints, vec![5, 5]);
+    assert_eq!(st.ints, vec![2, 2]);
+    assert_eq!(pa.ints, vec![1, 1, 1, 1]);
+}
+
 // --- ReLU ---
 
 #[test]
