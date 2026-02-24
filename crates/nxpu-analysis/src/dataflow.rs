@@ -1285,4 +1285,1107 @@ mod tests {
         // With costs [5, 3] and chain 0->1, critical path = 5 + 3 = 8.
         assert_eq!(cp.critical_path_length, 8);
     }
+
+    // --- Helper to make a dummy global variable handle ---
+    fn make_gv(index: usize) -> Handle<nxpu_ir::GlobalVariable> {
+        let mut arena = nxpu_ir::Arena::new();
+        // Append `index + 1` dummy variables so we get the handle at the desired index.
+        let mut handle = None;
+        for i in 0..=index {
+            let h = arena.append(nxpu_ir::GlobalVariable {
+                name: Some(format!("gv_{i}")),
+                space: nxpu_ir::AddressSpace::Storage {
+                    access: nxpu_ir::StorageAccess::LOAD | nxpu_ir::StorageAccess::STORE,
+                },
+                binding: None,
+                ty: {
+                    let mut types = nxpu_ir::UniqueArena::new();
+                    types.insert(nxpu_ir::Type {
+                        name: None,
+                        inner: nxpu_ir::TypeInner::Scalar(nxpu_ir::Scalar::F32),
+                    })
+                },
+                init: None,
+                layout: None,
+            });
+            handle = Some(h);
+        }
+        handle.unwrap()
+    }
+
+    // ===== Display tests =====
+
+    #[test]
+    fn display_dfg_with_nodes_and_edges() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // Two stores to the same pointer -> WAW edge.
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        let s = format!("{dfg}");
+        assert!(s.contains("DataflowGraph (2 nodes, "));
+        assert!(s.contains("node[0]: Store"));
+        assert!(s.contains("node[1]: Store"));
+        assert!(s.contains("edge:"));
+        assert!(s.contains("WAW"));
+    }
+
+    #[test]
+    fn dfg_node_kind_display_all_variants() {
+        assert_eq!(format!("{}", DfgNodeKind::Store), "Store");
+        assert_eq!(format!("{}", DfgNodeKind::Call), "Call");
+        assert_eq!(format!("{}", DfgNodeKind::Atomic), "Atomic");
+        assert_eq!(format!("{}", DfgNodeKind::Barrier), "Barrier");
+        assert_eq!(format!("{}", DfgNodeKind::Emit), "Emit");
+        assert_eq!(format!("{}", DfgNodeKind::If), "If");
+        assert_eq!(format!("{}", DfgNodeKind::Loop), "Loop");
+        assert_eq!(format!("{}", DfgNodeKind::Return), "Return");
+        assert_eq!(format!("{}", DfgNodeKind::Break), "Break");
+        assert_eq!(format!("{}", DfgNodeKind::Continue), "Continue");
+    }
+
+    #[test]
+    fn dependency_kind_display_all_variants() {
+        assert_eq!(format!("{}", DependencyKind::DataFlow), "RAW");
+        assert_eq!(format!("{}", DependencyKind::AntiDependency), "WAR");
+        assert_eq!(format!("{}", DependencyKind::OutputDependency), "WAW");
+        assert_eq!(format!("{}", DependencyKind::Control), "Control");
+    }
+
+    #[test]
+    fn dataflow_error_display() {
+        let err = DataflowError::CycleDetected {
+            visited: 3,
+            total: 5,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("cycle detected"));
+        assert!(msg.contains("3 of 5"));
+    }
+
+    // ===== Successors / Predecessors =====
+
+    #[test]
+    fn successors_and_predecessors() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // Three stores to same pointer: 0->1->2 (WAW chain).
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+
+        // Node 0 should have successors to 1 and 2.
+        let succs_0 = dfg.successors(0);
+        assert!(!succs_0.is_empty());
+
+        // Node 2 should have predecessors from 0 and/or 1.
+        let preds_2 = dfg.predecessors(2);
+        assert!(!preds_2.is_empty());
+
+        // Node 0 should have no predecessors.
+        let preds_0 = dfg.predecessors(0);
+        assert!(preds_0.is_empty());
+    }
+
+    // ===== Break / Continue statement classification =====
+
+    #[test]
+    fn break_and_continue_nodes() {
+        let mut func = Function::new("test");
+        func.body.push(Statement::Break);
+        func.body.push(Statement::Continue);
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 2);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Break);
+        assert_eq!(dfg.nodes()[1].kind, DfgNodeKind::Continue);
+        // Break and Continue have no reads/writes so no edges.
+        assert_eq!(dfg.edge_count(), 0);
+    }
+
+    // ===== Return with no value =====
+
+    #[test]
+    fn return_no_value() {
+        let mut func = Function::new("test");
+        func.body.push(Statement::Return { value: None });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Return);
+        assert!(dfg.nodes()[0].reads.is_empty());
+        assert!(dfg.nodes()[0].writes.is_empty());
+    }
+
+    // ===== Return with value =====
+
+    #[test]
+    fn return_with_value() {
+        let mut func = Function::new("test");
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(42.0)));
+        func.body.push(Statement::Return { value: Some(val) });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Return);
+        assert!(dfg.nodes()[0].reads.contains(&val));
+        assert!(dfg.nodes()[0].writes.is_empty());
+    }
+
+    // ===== If statement classification =====
+
+    #[test]
+    fn if_statement_classification() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let cond = func
+            .expressions
+            .append(Expression::Literal(Literal::Bool(true)));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // If statement with a store in the accept branch.
+        func.body.push(Statement::If {
+            condition: cond,
+            accept: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+            reject: vec![],
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::If);
+        // The If node should read the condition and the value from the child store.
+        assert!(dfg.nodes()[0].reads.contains(&cond));
+        // The If node should write the pointer from the child store.
+        assert!(dfg.nodes()[0].writes.contains(&ptr));
+    }
+
+    // ===== If statement with reject branch =====
+
+    #[test]
+    fn if_statement_with_reject_branch() {
+        let mut func = Function::new("test");
+        let gv0 = make_gv(0);
+        let gv1 = make_gv(1);
+        let ptr_a = func.expressions.append(Expression::GlobalVariable(gv0));
+        let ptr_b = func.expressions.append(Expression::GlobalVariable(gv1));
+        let cond = func
+            .expressions
+            .append(Expression::Literal(Literal::Bool(true)));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        func.body.push(Statement::If {
+            condition: cond,
+            accept: vec![Statement::Store {
+                pointer: ptr_a,
+                value: val,
+            }],
+            reject: vec![Statement::Store {
+                pointer: ptr_b,
+                value: val,
+            }],
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::If);
+        // Should include writes from both branches.
+        assert!(dfg.nodes()[0].writes.contains(&ptr_a));
+        assert!(dfg.nodes()[0].writes.contains(&ptr_b));
+    }
+
+    // ===== Loop statement classification =====
+
+    #[test]
+    fn loop_statement_classification() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let break_cond = func
+            .expressions
+            .append(Expression::Literal(Literal::Bool(false)));
+
+        func.body.push(Statement::Loop {
+            body: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+            continuing: vec![],
+            break_if: Some(break_cond),
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Loop);
+        // Should read break_if condition.
+        assert!(dfg.nodes()[0].reads.contains(&break_cond));
+        // Should write via the child store.
+        assert!(dfg.nodes()[0].writes.contains(&ptr));
+    }
+
+    // ===== Loop with continuing block =====
+
+    #[test]
+    fn loop_with_continuing_block() {
+        let mut func = Function::new("test");
+        let gv0 = make_gv(0);
+        let gv1 = make_gv(1);
+        let ptr_body = func.expressions.append(Expression::GlobalVariable(gv0));
+        let ptr_cont = func.expressions.append(Expression::GlobalVariable(gv1));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        func.body.push(Statement::Loop {
+            body: vec![Statement::Store {
+                pointer: ptr_body,
+                value: val,
+            }],
+            continuing: vec![Statement::Store {
+                pointer: ptr_cont,
+                value: val,
+            }],
+            break_if: None,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Loop);
+        // Should include writes from both body and continuing blocks.
+        assert!(dfg.nodes()[0].writes.contains(&ptr_body));
+        assert!(dfg.nodes()[0].writes.contains(&ptr_cont));
+    }
+
+    // ===== Call statement classification =====
+
+    #[test]
+    fn call_statement_classification() {
+        let mut func = Function::new("test");
+        let arg_val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let result_val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+
+        // Build a dummy function handle.
+        let callee_handle = {
+            let mut funcs = nxpu_ir::Arena::new();
+            funcs.append(Function::new("callee"))
+        };
+
+        func.body.push(Statement::Call {
+            function: callee_handle,
+            arguments: vec![arg_val],
+            result: Some(result_val),
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Call);
+        assert!(dfg.nodes()[0].reads.contains(&arg_val));
+        assert!(dfg.nodes()[0].writes.contains(&result_val));
+    }
+
+    // ===== Call with no result =====
+
+    #[test]
+    fn call_no_result() {
+        let mut func = Function::new("test");
+        let arg_val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        let callee_handle = {
+            let mut funcs = nxpu_ir::Arena::new();
+            funcs.append(Function::new("callee"))
+        };
+
+        func.body.push(Statement::Call {
+            function: callee_handle,
+            arguments: vec![arg_val],
+            result: None,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Call);
+        assert!(dfg.nodes()[0].writes.is_empty());
+    }
+
+    // ===== Atomic statement classification =====
+
+    #[test]
+    fn atomic_statement_classification() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(1)));
+        let result_expr = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+
+        func.body.push(Statement::Atomic {
+            pointer: ptr,
+            fun: nxpu_ir::AtomicFunction::Add,
+            value: val,
+            result: Some(result_expr),
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Atomic);
+        assert!(dfg.nodes()[0].reads.contains(&ptr));
+        assert!(dfg.nodes()[0].reads.contains(&val));
+        assert!(dfg.nodes()[0].writes.contains(&ptr));
+        assert!(dfg.nodes()[0].writes.contains(&result_expr));
+    }
+
+    // ===== Atomic with Exchange + compare =====
+
+    #[test]
+    fn atomic_exchange_with_compare() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(1)));
+        let cmp = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+
+        func.body.push(Statement::Atomic {
+            pointer: ptr,
+            fun: nxpu_ir::AtomicFunction::Exchange { compare: Some(cmp) },
+            value: val,
+            result: None,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Atomic);
+        // Compare should appear in reads.
+        assert!(dfg.nodes()[0].reads.contains(&cmp));
+    }
+
+    // ===== Atomic with no result =====
+
+    #[test]
+    fn atomic_no_result() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(1)));
+
+        func.body.push(Statement::Atomic {
+            pointer: ptr,
+            fun: nxpu_ir::AtomicFunction::Add,
+            value: val,
+            result: None,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.nodes()[0].writes.len(), 1);
+        assert!(dfg.nodes()[0].writes.contains(&ptr));
+    }
+
+    // ===== Emit statement classification =====
+
+    #[test]
+    fn emit_statement_classification() {
+        let mut func = Function::new("test");
+
+        // Create some expressions to emit.
+        let lit_a = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let lit_b = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        let add = func.expressions.append(Expression::Binary {
+            op: nxpu_ir::BinaryOp::Add,
+            left: lit_a,
+            right: lit_b,
+        });
+
+        // Emit range covering all three expressions.
+        let range = nxpu_ir::Range::from_index_range(0..3);
+        func.body.push(Statement::Emit(range));
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Emit);
+        // The emit should write all 3 expressions.
+        assert!(dfg.nodes()[0].writes.contains(&lit_a));
+        assert!(dfg.nodes()[0].writes.contains(&lit_b));
+        assert!(dfg.nodes()[0].writes.contains(&add));
+    }
+
+    // ===== Barrier statement classification =====
+
+    #[test]
+    fn barrier_statement_no_reads_writes() {
+        let mut func = Function::new("test");
+        func.body
+            .push(Statement::Barrier(nxpu_ir::Barrier::STORAGE));
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Barrier);
+        assert!(dfg.nodes()[0].reads.is_empty());
+        assert!(dfg.nodes()[0].writes.is_empty());
+    }
+
+    // ===== Barrier to barrier control edge =====
+
+    #[test]
+    fn barrier_to_barrier_control_edge() {
+        let mut func = Function::new("test");
+        func.body
+            .push(Statement::Barrier(nxpu_ir::Barrier::STORAGE));
+        func.body
+            .push(Statement::Barrier(nxpu_ir::Barrier::WORKGROUP));
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 2);
+        // First barrier should have a control edge to the second barrier.
+        let control_edges: Vec<_> = dfg
+            .edges()
+            .iter()
+            .filter(|e| e.kind == DependencyKind::Control)
+            .collect();
+        assert!(
+            control_edges.iter().any(|e| e.from == 0 && e.to == 1),
+            "expected control edge from barrier[0] to barrier[1]"
+        );
+    }
+
+    // ===== Barrier does not create control edge to non-memory op =====
+
+    #[test]
+    fn barrier_no_control_edge_to_break() {
+        let mut func = Function::new("test");
+        func.body
+            .push(Statement::Barrier(nxpu_ir::Barrier::STORAGE));
+        func.body.push(Statement::Break);
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 2);
+        // Break has no reads/writes and is not a barrier, so no control edge.
+        let control_edges: Vec<_> = dfg
+            .edges()
+            .iter()
+            .filter(|e| e.kind == DependencyKind::Control)
+            .collect();
+        assert!(
+            control_edges.is_empty(),
+            "should not have control edge from barrier to break"
+        );
+    }
+
+    // ===== RAW dependency (explicit read-after-write) =====
+
+    #[test]
+    fn explicit_raw_dependency() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let load = func.expressions.append(Expression::Load { pointer: ptr });
+
+        // Statement 0: store val -> ptr (writes ptr)
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        // Statement 1: return load(ptr) (reads ptr via load)
+        func.body.push(Statement::Return { value: Some(load) });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 2);
+
+        // Should have RAW: node 0 writes ptr, node 1 reads ptr (via load's pointer).
+        let raw_edges: Vec<_> = dfg
+            .edges()
+            .iter()
+            .filter(|e| e.kind == DependencyKind::DataFlow)
+            .collect();
+        assert!(
+            !raw_edges.is_empty(),
+            "expected RAW dependency: store then read"
+        );
+    }
+
+    // ===== Combined WAR + WAW + RAW =====
+
+    #[test]
+    fn combined_war_waw_raw_dependencies() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let load = func.expressions.append(Expression::Load { pointer: ptr });
+
+        // Statement 0: store val -> ptr (writes ptr, reads val)
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        // Statement 1: store load(ptr) -> ptr (reads ptr via load, writes ptr)
+        //   RAW: node 0 writes ptr, node 1 reads ptr (via load)
+        //   WAW: both write ptr
+        //   WAR: node 0 reads val (no WAR here since node 1 doesn't write val)
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: load,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 2);
+
+        let has_raw = dfg
+            .edges()
+            .iter()
+            .any(|e| e.kind == DependencyKind::DataFlow);
+        let has_waw = dfg
+            .edges()
+            .iter()
+            .any(|e| e.kind == DependencyKind::OutputDependency);
+        assert!(has_raw, "expected RAW dependency");
+        assert!(has_waw, "expected WAW dependency");
+    }
+
+    // ===== Parallel groups with a dependency chain =====
+
+    #[test]
+    fn parallel_groups_with_chain() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // Three stores to same pointer: all dependent.
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        let groups = dfg.parallel_groups();
+
+        // All dependent: each should be in its own group.
+        assert_eq!(groups.len(), 3, "expected 3 sequential groups");
+        for g in &groups {
+            assert_eq!(g.len(), 1, "each group should have exactly 1 node");
+        }
+    }
+
+    // ===== Parallel groups empty graph =====
+
+    #[test]
+    fn parallel_groups_empty() {
+        let func = Function::new("empty");
+        let dfg = DataflowGraph::build(&func);
+        let groups = dfg.parallel_groups();
+        assert!(groups.is_empty());
+    }
+
+    // ===== Critical path multi-path diamond graph =====
+
+    #[test]
+    fn critical_path_diamond_graph() {
+        // Build a diamond: node 0 -> node 1 (independent), node 0 -> node 2,
+        // node 1 -> node 3, node 2 -> node 3.
+        // We simulate this with stores that create the right dependency pattern.
+        let mut func = Function::new("test");
+        let gv0 = make_gv(0);
+        let gv1 = make_gv(1);
+
+        let ptr_a = func.expressions.append(Expression::GlobalVariable(gv0));
+        let ptr_b = func.expressions.append(Expression::GlobalVariable(gv1));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let load_a = func.expressions.append(Expression::Load { pointer: ptr_a });
+        let load_b = func.expressions.append(Expression::Load { pointer: ptr_b });
+
+        // stmt 0: store val -> ptr_a (writes a)
+        func.body.push(Statement::Store {
+            pointer: ptr_a,
+            value: val,
+        });
+        // stmt 1: store val -> ptr_b (writes b, independent of stmt 0)
+        func.body.push(Statement::Store {
+            pointer: ptr_b,
+            value: val,
+        });
+        // stmt 2: store load_a -> ptr_a (reads a -> RAW from 0, writes a -> WAW with 0)
+        func.body.push(Statement::Store {
+            pointer: ptr_a,
+            value: load_a,
+        });
+        // stmt 3: store load_b -> ptr_b (reads b -> RAW from 1, writes b -> WAW with 1)
+        func.body.push(Statement::Store {
+            pointer: ptr_b,
+            value: load_b,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        let cp = dfg.critical_path();
+
+        // Two parallel chains of length 2. Critical path = 2.
+        assert_eq!(cp.critical_path_length, 2);
+        assert_eq!(cp.critical_path.len(), 2);
+        assert_eq!(cp.node_distances.len(), 4);
+    }
+
+    // ===== Critical path result node distances =====
+
+    #[test]
+    fn critical_path_node_distances() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // Three stores: 0 -> 1 -> 2 (WAW chain).
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        let cp = dfg.critical_path();
+        assert_eq!(cp.node_distances.len(), 3);
+        assert_eq!(cp.node_distances[0], 1);
+        assert_eq!(cp.node_distances[1], 2);
+        assert_eq!(cp.node_distances[2], 3);
+        assert_eq!(cp.critical_path, vec![0, 1, 2]);
+    }
+
+    // ===== Expression operand coverage: Access, AccessIndex, Select, Swizzle =====
+
+    #[test]
+    fn expression_operands_access_and_select() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let access = func.expressions.append(Expression::Access {
+            base: ptr,
+            index: idx,
+        });
+        let val_a = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let val_b = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        let cond = func
+            .expressions
+            .append(Expression::Literal(Literal::Bool(true)));
+        let select = func.expressions.append(Expression::Select {
+            condition: cond,
+            accept: val_a,
+            reject: val_b,
+        });
+
+        // Emit a range covering all expressions.
+        let range = nxpu_ir::Range::from_index_range(0..func.expressions.len() as u32);
+        func.body.push(Statement::Emit(range));
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Emit);
+        // All expressions should appear in writes.
+        assert!(dfg.nodes()[0].writes.contains(&access));
+        assert!(dfg.nodes()[0].writes.contains(&select));
+    }
+
+    // ===== Expression operands: Splat, As, ArrayLength, Compose, Math =====
+
+    #[test]
+    fn expression_operands_splat_as_arraylength_compose_math() {
+        let mut func = Function::new("test");
+        let lit = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let splat = func.expressions.append(Expression::Splat {
+            size: nxpu_ir::VectorSize::Quad,
+            value: lit,
+        });
+        let cast = func.expressions.append(Expression::As {
+            expr: lit,
+            kind: nxpu_ir::ScalarKind::Uint,
+            convert: Some(4),
+        });
+        let arr_len = func.expressions.append(Expression::ArrayLength(lit));
+
+        let ty_handle = {
+            let mut types = nxpu_ir::UniqueArena::new();
+            types.insert(nxpu_ir::Type {
+                name: None,
+                inner: nxpu_ir::TypeInner::Vector {
+                    size: nxpu_ir::VectorSize::Quad,
+                    scalar: nxpu_ir::Scalar::F32,
+                },
+            })
+        };
+        let compose = func.expressions.append(Expression::Compose {
+            ty: ty_handle,
+            components: vec![lit],
+        });
+
+        let lit2 = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        let lit3 = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(3.0)));
+        let math = func.expressions.append(Expression::Math {
+            fun: nxpu_ir::MathFunction::Clamp,
+            arg: lit,
+            arg1: Some(lit2),
+            arg2: Some(lit3),
+            arg3: None,
+        });
+
+        let range = nxpu_ir::Range::from_index_range(0..func.expressions.len() as u32);
+        func.body.push(Statement::Emit(range));
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Emit);
+        assert!(dfg.nodes()[0].writes.contains(&splat));
+        assert!(dfg.nodes()[0].writes.contains(&cast));
+        assert!(dfg.nodes()[0].writes.contains(&arr_len));
+        assert!(dfg.nodes()[0].writes.contains(&compose));
+        assert!(dfg.nodes()[0].writes.contains(&math));
+    }
+
+    // ===== Expression operands: Swizzle, Unary, AccessIndex =====
+
+    #[test]
+    fn expression_operands_swizzle_unary_accessindex() {
+        let mut func = Function::new("test");
+        let lit = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let neg = func.expressions.append(Expression::Unary {
+            op: nxpu_ir::UnaryOp::Negate,
+            expr: lit,
+        });
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let access_idx = func.expressions.append(Expression::AccessIndex {
+            base: ptr,
+            index: 0,
+        });
+
+        let vec_lit = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        let swizzle = func.expressions.append(Expression::Swizzle {
+            size: nxpu_ir::VectorSize::Bi,
+            vector: vec_lit,
+            pattern: [
+                nxpu_ir::SwizzleComponent::X,
+                nxpu_ir::SwizzleComponent::Y,
+                nxpu_ir::SwizzleComponent::Z,
+                nxpu_ir::SwizzleComponent::W,
+            ],
+        });
+
+        let range = nxpu_ir::Range::from_index_range(0..func.expressions.len() as u32);
+        func.body.push(Statement::Emit(range));
+
+        let dfg = DataflowGraph::build(&func);
+        assert!(dfg.nodes()[0].writes.contains(&neg));
+        assert!(dfg.nodes()[0].writes.contains(&access_idx));
+        assert!(dfg.nodes()[0].writes.contains(&swizzle));
+    }
+
+    // ===== Expression operands: leaf expressions (no operands) =====
+
+    #[test]
+    fn expression_operands_leaf_nodes() {
+        let mut func = Function::new("test");
+        let _func_arg = func.expressions.append(Expression::FunctionArgument(0));
+        let gv = make_gv(0);
+        let _gv_expr = func.expressions.append(Expression::GlobalVariable(gv));
+
+        let callee_handle = {
+            let mut funcs = nxpu_ir::Arena::new();
+            funcs.append(Function::new("callee"))
+        };
+        let _call_result = func
+            .expressions
+            .append(Expression::CallResult(callee_handle));
+
+        let ty_handle = {
+            let mut types = nxpu_ir::UniqueArena::new();
+            types.insert(nxpu_ir::Type {
+                name: None,
+                inner: nxpu_ir::TypeInner::Scalar(nxpu_ir::Scalar::U32),
+            })
+        };
+        let _atomic_result = func.expressions.append(Expression::AtomicResult {
+            ty: ty_handle,
+            comparison: false,
+        });
+        let _zero_val = func.expressions.append(Expression::ZeroValue(ty_handle));
+
+        let range = nxpu_ir::Range::from_index_range(0..func.expressions.len() as u32);
+        func.body.push(Statement::Emit(range));
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        // Leaf expressions produce no reads (they have no operands).
+        // FunctionArgument, GlobalVariable, CallResult, AtomicResult, ZeroValue.
+    }
+
+    // ===== Topological sort with diamond shape =====
+
+    #[test]
+    fn topological_sort_diamond_shape() {
+        let mut func = Function::new("test");
+        let gv0 = make_gv(0);
+        let gv1 = make_gv(1);
+        let ptr_a = func.expressions.append(Expression::GlobalVariable(gv0));
+        let ptr_b = func.expressions.append(Expression::GlobalVariable(gv1));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let load_a = func.expressions.append(Expression::Load { pointer: ptr_a });
+
+        // stmt 0: store val -> ptr_a (writes a)
+        func.body.push(Statement::Store {
+            pointer: ptr_a,
+            value: val,
+        });
+        // stmt 1: store val -> ptr_b (writes b, independent)
+        func.body.push(Statement::Store {
+            pointer: ptr_b,
+            value: val,
+        });
+        // stmt 2: store load(a) -> ptr_b (reads a -> RAW from 0, writes b -> WAW with 1)
+        func.body.push(Statement::Store {
+            pointer: ptr_b,
+            value: load_a,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        let order = dfg.topological_sort().unwrap();
+        assert_eq!(order.len(), 3);
+
+        // Node 0 must come before node 2 (RAW dependency on ptr_a).
+        // Node 1 must come before node 2 (WAW dependency on ptr_b).
+        let pos_0 = order.iter().position(|&n| n == 0).unwrap();
+        let pos_1 = order.iter().position(|&n| n == 1).unwrap();
+        let pos_2 = order.iter().position(|&n| n == 2).unwrap();
+        assert!(pos_0 < pos_2);
+        assert!(pos_1 < pos_2);
+    }
+
+    // ===== Parallel groups with mixed independent and dependent ops =====
+
+    #[test]
+    fn parallel_groups_mixed() {
+        let mut func = Function::new("test");
+        let gv0 = make_gv(0);
+        let gv1 = make_gv(1);
+        let ptr_a = func.expressions.append(Expression::GlobalVariable(gv0));
+        let ptr_b = func.expressions.append(Expression::GlobalVariable(gv1));
+        let val_a = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let val_b = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+
+        // Two independent stores (no shared pointers or values).
+        func.body.push(Statement::Store {
+            pointer: ptr_a,
+            value: val_a,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr_b,
+            value: val_b,
+        });
+        // Third store depends on ptr_a (WAW with stmt 0).
+        func.body.push(Statement::Store {
+            pointer: ptr_a,
+            value: val_b,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        let groups = dfg.parallel_groups();
+
+        // First group should have at least 2 independent ops.
+        assert!(!groups.is_empty());
+        let first_group = &groups[0];
+        assert!(
+            first_group.len() >= 2,
+            "expected first parallel group to contain independent ops"
+        );
+    }
+
+    // ===== Single node graph =====
+
+    #[test]
+    fn single_node_graph() {
+        let mut func = Function::new("test");
+        func.body.push(Statement::Break);
+
+        let dfg = DataflowGraph::build(&func);
+        assert_eq!(dfg.node_count(), 1);
+        assert_eq!(dfg.edge_count(), 0);
+
+        let order = dfg.topological_sort().unwrap();
+        assert_eq!(order, vec![0]);
+
+        let cp = dfg.critical_path();
+        assert_eq!(cp.critical_path_length, 1);
+        assert_eq!(cp.critical_path, vec![0]);
+
+        let groups = dfg.parallel_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0], vec![0]);
+    }
+
+    // ===== Display with all edge kinds =====
+
+    #[test]
+    fn display_all_edge_kinds() {
+        let mut func = Function::new("test");
+        let gv = make_gv(0);
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let load = func.expressions.append(Expression::Load { pointer: ptr });
+
+        // stmt 0: store val -> ptr (writes ptr)
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        // stmt 1: store load(ptr) -> ptr (reads ptr, writes ptr -> RAW + WAW)
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: load,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        let s = format!("{dfg}");
+        assert!(s.contains("RAW") || s.contains("WAW") || s.contains("WAR"));
+    }
+
+    // ===== Math expression with all 4 arguments =====
+
+    #[test]
+    fn math_expression_four_args() {
+        let mut func = Function::new("test");
+        let a = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let b = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        let c = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(3.0)));
+        let d = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(4.0)));
+        let _math = func.expressions.append(Expression::Math {
+            fun: nxpu_ir::MathFunction::Fma,
+            arg: a,
+            arg1: Some(b),
+            arg2: Some(c),
+            arg3: Some(d),
+        });
+
+        let range = nxpu_ir::Range::from_index_range(0..func.expressions.len() as u32);
+        func.body.push(Statement::Emit(range));
+
+        let dfg = DataflowGraph::build(&func);
+        // The math expression should read all four argument literals.
+        let reads = &dfg.nodes()[0].reads;
+        assert!(reads.contains(&a), "math should read arg");
+        assert!(reads.contains(&b), "math should read arg1");
+        assert!(reads.contains(&c), "math should read arg2");
+        assert!(reads.contains(&d), "math should read arg3");
+    }
 }

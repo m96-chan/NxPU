@@ -722,4 +722,365 @@ mod tests {
         let changed = fusion.run(&mut module);
         assert!(!changed);
     }
+
+    #[test]
+    fn fuse_sub_relu() {
+        let mut graph = ComputeGraph::new();
+
+        let a = graph.add_edge(make_tensor("a", &[-1, 256]));
+        let b = graph.add_edge(make_tensor("b", &[-1, 256]));
+        let sub_out = graph.add_edge(make_tensor("sub_out", &[-1, 256]));
+        let relu_out = graph.add_edge(make_tensor("relu_out", &[-1, 256]));
+
+        graph.inputs = vec![a, b];
+        graph.outputs = vec![relu_out];
+
+        graph
+            .add_node(GraphOp::Sub, vec![a, b], vec![sub_out], "sub")
+            .unwrap();
+        graph
+            .add_node(GraphOp::Relu, vec![sub_out], vec![relu_out], "relu")
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(changed);
+        assert_eq!(graph.node_count(), 1);
+        assert_eq!(
+            graph.nodes[0].op,
+            GraphOp::FusedElementWise {
+                base_op: Box::new(GraphOp::Sub),
+                activation: ActivationFunction::Relu,
+            }
+        );
+    }
+
+    #[test]
+    fn fuse_div_sigmoid() {
+        let mut graph = ComputeGraph::new();
+
+        let a = graph.add_edge(make_tensor("a", &[-1, 256]));
+        let b = graph.add_edge(make_tensor("b", &[-1, 256]));
+        let div_out = graph.add_edge(make_tensor("div_out", &[-1, 256]));
+        let sig_out = graph.add_edge(make_tensor("sig_out", &[-1, 256]));
+
+        graph.inputs = vec![a, b];
+        graph.outputs = vec![sig_out];
+
+        graph
+            .add_node(GraphOp::Div, vec![a, b], vec![div_out], "div")
+            .unwrap();
+        graph
+            .add_node(GraphOp::Sigmoid, vec![div_out], vec![sig_out], "sigmoid")
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(changed);
+        assert_eq!(graph.node_count(), 1);
+        assert_eq!(
+            graph.nodes[0].op,
+            GraphOp::FusedElementWise {
+                base_op: Box::new(GraphOp::Div),
+                activation: ActivationFunction::Sigmoid,
+            }
+        );
+    }
+
+    #[test]
+    fn conv_no_consumer_no_fusion() {
+        // Conv2D with no consumer (output is a graph output).
+        let mut graph = ComputeGraph::new();
+
+        let input = graph.add_edge(make_tensor("input", &[-1, 3, 224, 224]));
+        let weight = graph.add_edge(make_tensor("weight", &[64, 3, 3, 3]));
+        let conv_out = graph.add_edge(make_tensor("conv_out", &[-1, 64, 222, 222]));
+
+        graph.inputs = vec![input, weight];
+        graph.outputs = vec![conv_out];
+
+        graph
+            .add_node(GraphOp::Conv2d, vec![input, weight], vec![conv_out], "conv")
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(!changed);
+        assert_eq!(graph.node_count(), 1);
+    }
+
+    #[test]
+    fn conv_with_non_fusible_consumer() {
+        // Conv2D followed by Reshape (not Add or activation).
+        let mut graph = ComputeGraph::new();
+
+        let input = graph.add_edge(make_tensor("input", &[-1, 3, 224, 224]));
+        let weight = graph.add_edge(make_tensor("weight", &[64, 3, 3, 3]));
+        let conv_out = graph.add_edge(make_tensor("conv_out", &[-1, 64, 222, 222]));
+        let reshape_out = graph.add_edge(make_tensor("reshape_out", &[-1, 64, 222, 222]));
+
+        graph.inputs = vec![input, weight];
+        graph.outputs = vec![reshape_out];
+
+        graph
+            .add_node(GraphOp::Conv2d, vec![input, weight], vec![conv_out], "conv")
+            .unwrap();
+        graph
+            .add_node(
+                GraphOp::Reshape,
+                vec![conv_out],
+                vec![reshape_out],
+                "reshape",
+            )
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(!changed);
+        assert_eq!(graph.node_count(), 2);
+    }
+
+    #[test]
+    fn conv_sigmoid_fusion() {
+        // Conv2D + Sigmoid (no bias).
+        let mut graph = ComputeGraph::new();
+
+        let input = graph.add_edge(make_tensor("input", &[-1, 3, 224, 224]));
+        let weight = graph.add_edge(make_tensor("weight", &[64, 3, 3, 3]));
+        let conv_out = graph.add_edge(make_tensor("conv_out", &[-1, 64, 222, 222]));
+        let sig_out = graph.add_edge(make_tensor("sig_out", &[-1, 64, 222, 222]));
+
+        graph.inputs = vec![input, weight];
+        graph.outputs = vec![sig_out];
+
+        graph
+            .add_node(GraphOp::Conv2d, vec![input, weight], vec![conv_out], "conv")
+            .unwrap();
+        graph
+            .add_node(GraphOp::Sigmoid, vec![conv_out], vec![sig_out], "sigmoid")
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(changed);
+        assert_eq!(graph.node_count(), 1);
+        assert_eq!(
+            graph.nodes[0].op,
+            GraphOp::FusedConv2d {
+                activation: ActivationFunction::Sigmoid,
+            }
+        );
+    }
+
+    #[test]
+    fn conv_bias_sigmoid_fusion() {
+        // Conv2D + Add(bias) + Sigmoid.
+        let mut graph = ComputeGraph::new();
+
+        let input = graph.add_edge(make_tensor("input", &[-1, 3, 224, 224]));
+        let weight = graph.add_edge(make_tensor("weight", &[64, 3, 3, 3]));
+        let bias = graph.add_edge(make_tensor("bias", &[64]));
+        let conv_out = graph.add_edge(make_tensor("conv_out", &[-1, 64, 222, 222]));
+        let add_out = graph.add_edge(make_tensor("add_out", &[-1, 64, 222, 222]));
+        let sig_out = graph.add_edge(make_tensor("sig_out", &[-1, 64, 222, 222]));
+
+        graph.inputs = vec![input, weight, bias];
+        graph.outputs = vec![sig_out];
+
+        graph
+            .add_node(GraphOp::Conv2d, vec![input, weight], vec![conv_out], "conv")
+            .unwrap();
+        graph
+            .add_node(
+                GraphOp::Add,
+                vec![conv_out, bias],
+                vec![add_out],
+                "bias_add",
+            )
+            .unwrap();
+        graph
+            .add_node(GraphOp::Sigmoid, vec![add_out], vec![sig_out], "sigmoid")
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(changed);
+        assert_eq!(graph.node_count(), 1);
+        assert_eq!(
+            graph.nodes[0].op,
+            GraphOp::FusedConv2d {
+                activation: ActivationFunction::Sigmoid,
+            }
+        );
+        assert_eq!(graph.nodes[0].inputs, vec![input, weight, bias]);
+    }
+
+    #[test]
+    fn matmul_without_add_no_fusion() {
+        // MatMul without a subsequent Add.
+        let mut graph = ComputeGraph::new();
+
+        let a = graph.add_edge(make_tensor("A", &[-1, 768]));
+        let b = graph.add_edge(make_tensor("B", &[768, 768]));
+        let mm_out = graph.add_edge(make_tensor("mm_out", &[-1, 768]));
+
+        graph.inputs = vec![a, b];
+        graph.outputs = vec![mm_out];
+
+        graph
+            .add_node(GraphOp::MatMul, vec![a, b], vec![mm_out], "matmul")
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(!changed);
+        assert_eq!(graph.node_count(), 1);
+    }
+
+    #[test]
+    fn elementwise_without_activation_no_fusion() {
+        // Add without a subsequent activation.
+        let mut graph = ComputeGraph::new();
+
+        let a = graph.add_edge(make_tensor("a", &[-1, 256]));
+        let b = graph.add_edge(make_tensor("b", &[-1, 256]));
+        let add_out = graph.add_edge(make_tensor("add_out", &[-1, 256]));
+
+        graph.inputs = vec![a, b];
+        graph.outputs = vec![add_out];
+
+        graph
+            .add_node(GraphOp::Add, vec![a, b], vec![add_out], "add")
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(!changed);
+        assert_eq!(graph.node_count(), 1);
+    }
+
+    #[test]
+    fn elementwise_with_non_activation_consumer() {
+        // Add followed by Reshape (not an activation).
+        let mut graph = ComputeGraph::new();
+
+        let a = graph.add_edge(make_tensor("a", &[-1, 256]));
+        let b = graph.add_edge(make_tensor("b", &[-1, 256]));
+        let add_out = graph.add_edge(make_tensor("add_out", &[-1, 256]));
+        let reshape_out = graph.add_edge(make_tensor("reshape_out", &[-1, 256]));
+
+        graph.inputs = vec![a, b];
+        graph.outputs = vec![reshape_out];
+
+        graph
+            .add_node(GraphOp::Add, vec![a, b], vec![add_out], "add")
+            .unwrap();
+        graph
+            .add_node(
+                GraphOp::Reshape,
+                vec![add_out],
+                vec![reshape_out],
+                "reshape",
+            )
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(!changed);
+        assert_eq!(graph.node_count(), 2);
+    }
+
+    #[test]
+    fn conv_multiple_outputs_no_fusion() {
+        // Conv2D with multiple outputs -- should not fuse.
+        let mut graph = ComputeGraph::new();
+
+        let input = graph.add_edge(make_tensor("input", &[-1, 3, 224, 224]));
+        let weight = graph.add_edge(make_tensor("weight", &[64, 3, 3, 3]));
+        let conv_out1 = graph.add_edge(make_tensor("conv_out1", &[-1, 64, 222, 222]));
+        let conv_out2 = graph.add_edge(make_tensor("conv_out2", &[-1, 64, 222, 222]));
+
+        graph.inputs = vec![input, weight];
+        graph.outputs = vec![conv_out1, conv_out2];
+
+        graph
+            .add_node(
+                GraphOp::Conv2d,
+                vec![input, weight],
+                vec![conv_out1, conv_out2],
+                "conv",
+            )
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(!changed);
+    }
+
+    #[test]
+    fn matmul_multiple_outputs_no_fusion() {
+        // MatMul with multiple outputs -- should not fuse.
+        let mut graph = ComputeGraph::new();
+
+        let a = graph.add_edge(make_tensor("A", &[-1, 768]));
+        let b = graph.add_edge(make_tensor("B", &[768, 768]));
+        let mm_out1 = graph.add_edge(make_tensor("mm_out1", &[-1, 768]));
+        let mm_out2 = graph.add_edge(make_tensor("mm_out2", &[-1, 768]));
+
+        graph.inputs = vec![a, b];
+        graph.outputs = vec![mm_out1, mm_out2];
+
+        graph
+            .add_node(
+                GraphOp::MatMul,
+                vec![a, b],
+                vec![mm_out1, mm_out2],
+                "matmul",
+            )
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(!changed);
+    }
+
+    #[test]
+    fn add_multi_output_no_fusion() {
+        // Add with multiple outputs -- should not fuse.
+        let mut graph = ComputeGraph::new();
+
+        let a = graph.add_edge(make_tensor("a", &[-1, 256]));
+        let b = graph.add_edge(make_tensor("b", &[-1, 256]));
+        let add_out1 = graph.add_edge(make_tensor("add_out1", &[-1, 256]));
+        let add_out2 = graph.add_edge(make_tensor("add_out2", &[-1, 256]));
+
+        graph.inputs = vec![a, b];
+        graph.outputs = vec![add_out1, add_out2];
+
+        graph
+            .add_node(GraphOp::Add, vec![a, b], vec![add_out1, add_out2], "add")
+            .unwrap();
+
+        let fusion = OperatorFusion;
+        let changed = fusion.run_on_graph(&mut graph);
+
+        assert!(!changed);
+    }
+
+    #[test]
+    fn operator_fusion_name() {
+        let fusion = OperatorFusion;
+        assert_eq!(fusion.name(), "operator-fusion");
+    }
 }

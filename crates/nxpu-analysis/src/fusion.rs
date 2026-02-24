@@ -614,4 +614,507 @@ mod tests {
         let fused = fuse_patterns(patterns);
         assert_eq!(fused.len(), 2);
     }
+
+    // ---- Display tests ----
+
+    #[test]
+    fn display_fused_pattern_single() {
+        let pattern = FusedPattern::Single(KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        });
+        let s = format!("{pattern}");
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn display_fused_pattern_conv_batchnorm() {
+        let pattern = FusedPattern::ConvBatchNorm {
+            conv: KernelPattern::Conv2D {
+                input: make_tensor("x", TensorRole::Input),
+                weight: make_tensor("w", TensorRole::Input),
+                output: make_tensor("conv_out", TensorRole::Output),
+                shape: Conv2DShape {
+                    batch: "N".into(),
+                    channels_in: "IC".into(),
+                    channels_out: "OC".into(),
+                    height: "H".into(),
+                    width: "W".into(),
+                    kernel_h: "KH".into(),
+                    kernel_w: "KW".into(),
+                    kernel_h_val: 3,
+                    kernel_w_val: 3,
+                    stride_h: 1,
+                    stride_w: 1,
+                    pad_h: 0,
+                    pad_w: 0,
+                },
+            },
+            norm: Box::new(KernelPattern::Normalization {
+                input: make_tensor("conv_out", TensorRole::Input),
+                scale: make_tensor("gamma", TensorRole::Input),
+                bias: make_tensor("beta", TensorRole::Input),
+                output: make_tensor("bn_out", TensorRole::Output),
+                epsilon: 1e-5,
+            }),
+        };
+        let s = format!("{pattern}");
+        assert!(s.contains("BatchNorm"), "got: {s}");
+    }
+
+    #[test]
+    fn display_fused_pattern_matmul_bias() {
+        let pattern = FusedPattern::MatMulBias {
+            matmul: KernelPattern::MatMul {
+                inputs: [
+                    make_tensor("A", TensorRole::Input),
+                    make_tensor("B", TensorRole::Input),
+                ],
+                output: make_tensor("mm_out", TensorRole::Output),
+                shape: MatMulShape {
+                    m: "M".into(),
+                    n: "N".into(),
+                    k: "K".into(),
+                },
+            },
+            bias_add: Box::new(KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("mm_out", TensorRole::Input),
+                    make_tensor("bias", TensorRole::Input),
+                ],
+                output: make_tensor("out", TensorRole::Output),
+                dim_name: "N".into(),
+            }),
+        };
+        let s = format!("{pattern}");
+        assert_eq!(s, "Gemm");
+    }
+
+    #[test]
+    fn display_fused_pattern_with_activation() {
+        let pattern = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("a", TensorRole::Input),
+                    make_tensor("b", TensorRole::Input),
+                ],
+                output: make_tensor("c", TensorRole::Output),
+                dim_name: "N".into(),
+            })),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(KernelPattern::Activation {
+                op: ActivationOp::Relu,
+                input: make_tensor("c", TensorRole::Input),
+                output: make_tensor("d", TensorRole::Output),
+                dim_name: "N".into(),
+            }),
+        };
+        let s = format!("{pattern}");
+        assert!(s.contains("Relu"), "got: {s}");
+    }
+
+    // ---- primary_pattern / output_pattern / fused_activation tests ----
+
+    #[test]
+    fn primary_pattern_for_all_variants() {
+        let add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+
+        let single = FusedPattern::Single(add.clone());
+        assert!(matches!(
+            single.primary_pattern(),
+            KernelPattern::ElementWise { .. }
+        ));
+
+        let conv_bn = FusedPattern::ConvBatchNorm {
+            conv: KernelPattern::Conv2D {
+                input: make_tensor("x", TensorRole::Input),
+                weight: make_tensor("w", TensorRole::Input),
+                output: make_tensor("conv_out", TensorRole::Output),
+                shape: Conv2DShape {
+                    batch: "N".into(),
+                    channels_in: "IC".into(),
+                    channels_out: "OC".into(),
+                    height: "H".into(),
+                    width: "W".into(),
+                    kernel_h: "KH".into(),
+                    kernel_w: "KW".into(),
+                    kernel_h_val: 3,
+                    kernel_w_val: 3,
+                    stride_h: 1,
+                    stride_w: 1,
+                    pad_h: 0,
+                    pad_w: 0,
+                },
+            },
+            norm: Box::new(KernelPattern::Normalization {
+                input: make_tensor("conv_out", TensorRole::Input),
+                scale: make_tensor("gamma", TensorRole::Input),
+                bias: make_tensor("beta", TensorRole::Input),
+                output: make_tensor("bn_out", TensorRole::Output),
+                epsilon: 1e-5,
+            }),
+        };
+        assert!(matches!(
+            conv_bn.primary_pattern(),
+            KernelPattern::Conv2D { .. }
+        ));
+
+        let matmul_bias = FusedPattern::MatMulBias {
+            matmul: KernelPattern::MatMul {
+                inputs: [
+                    make_tensor("A", TensorRole::Input),
+                    make_tensor("B", TensorRole::Input),
+                ],
+                output: make_tensor("mm_out", TensorRole::Output),
+                shape: MatMulShape {
+                    m: "M".into(),
+                    n: "N".into(),
+                    k: "K".into(),
+                },
+            },
+            bias_add: Box::new(add.clone()),
+        };
+        assert!(matches!(
+            matmul_bias.primary_pattern(),
+            KernelPattern::MatMul { .. }
+        ));
+
+        let with_act = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(add.clone())),
+            activation: FusedActivation::Sigmoid,
+            activation_pattern: Box::new(KernelPattern::Activation {
+                op: ActivationOp::Sigmoid,
+                input: make_tensor("c", TensorRole::Input),
+                output: make_tensor("d", TensorRole::Output),
+                dim_name: "N".into(),
+            }),
+        };
+        assert!(matches!(
+            with_act.primary_pattern(),
+            KernelPattern::ElementWise { .. }
+        ));
+    }
+
+    #[test]
+    fn fused_activation_returns_correct_values() {
+        let add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+
+        let single = FusedPattern::Single(add.clone());
+        assert_eq!(single.fused_activation(), FusedActivation::None);
+
+        let with_relu = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(add.clone())),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(KernelPattern::Activation {
+                op: ActivationOp::Relu,
+                input: make_tensor("c", TensorRole::Input),
+                output: make_tensor("d", TensorRole::Output),
+                dim_name: "N".into(),
+            }),
+        };
+        assert_eq!(with_relu.fused_activation(), FusedActivation::Relu);
+    }
+
+    #[test]
+    fn fused_activation_display() {
+        assert_eq!(format!("{}", FusedActivation::None), "None");
+        assert_eq!(format!("{}", FusedActivation::Relu), "Relu");
+        assert_eq!(format!("{}", FusedActivation::Sigmoid), "Sigmoid");
+        assert_eq!(format!("{}", FusedActivation::Tanh), "Tanh");
+    }
+
+    // ---- tensor name helpers for edge cases ----
+
+    #[test]
+    fn output_tensor_names_for_split() {
+        let pattern = KernelPattern::Split {
+            input: make_tensor("x", TensorRole::Input),
+            outputs: vec![
+                make_tensor("o1", TensorRole::Output),
+                make_tensor("o2", TensorRole::Output),
+            ],
+            axis: 1,
+        };
+        let names = output_tensor_names(&pattern);
+        assert_eq!(names, vec!["o1", "o2"]);
+    }
+
+    #[test]
+    fn output_tensor_names_for_unknown() {
+        let pattern = KernelPattern::Unknown {
+            reason: "test".into(),
+        };
+        let names = output_tensor_names(&pattern);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn input_tensor_names_for_unknown() {
+        let pattern = KernelPattern::Unknown {
+            reason: "test".into(),
+        };
+        let names = input_tensor_names(&pattern);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn input_tensor_names_for_concat() {
+        let pattern = KernelPattern::Concat {
+            inputs: vec![
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            axis: 0,
+        };
+        let names = input_tensor_names(&pattern);
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn input_tensor_names_for_attention() {
+        let pattern = KernelPattern::Attention {
+            query: make_tensor("q", TensorRole::Input),
+            key: make_tensor("k", TensorRole::Input),
+            value: make_tensor("v", TensorRole::Input),
+            output: make_tensor("o", TensorRole::Output),
+            d_k: "D".into(),
+            seq_len: "S".into(),
+        };
+        let names = input_tensor_names(&pattern);
+        assert_eq!(names, vec!["q", "k", "v"]);
+    }
+
+    #[test]
+    fn unknown_pattern_passes_through_fuse() {
+        let patterns = vec![
+            KernelPattern::Unknown {
+                reason: "test".into(),
+            },
+            KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("a", TensorRole::Input),
+                    make_tensor("b", TensorRole::Input),
+                ],
+                output: make_tensor("c", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 2);
+        assert!(matches!(
+            &fused[0].0,
+            FusedPattern::Single(KernelPattern::Unknown { .. })
+        ));
+        assert!(matches!(
+            &fused[1].0,
+            FusedPattern::Single(KernelPattern::ElementWise { .. })
+        ));
+    }
+
+    #[test]
+    fn matmul_add_relu_fusion() {
+        // MatMul + Add + Relu: MatMul+Add fuses to MatMulBias, then Relu fuses on top
+        let patterns = vec![
+            KernelPattern::MatMul {
+                inputs: [
+                    make_tensor("A", TensorRole::Input),
+                    make_tensor("B", TensorRole::Input),
+                ],
+                output: make_tensor("mm_out", TensorRole::Output),
+                shape: MatMulShape {
+                    m: "M".into(),
+                    n: "N".into(),
+                    k: "K".into(),
+                },
+            },
+            KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("mm_out", TensorRole::Input),
+                    make_tensor("bias", TensorRole::Input),
+                ],
+                output: make_tensor("gemm_out", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+            KernelPattern::Activation {
+                op: ActivationOp::Relu,
+                input: make_tensor("gemm_out", TensorRole::Input),
+                output: make_tensor("relu_out", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 1);
+        match &fused[0].0 {
+            FusedPattern::WithActivation {
+                base,
+                activation: FusedActivation::Relu,
+                ..
+            } => {
+                assert!(matches!(**base, FusedPattern::MatMulBias { .. }));
+            }
+            other => panic!("expected WithActivation(MatMulBias, Relu), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conv2d_at_end_of_list_no_fusion() {
+        // Conv2D as the last pattern with nothing to fuse
+        let patterns = vec![KernelPattern::Conv2D {
+            input: make_tensor("x", TensorRole::Input),
+            weight: make_tensor("w", TensorRole::Input),
+            output: make_tensor("conv_out", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "IC".into(),
+                channels_out: "OC".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                kernel_h_val: 3,
+                kernel_w_val: 3,
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 0,
+                pad_w: 0,
+            },
+        }];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 1);
+        assert!(matches!(
+            &fused[0].0,
+            FusedPattern::Single(KernelPattern::Conv2D { .. })
+        ));
+    }
+
+    #[test]
+    fn matmul_at_end_of_list_no_fusion() {
+        // MatMul as the last pattern with nothing to fuse
+        let patterns = vec![KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("mm_out", TensorRole::Output),
+            shape: MatMulShape {
+                m: "M".into(),
+                n: "N".into(),
+                k: "K".into(),
+            },
+        }];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 1);
+        assert!(matches!(
+            &fused[0].0,
+            FusedPattern::Single(KernelPattern::MatMul { .. })
+        ));
+    }
+
+    #[test]
+    fn conv2d_with_non_normalization_next() {
+        // Conv2D followed by non-Normalization pattern
+        let patterns = vec![
+            KernelPattern::Conv2D {
+                input: make_tensor("x", TensorRole::Input),
+                weight: make_tensor("w", TensorRole::Input),
+                output: make_tensor("conv_out", TensorRole::Output),
+                shape: Conv2DShape {
+                    batch: "N".into(),
+                    channels_in: "IC".into(),
+                    channels_out: "OC".into(),
+                    height: "H".into(),
+                    width: "W".into(),
+                    kernel_h: "KH".into(),
+                    kernel_w: "KW".into(),
+                    kernel_h_val: 3,
+                    kernel_w_val: 3,
+                    stride_h: 1,
+                    stride_w: 1,
+                    pad_h: 0,
+                    pad_w: 0,
+                },
+            },
+            KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("conv_out", TensorRole::Input),
+                    make_tensor("bias", TensorRole::Input),
+                ],
+                output: make_tensor("add_out", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 2);
+        assert!(matches!(
+            &fused[0].0,
+            FusedPattern::Single(KernelPattern::Conv2D { .. })
+        ));
+        assert!(matches!(
+            &fused[1].0,
+            FusedPattern::Single(KernelPattern::ElementWise { .. })
+        ));
+    }
+
+    #[test]
+    fn matmul_with_non_add_elementwise() {
+        // MatMul followed by Sub (not Add) -- should NOT fuse to MatMulBias
+        let patterns = vec![
+            KernelPattern::MatMul {
+                inputs: [
+                    make_tensor("A", TensorRole::Input),
+                    make_tensor("B", TensorRole::Input),
+                ],
+                output: make_tensor("mm_out", TensorRole::Output),
+                shape: MatMulShape {
+                    m: "M".into(),
+                    n: "N".into(),
+                    k: "K".into(),
+                },
+            },
+            KernelPattern::ElementWise {
+                op: ElementWiseOp::Sub,
+                inputs: [
+                    make_tensor("mm_out", TensorRole::Input),
+                    make_tensor("other", TensorRole::Input),
+                ],
+                output: make_tensor("sub_out", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 2);
+    }
 }

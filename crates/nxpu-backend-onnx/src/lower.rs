@@ -1337,6 +1337,649 @@ mod tests {
         assert_eq!(graph.initializer[0].data_type, data_type::INT64);
     }
 
+    // ---------------------------------------------------------------
+    // Fusion-related tests
+    // ---------------------------------------------------------------
+
+    fn make_conv2d_shape() -> Conv2DShape {
+        Conv2DShape {
+            batch: "N".into(),
+            channels_in: "IC".into(),
+            channels_out: "OC".into(),
+            height: "H".into(),
+            width: "W".into(),
+            kernel_h: "KH".into(),
+            kernel_w: "KW".into(),
+            kernel_h_val: 3,
+            kernel_w_val: 3,
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+        }
+    }
+
+    fn make_matmul_shape() -> MatMulShape {
+        MatMulShape {
+            m: "M".into(),
+            n: "N".into(),
+            k: "K".into(),
+        }
+    }
+
+    #[test]
+    fn fused_single_delegates_to_build_model() {
+        let pattern = KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("C", TensorRole::Output),
+            shape: make_matmul_shape(),
+        };
+        let fused = FusedPattern::Single(pattern);
+        let model = build_fused_model(&fused, "single_matmul", &[]).unwrap();
+
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node.len(), 1);
+        assert_eq!(graph.node[0].op_type, "MatMul");
+        assert_eq!(graph.name, "single_matmul");
+    }
+
+    #[test]
+    fn fused_single_conv2d() {
+        let pattern = KernelPattern::Conv2D {
+            input: make_tensor("x", TensorRole::Input),
+            weight: make_tensor("w", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            shape: make_conv2d_shape(),
+        };
+        let fused = FusedPattern::Single(pattern);
+        let model = build_fused_model(&fused, "single_conv", &[]).unwrap();
+
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node.len(), 1);
+        assert_eq!(graph.node[0].op_type, "Conv");
+    }
+
+    #[test]
+    fn fused_conv_batchnorm() {
+        let conv = KernelPattern::Conv2D {
+            input: make_tensor("x", TensorRole::Input),
+            weight: make_tensor("w", TensorRole::Input),
+            output: make_tensor("conv_out", TensorRole::Output),
+            shape: make_conv2d_shape(),
+        };
+        let norm = KernelPattern::Normalization {
+            input: make_tensor("conv_out", TensorRole::Input),
+            scale: make_tensor("gamma", TensorRole::Input),
+            bias: make_tensor("beta", TensorRole::Input),
+            output: make_tensor("bn_out", TensorRole::Output),
+            epsilon: 1e-5,
+        };
+        let fused = FusedPattern::ConvBatchNorm {
+            conv,
+            norm: Box::new(norm),
+        };
+
+        let model = build_fused_model(&fused, "conv_bn", &[]).unwrap();
+        assert_eq!(model.ir_version, 7);
+        assert_eq!(model.producer_name, "nxpu");
+
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.name, "conv_bn");
+        assert_eq!(graph.node.len(), 2);
+        assert_eq!(graph.node[0].op_type, "Conv");
+        assert_eq!(graph.node[0].name, "conv_0");
+        assert_eq!(graph.node[1].op_type, "BatchNormalization");
+        assert_eq!(graph.node[1].name, "batchnorm_0");
+
+        // Conv output feeds into BatchNorm via intermediate name.
+        assert_eq!(graph.node[0].output, vec!["conv_out_intermediate"]);
+        assert_eq!(graph.node[1].input[0], "conv_out_intermediate");
+
+        // Graph inputs: x, w, gamma, beta.
+        assert_eq!(graph.input.len(), 4);
+        assert_eq!(graph.input[0].name, "x");
+        assert_eq!(graph.input[1].name, "w");
+        assert_eq!(graph.input[2].name, "gamma");
+        assert_eq!(graph.input[3].name, "beta");
+
+        // Graph output: bn_out.
+        assert_eq!(graph.output.len(), 1);
+        assert_eq!(graph.output[0].name, "bn_out");
+
+        // Conv node attributes: kernel_shape, strides, pads.
+        let conv_attrs = &graph.node[0].attribute;
+        let ks = conv_attrs
+            .iter()
+            .find(|a| a.name == "kernel_shape")
+            .unwrap();
+        assert_eq!(ks.ints, vec![3, 3]);
+        let strides = conv_attrs.iter().find(|a| a.name == "strides").unwrap();
+        assert_eq!(strides.ints, vec![1, 1]);
+
+        // BatchNorm node has epsilon attribute.
+        let bn_attrs = &graph.node[1].attribute;
+        let eps = bn_attrs.iter().find(|a| a.name == "epsilon").unwrap();
+        assert!((eps.f - 1e-5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn fused_matmul_bias_produces_gemm() {
+        let matmul = KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("mm_out", TensorRole::Output),
+            shape: make_matmul_shape(),
+        };
+        let bias_add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("mm_out", TensorRole::Input),
+                make_tensor("bias", TensorRole::Input),
+            ],
+            output: make_tensor("out", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let fused = FusedPattern::MatMulBias {
+            matmul,
+            bias_add: Box::new(bias_add),
+        };
+
+        let model = build_fused_model(&fused, "gemm_ep", &[]).unwrap();
+        assert_eq!(model.ir_version, 7);
+        assert_eq!(model.producer_name, "nxpu");
+
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.name, "gemm_ep");
+        assert_eq!(graph.node.len(), 1);
+        assert_eq!(graph.node[0].op_type, "Gemm");
+        assert_eq!(graph.node[0].name, "gemm_0");
+
+        // Gemm inputs: A, B, bias.
+        assert_eq!(graph.node[0].input, vec!["A", "B", "bias"]);
+        // Gemm output: out.
+        assert_eq!(graph.node[0].output, vec!["out"]);
+
+        // Graph inputs: A [M,K], B [K,N], bias [N].
+        assert_eq!(graph.input.len(), 3);
+        assert_eq!(graph.input[0].name, "A");
+        assert_eq!(graph.input[1].name, "B");
+        assert_eq!(graph.input[2].name, "bias");
+
+        // Graph output: out [M,N].
+        assert_eq!(graph.output.len(), 1);
+        assert_eq!(graph.output[0].name, "out");
+
+        // Gemm attributes: alpha=1.0, beta=1.0.
+        let attrs = &graph.node[0].attribute;
+        let alpha = attrs.iter().find(|a| a.name == "alpha").unwrap();
+        assert!((alpha.f - 1.0).abs() < 1e-6);
+        let beta = attrs.iter().find(|a| a.name == "beta").unwrap();
+        assert!((beta.f - 1.0).abs() < 1e-6);
+
+        // Verify shapes via type protos.
+        let a_type = graph.input[0].r#type.as_ref().unwrap();
+        let type_proto::Value::TensorType(a_tensor) = a_type.value.as_ref().unwrap();
+        let a_dims = &a_tensor.shape.as_ref().unwrap().dim;
+        assert_eq!(a_dims.len(), 2);
+        assert_eq!(
+            a_dims[0].value,
+            Some(tensor_shape_dimension::Value::DimParam("M".into()))
+        );
+        assert_eq!(
+            a_dims[1].value,
+            Some(tensor_shape_dimension::Value::DimParam("K".into()))
+        );
+
+        // bias shape: [N].
+        let bias_type = graph.input[2].r#type.as_ref().unwrap();
+        let type_proto::Value::TensorType(bias_tensor) = bias_type.value.as_ref().unwrap();
+        let bias_dims = &bias_tensor.shape.as_ref().unwrap().dim;
+        assert_eq!(bias_dims.len(), 1);
+        assert_eq!(
+            bias_dims[0].value,
+            Some(tensor_shape_dimension::Value::DimParam("N".into()))
+        );
+    }
+
+    #[test]
+    fn fused_matmul_bias_reversed_add_inputs() {
+        // When bias is the first input of the Add (not mm_out), it should still work.
+        let matmul = KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("mm_out", TensorRole::Output),
+            shape: make_matmul_shape(),
+        };
+        let bias_add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("bias", TensorRole::Input),
+                make_tensor("mm_out", TensorRole::Input),
+            ],
+            output: make_tensor("out", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let fused = FusedPattern::MatMulBias {
+            matmul,
+            bias_add: Box::new(bias_add),
+        };
+
+        let model = build_fused_model(&fused, "gemm_rev", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node[0].op_type, "Gemm");
+        // bias should still be identified correctly.
+        assert_eq!(graph.node[0].input, vec!["A", "B", "bias"]);
+    }
+
+    #[test]
+    fn fused_with_activation_relu() {
+        let base = FusedPattern::Single(KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        });
+        let act_pattern = KernelPattern::Activation {
+            op: ActivationOp::Relu,
+            input: make_tensor("c", TensorRole::Input),
+            output: make_tensor("d", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(base),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(act_pattern),
+        };
+
+        let model = build_fused_model(&fused, "add_relu", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        // Should have Add + Relu nodes.
+        assert_eq!(graph.node.len(), 2);
+        assert_eq!(graph.node[0].op_type, "Add");
+        assert_eq!(graph.node[1].op_type, "Relu");
+
+        // The Add output is renamed to an intermediate.
+        assert_eq!(graph.node[0].output, vec!["c_pre_relu"]);
+        // Relu takes the intermediate and produces the original output name.
+        assert_eq!(graph.node[1].input, vec!["c_pre_relu"]);
+        assert_eq!(graph.node[1].output, vec!["c"]);
+
+        // Graph output should be the original name.
+        assert_eq!(graph.output[0].name, "c");
+    }
+
+    #[test]
+    fn fused_with_activation_sigmoid() {
+        let base = FusedPattern::Single(KernelPattern::ElementWise {
+            op: ElementWiseOp::Mul,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        });
+        let act_pattern = KernelPattern::Activation {
+            op: ActivationOp::Sigmoid,
+            input: make_tensor("c", TensorRole::Input),
+            output: make_tensor("d", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(base),
+            activation: FusedActivation::Sigmoid,
+            activation_pattern: Box::new(act_pattern),
+        };
+
+        let model = build_fused_model(&fused, "mul_sigmoid", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        assert_eq!(graph.node.len(), 2);
+        assert_eq!(graph.node[0].op_type, "Mul");
+        assert_eq!(graph.node[1].op_type, "Sigmoid");
+
+        assert_eq!(graph.node[0].output, vec!["c_pre_sigmoid"]);
+        assert_eq!(graph.node[1].input, vec!["c_pre_sigmoid"]);
+        assert_eq!(graph.node[1].output, vec!["c"]);
+    }
+
+    #[test]
+    fn fused_with_activation_tanh() {
+        let base = FusedPattern::Single(KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("C", TensorRole::Output),
+            shape: make_matmul_shape(),
+        });
+        let act_pattern = KernelPattern::Activation {
+            op: ActivationOp::Tanh,
+            input: make_tensor("C", TensorRole::Input),
+            output: make_tensor("D", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(base),
+            activation: FusedActivation::Tanh,
+            activation_pattern: Box::new(act_pattern),
+        };
+
+        let model = build_fused_model(&fused, "matmul_tanh", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        assert_eq!(graph.node.len(), 2);
+        assert_eq!(graph.node[0].op_type, "MatMul");
+        assert_eq!(graph.node[1].op_type, "Tanh");
+
+        assert_eq!(graph.node[0].output, vec!["C_pre_tanh"]);
+        assert_eq!(graph.node[1].input, vec!["C_pre_tanh"]);
+        assert_eq!(graph.node[1].output, vec!["C"]);
+    }
+
+    #[test]
+    fn fused_with_activation_none_is_noop() {
+        let base = FusedPattern::Single(KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        });
+        let act_pattern = KernelPattern::Activation {
+            op: ActivationOp::Relu,
+            input: make_tensor("c", TensorRole::Input),
+            output: make_tensor("d", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(base),
+            activation: FusedActivation::None,
+            activation_pattern: Box::new(act_pattern),
+        };
+
+        let model = build_fused_model(&fused, "add_none", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        // FusedActivation::None should not append any activation node.
+        assert_eq!(graph.node.len(), 1);
+        assert_eq!(graph.node[0].op_type, "Add");
+    }
+
+    #[test]
+    fn fused_conv_batchnorm_with_relu() {
+        let conv = KernelPattern::Conv2D {
+            input: make_tensor("x", TensorRole::Input),
+            weight: make_tensor("w", TensorRole::Input),
+            output: make_tensor("conv_out", TensorRole::Output),
+            shape: make_conv2d_shape(),
+        };
+        let norm = KernelPattern::Normalization {
+            input: make_tensor("conv_out", TensorRole::Input),
+            scale: make_tensor("gamma", TensorRole::Input),
+            bias: make_tensor("beta", TensorRole::Input),
+            output: make_tensor("bn_out", TensorRole::Output),
+            epsilon: 1e-5,
+        };
+        let conv_bn = FusedPattern::ConvBatchNorm {
+            conv,
+            norm: Box::new(norm),
+        };
+        let act_pattern = KernelPattern::Activation {
+            op: ActivationOp::Relu,
+            input: make_tensor("bn_out", TensorRole::Input),
+            output: make_tensor("relu_out", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(conv_bn),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(act_pattern),
+        };
+
+        let model = build_fused_model(&fused, "conv_bn_relu", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        // Conv + BatchNorm + Relu = 3 nodes.
+        assert_eq!(graph.node.len(), 3);
+        assert_eq!(graph.node[0].op_type, "Conv");
+        assert_eq!(graph.node[1].op_type, "BatchNormalization");
+        assert_eq!(graph.node[2].op_type, "Relu");
+
+        // BN output is renamed to intermediate, Relu restores original.
+        assert_eq!(graph.node[1].output, vec!["bn_out_pre_relu"]);
+        assert_eq!(graph.node[2].input, vec!["bn_out_pre_relu"]);
+        assert_eq!(graph.node[2].output, vec!["bn_out"]);
+    }
+
+    #[test]
+    fn fused_gemm_with_relu() {
+        let matmul = KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("mm_out", TensorRole::Output),
+            shape: make_matmul_shape(),
+        };
+        let bias_add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("mm_out", TensorRole::Input),
+                make_tensor("bias", TensorRole::Input),
+            ],
+            output: make_tensor("out", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let gemm = FusedPattern::MatMulBias {
+            matmul,
+            bias_add: Box::new(bias_add),
+        };
+        let act_pattern = KernelPattern::Activation {
+            op: ActivationOp::Relu,
+            input: make_tensor("out", TensorRole::Input),
+            output: make_tensor("relu_out", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(gemm),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(act_pattern),
+        };
+
+        let model = build_fused_model(&fused, "gemm_relu", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        // Gemm + Relu = 2 nodes.
+        assert_eq!(graph.node.len(), 2);
+        assert_eq!(graph.node[0].op_type, "Gemm");
+        assert_eq!(graph.node[1].op_type, "Relu");
+
+        assert_eq!(graph.node[0].output, vec!["out_pre_relu"]);
+        assert_eq!(graph.node[1].input, vec!["out_pre_relu"]);
+        assert_eq!(graph.node[1].output, vec!["out"]);
+    }
+
+    #[test]
+    fn append_activation_node_relu() {
+        // Build a simple model then append Relu.
+        let pattern = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let mut model = build_model(&pattern, "test", &[]).unwrap();
+        append_activation_node(&mut model, "Relu");
+
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node.len(), 2);
+        assert_eq!(graph.node[1].op_type, "Relu");
+        assert_eq!(graph.node[1].name, "relu_0");
+        assert_eq!(graph.node[1].input, vec!["c_pre_relu"]);
+        assert_eq!(graph.node[1].output, vec!["c"]);
+        // Original last node output renamed.
+        assert_eq!(graph.node[0].output, vec!["c_pre_relu"]);
+        // Graph output retains original name.
+        assert_eq!(graph.output[0].name, "c");
+    }
+
+    #[test]
+    fn append_activation_node_sigmoid() {
+        let pattern = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let mut model = build_model(&pattern, "test", &[]).unwrap();
+        append_activation_node(&mut model, "Sigmoid");
+
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node.len(), 2);
+        assert_eq!(graph.node[1].op_type, "Sigmoid");
+        assert_eq!(graph.node[1].name, "sigmoid_0");
+        assert_eq!(graph.node[1].input, vec!["c_pre_sigmoid"]);
+        assert_eq!(graph.node[1].output, vec!["c"]);
+    }
+
+    #[test]
+    fn append_activation_node_tanh() {
+        let pattern = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let mut model = build_model(&pattern, "test", &[]).unwrap();
+        append_activation_node(&mut model, "Tanh");
+
+        let graph = model.graph.as_ref().unwrap();
+        assert_eq!(graph.node.len(), 2);
+        assert_eq!(graph.node[1].op_type, "Tanh");
+        assert_eq!(graph.node[1].name, "tanh_0");
+        assert_eq!(graph.node[1].input, vec!["c_pre_tanh"]);
+        assert_eq!(graph.node[1].output, vec!["c"]);
+    }
+
+    #[test]
+    fn fused_conv_batchnorm_with_weights_injected() {
+        let conv = KernelPattern::Conv2D {
+            input: make_tensor("x", TensorRole::Input),
+            weight: make_tensor("w", TensorRole::Input),
+            output: make_tensor("conv_out", TensorRole::Output),
+            shape: make_conv2d_shape(),
+        };
+        let norm = KernelPattern::Normalization {
+            input: make_tensor("conv_out", TensorRole::Input),
+            scale: make_tensor("gamma", TensorRole::Input),
+            bias: make_tensor("beta", TensorRole::Input),
+            output: make_tensor("bn_out", TensorRole::Output),
+            epsilon: 1e-5,
+        };
+        let fused = FusedPattern::ConvBatchNorm {
+            conv,
+            norm: Box::new(norm),
+        };
+
+        let weights = vec![
+            EmbeddedWeight {
+                name: "w".into(),
+                dims: vec![8, 3, 3, 3],
+                data: vec![0.1; 8 * 3 * 3 * 3],
+            },
+            EmbeddedWeight {
+                name: "gamma".into(),
+                dims: vec![8],
+                data: vec![1.0; 8],
+            },
+        ];
+
+        let model = build_fused_model(&fused, "conv_bn_w", &weights).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        // Both referenced weights should be injected.
+        assert_eq!(graph.initializer.len(), 2);
+        let init_names: Vec<&str> = graph.initializer.iter().map(|i| i.name.as_str()).collect();
+        assert!(init_names.contains(&"w"));
+        assert!(init_names.contains(&"gamma"));
+    }
+
+    #[test]
+    fn fused_matmul_bias_with_weights_injected() {
+        let matmul = KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("mm_out", TensorRole::Output),
+            shape: make_matmul_shape(),
+        };
+        let bias_add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("mm_out", TensorRole::Input),
+                make_tensor("bias", TensorRole::Input),
+            ],
+            output: make_tensor("out", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let fused = FusedPattern::MatMulBias {
+            matmul,
+            bias_add: Box::new(bias_add),
+        };
+
+        let weights = vec![
+            EmbeddedWeight {
+                name: "B".into(),
+                dims: vec![4, 8],
+                data: vec![0.5; 32],
+            },
+            EmbeddedWeight {
+                name: "bias".into(),
+                dims: vec![8],
+                data: vec![0.1; 8],
+            },
+            EmbeddedWeight {
+                name: "unused".into(),
+                dims: vec![2],
+                data: vec![9.9, 9.9],
+            },
+        ];
+
+        let model = build_fused_model(&fused, "gemm_w", &weights).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        // Only B and bias are referenced; unused should not appear.
+        assert_eq!(graph.initializer.len(), 2);
+        let init_names: Vec<&str> = graph.initializer.iter().map(|i| i.name.as_str()).collect();
+        assert!(init_names.contains(&"B"));
+        assert!(init_names.contains(&"bias"));
+        assert!(!init_names.contains(&"unused"));
+    }
+
     #[test]
     fn inject_weights_adds_initializer() {
         let mut graph = GraphProto {

@@ -1020,4 +1020,1359 @@ mod tests {
         });
         assert_eq!(type_size_bytes(&module, mat4x4_ty), 64); // 4 * 4 * 4
     }
+
+    // ===== Type size: Atomic =====
+
+    #[test]
+    fn atomic_type_size() {
+        let mut module = Module::default();
+        let atomic_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Atomic(Scalar::U32),
+        });
+        assert_eq!(type_size_bytes(&module, atomic_ty), 4);
+    }
+
+    // ===== Type size: Pointer =====
+
+    #[test]
+    fn pointer_type_size_is_zero() {
+        let mut module = Module::default();
+        let f32_ty = f32_type(&mut module);
+        let ptr_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Pointer {
+                base: f32_ty,
+                space: AddressSpace::Storage {
+                    access: StorageAccess::LOAD,
+                },
+            },
+        });
+        assert_eq!(type_size_bytes(&module, ptr_ty), 0);
+    }
+
+    // ===== Type size: Array with zero-size base uses stride =====
+
+    #[test]
+    fn array_with_zero_base_uses_stride() {
+        let mut module = Module::default();
+        // Create an array whose base type has zero size (e.g. pointer).
+        let f32_ty = f32_type(&mut module);
+        let ptr_base = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Pointer {
+                base: f32_ty,
+                space: AddressSpace::Storage {
+                    access: StorageAccess::LOAD,
+                },
+            },
+        });
+        let arr_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: ptr_base,
+                size: ArraySize::Constant(10),
+                stride: 8,
+            },
+        });
+        // Base has size 0, so falls back to n * stride = 10 * 8 = 80.
+        assert_eq!(type_size_bytes(&module, arr_ty), 80);
+    }
+
+    // ===== Type size: Array with non-zero base uses base size =====
+
+    #[test]
+    fn array_with_nonzero_base_uses_elem_size() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 10);
+        // f32 = 4 bytes, so 10 * 4 = 40.
+        assert_eq!(type_size_bytes(&module, arr_ty), 40);
+    }
+
+    // ===== Type size: Dynamic array =====
+
+    #[test]
+    fn dynamic_array_size_is_zero() {
+        let mut module = Module::default();
+        let dyn_arr_ty = f32_dynamic_array_type(&mut module);
+        assert_eq!(type_size_bytes(&module, dyn_arr_ty), 0);
+    }
+
+    // ===== Type size: Scalar =====
+
+    #[test]
+    fn scalar_type_size() {
+        let mut module = Module::default();
+        let f32_ty = f32_type(&mut module);
+        assert_eq!(type_size_bytes(&module, f32_ty), 4);
+    }
+
+    // ===== Type size: Vec2 =====
+
+    #[test]
+    fn vec2_type_size() {
+        let mut module = Module::default();
+        let vec2_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Vector {
+                size: VectorSize::Bi,
+                scalar: Scalar::F32,
+            },
+        });
+        assert_eq!(type_size_bytes(&module, vec2_ty), 8); // 2 * 4
+    }
+
+    // ===== Type size: Vec3 =====
+
+    #[test]
+    fn vec3_type_size() {
+        let mut module = Module::default();
+        let vec3_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Vector {
+                size: VectorSize::Tri,
+                scalar: Scalar::F32,
+            },
+        });
+        assert_eq!(type_size_bytes(&module, vec3_ty), 12); // 3 * 4
+    }
+
+    // ===== Type size: Matrix 2x3 =====
+
+    #[test]
+    fn matrix_2x3_type_size() {
+        let mut module = Module::default();
+        let mat_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Matrix {
+                columns: VectorSize::Bi,
+                rows: VectorSize::Tri,
+                scalar: Scalar::F32,
+            },
+        });
+        assert_eq!(type_size_bytes(&module, mat_ty), 24); // 2 * 3 * 4
+    }
+
+    // ===== Greedy allocate: empty intervals =====
+
+    #[test]
+    fn greedy_allocate_empty() {
+        let intervals = HashMap::new();
+        let plan = greedy_allocate(&intervals);
+        assert!(plan.allocations.is_empty());
+        assert_eq!(plan.peak_bytes, 0);
+    }
+
+    // ===== Greedy allocate: zero-size tensor =====
+
+    #[test]
+    fn greedy_allocate_zero_size_tensor() {
+        let mut intervals = HashMap::new();
+        intervals.insert(
+            TensorId(0),
+            LiveInterval {
+                start: 0,
+                end: 5,
+                size_bytes: 0,
+            },
+        );
+        let plan = greedy_allocate(&intervals);
+        assert_eq!(plan.allocations.len(), 1);
+        assert_eq!(plan.allocations[0].size_bytes, 0);
+        assert_eq!(plan.peak_bytes, 0);
+    }
+
+    // ===== Greedy allocate: gap finding between active allocations =====
+
+    #[test]
+    fn greedy_allocate_gap_finding() {
+        // Three tensors: A and C overlap, B does not overlap with anything.
+        // A: [0, 3] size 100, C: [0, 3] size 100, B: [0, 3] size 50.
+        // All overlap, so they must be placed sequentially.
+        // Then D: [5, 6] size 50 should fit in a gap (reuse B's slot).
+        let mut intervals = HashMap::new();
+        intervals.insert(
+            TensorId(0),
+            LiveInterval {
+                start: 0,
+                end: 3,
+                size_bytes: 100,
+            },
+        );
+        intervals.insert(
+            TensorId(1),
+            LiveInterval {
+                start: 0,
+                end: 3,
+                size_bytes: 50,
+            },
+        );
+        intervals.insert(
+            TensorId(2),
+            LiveInterval {
+                start: 0,
+                end: 3,
+                size_bytes: 100,
+            },
+        );
+        intervals.insert(
+            TensorId(3),
+            LiveInterval {
+                start: 5,
+                end: 6,
+                size_bytes: 50,
+            },
+        );
+
+        let plan = greedy_allocate(&intervals);
+        assert_eq!(plan.allocations.len(), 4);
+        // Peak should be 250 (all three overlapping: 100 + 50 + 100).
+        // D should reuse space since its lifetime doesn't overlap.
+        assert_eq!(plan.peak_bytes, 250);
+    }
+
+    // ===== Greedy allocate: size tie-breaking (larger first) =====
+
+    #[test]
+    fn greedy_allocate_size_tiebreak() {
+        // Two tensors starting at the same time, different sizes.
+        let mut intervals = HashMap::new();
+        intervals.insert(
+            TensorId(0),
+            LiveInterval {
+                start: 0,
+                end: 0,
+                size_bytes: 50,
+            },
+        );
+        intervals.insert(
+            TensorId(1),
+            LiveInterval {
+                start: 0,
+                end: 0,
+                size_bytes: 200,
+            },
+        );
+
+        let plan = greedy_allocate(&intervals);
+        assert_eq!(plan.allocations.len(), 2);
+        // Both overlap at time 0, so peak should be 250.
+        assert_eq!(plan.peak_bytes, 250);
+
+        // Larger tensor should be placed first (lower offset) due to tie-breaking.
+        let large_alloc = plan
+            .allocations
+            .iter()
+            .find(|a| a.size_bytes == 200)
+            .unwrap();
+        let small_alloc = plan
+            .allocations
+            .iter()
+            .find(|a| a.size_bytes == 50)
+            .unwrap();
+        assert!(
+            large_alloc.offset < small_alloc.offset,
+            "larger tensor should have lower offset"
+        );
+    }
+
+    // ===== Merge intervals =====
+
+    #[test]
+    fn merge_intervals_extends_existing() {
+        let mut dst = HashMap::new();
+        dst.insert(
+            TensorId(0),
+            LiveInterval {
+                start: 2,
+                end: 5,
+                size_bytes: 100,
+            },
+        );
+
+        let mut src = HashMap::new();
+        src.insert(
+            TensorId(0),
+            LiveInterval {
+                start: 1,
+                end: 3,
+                size_bytes: 100,
+            },
+        );
+        src.insert(
+            TensorId(1),
+            LiveInterval {
+                start: 0,
+                end: 4,
+                size_bytes: 200,
+            },
+        );
+
+        merge_intervals(&mut dst, &src);
+
+        // TensorId(0) should have start extended to 1, end stays at 5.
+        let interval_0 = dst.get(&TensorId(0)).unwrap();
+        assert_eq!(interval_0.start, 1);
+        assert_eq!(interval_0.end, 5);
+
+        // TensorId(1) should be added.
+        let interval_1 = dst.get(&TensorId(1)).unwrap();
+        assert_eq!(interval_1.start, 0);
+        assert_eq!(interval_1.end, 4);
+        assert_eq!(interval_1.size_bytes, 200);
+    }
+
+    #[test]
+    fn merge_intervals_end_extended() {
+        let mut dst = HashMap::new();
+        dst.insert(
+            TensorId(0),
+            LiveInterval {
+                start: 0,
+                end: 3,
+                size_bytes: 100,
+            },
+        );
+
+        let mut src = HashMap::new();
+        src.insert(
+            TensorId(0),
+            LiveInterval {
+                start: 2,
+                end: 10,
+                size_bytes: 100,
+            },
+        );
+
+        merge_intervals(&mut dst, &src);
+        let interval = dst.get(&TensorId(0)).unwrap();
+        assert_eq!(interval.start, 0);
+        assert_eq!(interval.end, 10);
+    }
+
+    // ===== Plan memory with helper functions =====
+
+    #[test]
+    fn plan_memory_with_helper_function() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("buf".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Helper function that uses the global.
+        let mut helper = Function::new("helper");
+        let ptr = helper.expressions.append(Expression::GlobalVariable(gv));
+        let lit = helper
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        helper.body.push(Statement::Store {
+            pointer: ptr,
+            value: lit,
+        });
+        module.functions.append(helper);
+
+        // Entry point that also uses the global.
+        let mut ep_func = Function::new("main");
+        let ptr2 = ep_func.expressions.append(Expression::GlobalVariable(gv));
+        let lit2 = ep_func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        ep_func.body.push(Statement::Store {
+            pointer: ptr2,
+            value: lit2,
+        });
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: ep_func,
+        });
+
+        let plan = plan_memory(&module);
+        // Should have at least 1 allocation for the global.
+        assert!(!plan.allocations.is_empty());
+        assert!(plan.peak_bytes >= 256);
+    }
+
+    // ===== Plan memory: unreferenced globals get allocated =====
+
+    #[test]
+    fn unreferenced_globals_get_allocated() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 128); // 512 bytes
+
+        // Global variable that is never referenced in any function body.
+        module.global_variables.append(GlobalVariable {
+            name: Some("unused".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let plan = plan_memory(&module);
+        // The unreferenced global should still get an allocation.
+        let non_zero: Vec<_> = plan
+            .allocations
+            .iter()
+            .filter(|a| a.size_bytes > 0)
+            .collect();
+        assert_eq!(non_zero.len(), 1);
+        assert_eq!(non_zero[0].size_bytes, 512);
+        assert_eq!(plan.peak_bytes, 512);
+    }
+
+    // ===== Lifetime analysis with If statement =====
+
+    #[test]
+    fn lifetime_analysis_with_if_statement() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("buf".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let cond = func
+            .expressions
+            .append(Expression::Literal(Literal::Bool(true)));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // stmt 0: if (cond) { store val -> ptr }
+        func.body.push(Statement::If {
+            condition: cond,
+            accept: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+            reject: vec![],
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.peak_bytes >= 256);
+    }
+
+    // ===== Lifetime analysis with Loop statement =====
+
+    #[test]
+    fn lifetime_analysis_with_loop_statement() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("buf".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let break_cond = func
+            .expressions
+            .append(Expression::Literal(Literal::Bool(false)));
+
+        // Loop with body, continuing, and break_if.
+        func.body.push(Statement::Loop {
+            body: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+            continuing: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+            break_if: Some(break_cond),
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.peak_bytes >= 256);
+    }
+
+    // ===== Lifetime analysis with Call statement =====
+
+    #[test]
+    fn lifetime_analysis_with_call_statement() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("buf".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Add a helper function.
+        let helper = Function::new("helper");
+        let helper_handle = module.functions.append(helper);
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let result_expr = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+
+        func.body.push(Statement::Call {
+            function: helper_handle,
+            arguments: vec![ptr],
+            result: Some(result_expr),
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.peak_bytes >= 256);
+    }
+
+    // ===== Lifetime analysis with Atomic statement =====
+
+    #[test]
+    fn lifetime_analysis_with_atomic_statement() {
+        let mut module = Module::default();
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("counter".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: u32_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(1)));
+        let result_expr = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+
+        func.body.push(Statement::Atomic {
+            pointer: ptr,
+            fun: AtomicFunction::Add,
+            value: val,
+            result: Some(result_expr),
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        // u32 = 4 bytes.
+        assert!(plan.peak_bytes >= 4);
+    }
+
+    // ===== Lifetime analysis with Atomic Exchange compare =====
+
+    #[test]
+    fn lifetime_analysis_with_atomic_exchange_compare() {
+        let mut module = Module::default();
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("counter".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: u32_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(1)));
+        let cmp = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+
+        func.body.push(Statement::Atomic {
+            pointer: ptr,
+            fun: AtomicFunction::Exchange { compare: Some(cmp) },
+            value: val,
+            result: None,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.peak_bytes >= 4);
+    }
+
+    // ===== Lifetime analysis with Return statement =====
+
+    #[test]
+    fn lifetime_analysis_with_return_value() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("buf".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        func.body.push(Statement::Return { value: Some(ptr) });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.peak_bytes >= 256);
+    }
+
+    // ===== Lifetime analysis with Break/Continue (no tensor refs) =====
+
+    #[test]
+    fn lifetime_analysis_break_continue_no_effect() {
+        let mut module = Module::default();
+        let mut func = Function::new("main");
+        func.body.push(Statement::Break);
+        func.body.push(Statement::Continue);
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.allocations.is_empty());
+        assert_eq!(plan.peak_bytes, 0);
+    }
+
+    // ===== Lifetime analysis with Barrier (no tensor refs) =====
+
+    #[test]
+    fn lifetime_analysis_barrier_no_effect() {
+        let mut module = Module::default();
+        let mut func = Function::new("main");
+        func.body.push(Statement::Barrier(Barrier::STORAGE));
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.allocations.is_empty());
+        assert_eq!(plan.peak_bytes, 0);
+    }
+
+    // ===== Lifetime analysis with Emit =====
+
+    #[test]
+    fn lifetime_analysis_with_emit() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("buf".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let _load = func.expressions.append(Expression::Load { pointer: ptr });
+
+        // Emit covering both expressions.
+        let range = Range::from_index_range(0..func.expressions.len() as u32);
+        func.body.push(Statement::Emit(range));
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.peak_bytes >= 256);
+    }
+
+    // ===== Access/AccessIndex expression resolution =====
+
+    #[test]
+    fn access_index_resolves_to_global() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("buf".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let access_idx = func.expressions.append(Expression::AccessIndex {
+            base: ptr,
+            index: 0,
+        });
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // Store using AccessIndex (should resolve to the global).
+        func.body.push(Statement::Store {
+            pointer: access_idx,
+            value: val,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.peak_bytes >= 256);
+    }
+
+    // ===== Access expression resolution =====
+
+    #[test]
+    fn access_resolves_to_global() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("buf".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let access = func.expressions.append(Expression::Access {
+            base: ptr,
+            index: idx,
+        });
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // Store using Access (should resolve to the global).
+        func.body.push(Statement::Store {
+            pointer: access,
+            value: val,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.peak_bytes >= 256);
+    }
+
+    // ===== Local variable in helper function =====
+
+    #[test]
+    fn local_variable_in_helper_function() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let mut helper = Function::new("helper");
+        let lv = helper.local_variables.append(LocalVariable {
+            name: Some("temp".into()),
+            ty: arr_ty,
+            init: None,
+        });
+        let ptr = helper.expressions.append(Expression::LocalVariable(lv));
+        let lit = helper
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        helper.body.push(Statement::Store {
+            pointer: ptr,
+            value: lit,
+        });
+        module.functions.append(helper);
+
+        let plan = plan_memory(&module);
+        // The local variable should be allocated.
+        let non_zero: Vec<_> = plan
+            .allocations
+            .iter()
+            .filter(|a| a.size_bytes > 0)
+            .collect();
+        assert_eq!(non_zero.len(), 1);
+        assert_eq!(non_zero[0].size_bytes, 256);
+    }
+
+    // ===== Multiple entry points =====
+
+    #[test]
+    fn plan_memory_multiple_entry_points() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 128); // 512 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("shared".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Entry point 1.
+        let mut func1 = Function::new("ep1");
+        let ptr1 = func1.expressions.append(Expression::GlobalVariable(gv));
+        let lit1 = func1
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        func1.body.push(Statement::Store {
+            pointer: ptr1,
+            value: lit1,
+        });
+        module.entry_points.push(EntryPoint {
+            name: "ep1".into(),
+            workgroup_size: [1, 1, 1],
+            function: func1,
+        });
+
+        // Entry point 2.
+        let mut func2 = Function::new("ep2");
+        let ptr2 = func2.expressions.append(Expression::GlobalVariable(gv));
+        let lit2 = func2
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        func2.body.push(Statement::Store {
+            pointer: ptr2,
+            value: lit2,
+        });
+        module.entry_points.push(EntryPoint {
+            name: "ep2".into(),
+            workgroup_size: [1, 1, 1],
+            function: func2,
+        });
+
+        let plan = plan_memory(&module);
+        // Same global used in both entry points.
+        assert_eq!(plan.peak_bytes, 512);
+    }
+
+    // ===== MemoryPlanning pass with non-trivial module =====
+
+    #[test]
+    fn memory_planning_pass_with_content() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 128); // 512 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("buf".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let lit = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: lit,
+        });
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let pass = MemoryPlanning;
+        let changed = pass.run(&mut module);
+        assert!(!changed);
+    }
+
+    // ===== Display: empty plan =====
+
+    #[test]
+    fn memory_plan_display_empty() {
+        let plan = MemoryPlan::default();
+        let text = format!("{plan}");
+        assert!(text.contains("Peak memory: 0 bytes"));
+        assert!(text.contains("Buffers: 0"));
+    }
+
+    // ===== Display: plan with zero-total (no reuse line) =====
+
+    #[test]
+    fn memory_plan_display_no_reuse_line_for_zero_total() {
+        let plan = MemoryPlan {
+            allocations: vec![BufferAllocation {
+                tensor_id: TensorId(0),
+                offset: 0,
+                size_bytes: 0,
+            }],
+            peak_bytes: 0,
+        };
+        let text = format!("{plan}");
+        assert!(text.contains("Buffers: 1"));
+        // With total = 0, the reuse savings line should not be present.
+        assert!(!text.contains("Reuse savings:"));
+    }
+
+    // ===== If statement with nested references in reject =====
+
+    #[test]
+    fn if_with_reject_branch_references() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv_a = module.global_variables.append(GlobalVariable {
+            name: Some("a".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+        let gv_b = module.global_variables.append(GlobalVariable {
+            name: Some("b".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 1,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr_a = func.expressions.append(Expression::GlobalVariable(gv_a));
+        let ptr_b = func.expressions.append(Expression::GlobalVariable(gv_b));
+        let cond = func
+            .expressions
+            .append(Expression::Literal(Literal::Bool(true)));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        func.body.push(Statement::If {
+            condition: cond,
+            accept: vec![Statement::Store {
+                pointer: ptr_a,
+                value: val,
+            }],
+            reject: vec![Statement::Store {
+                pointer: ptr_b,
+                value: val,
+            }],
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        // Both globals should be allocated.
+        let non_zero: Vec<_> = plan
+            .allocations
+            .iter()
+            .filter(|a| a.size_bytes > 0)
+            .collect();
+        assert_eq!(non_zero.len(), 2);
+    }
+
+    // ===== Loop with break_if expression referencing a global =====
+
+    #[test]
+    fn loop_break_if_references_global() {
+        let mut module = Module::default();
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("flag".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: u32_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+
+        func.body.push(Statement::Loop {
+            body: vec![],
+            continuing: vec![],
+            break_if: Some(ptr),
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.peak_bytes >= 4);
+    }
+
+    // ===== Resolve expression: returns None for non-variable expressions =====
+
+    #[test]
+    fn resolve_expr_non_variable_returns_none() {
+        let mut module = Module::default();
+        let mut func = Function::new("main");
+        let lit = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // Store lit -> lit (not realistic, but tests resolve_expr_tensor_id returning None).
+        func.body.push(Statement::Store {
+            pointer: lit,
+            value: lit,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        // Literal expression does not resolve to any tensor, so no allocations.
+        assert_eq!(plan.peak_bytes, 0);
+    }
+
+    // ===== Return with no value in lifetime analysis =====
+
+    #[test]
+    fn return_no_value_no_effect_on_lifetimes() {
+        let mut module = Module::default();
+        let mut func = Function::new("main");
+        func.body.push(Statement::Return { value: None });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert_eq!(plan.peak_bytes, 0);
+    }
+
+    // ===== Single store function (minimum case) =====
+
+    #[test]
+    fn single_store_function() {
+        let mut module = Module::default();
+        let f32_ty = f32_type(&mut module);
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("x".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: f32_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(42.0)));
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert_eq!(plan.peak_bytes, 4); // f32 = 4 bytes
+    }
+
+    // ===== Call with no result in lifetime analysis =====
+
+    #[test]
+    fn call_no_result_lifetime() {
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv = module.global_variables.append(GlobalVariable {
+            name: Some("buf".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let helper = Function::new("helper");
+        let helper_handle = module.functions.append(helper);
+
+        let mut func = Function::new("main");
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+
+        func.body.push(Statement::Call {
+            function: helper_handle,
+            arguments: vec![ptr],
+            result: None,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        assert!(plan.peak_bytes >= 256);
+    }
+
+    // ===== Lifetime interval start updated backwards =====
+
+    #[test]
+    fn lifetime_interval_start_updated_backwards() {
+        // Build a case where a tensor is first seen at stmt 2, then at stmt 0.
+        // This tests the and_modify path where stmt_idx < interval.start.
+        let mut module = Module::default();
+        let arr_ty = f32_array_type(&mut module, 64); // 256 bytes
+
+        let gv_a = module.global_variables.append(GlobalVariable {
+            name: Some("a".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+        let gv_b = module.global_variables.append(GlobalVariable {
+            name: Some("b".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 1,
+            }),
+            ty: arr_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+        let ptr_a = func.expressions.append(Expression::GlobalVariable(gv_a));
+        let ptr_b = func.expressions.append(Expression::GlobalVariable(gv_b));
+        let load_a = func.expressions.append(Expression::Load { pointer: ptr_a });
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // stmt 0: store val -> ptr_a (a used at 0)
+        func.body.push(Statement::Store {
+            pointer: ptr_a,
+            value: val,
+        });
+        // stmt 1: store val -> ptr_b (b used at 1)
+        func.body.push(Statement::Store {
+            pointer: ptr_b,
+            value: val,
+        });
+        // stmt 2: store load(a) -> ptr_b (a used at 2, b used at 2)
+        func.body.push(Statement::Store {
+            pointer: ptr_b,
+            value: load_a,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let plan = plan_memory(&module);
+        // a: [0, 2], b: [1, 2] -- both live at stmt 2, peak should be 512.
+        assert_eq!(plan.peak_bytes, 512);
+    }
 }

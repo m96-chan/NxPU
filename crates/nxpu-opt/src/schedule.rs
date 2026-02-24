@@ -547,4 +547,163 @@ mod tests {
             "schedule with dependent ops at same time should be invalid"
         );
     }
+
+    #[test]
+    fn schedule_pass_with_entry_points() {
+        let mut module = Module::default();
+        let mut func = Function::new("ep_test");
+        let gv = dummy_gv_handle();
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(42.0)));
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        module.entry_points.push(nxpu_ir::EntryPoint {
+            name: "ep_test".into(),
+            workgroup_size: [1, 1, 1],
+            function: func,
+        });
+
+        let pass = SchedulePass;
+        let changed = pass.run(&mut module);
+        assert!(!changed, "schedule pass should not modify the module");
+    }
+
+    #[test]
+    fn compute_schedules_with_entry_points() {
+        let mut module = Module::default();
+
+        let mut func1 = Function::new("ep1");
+        let gv = dummy_gv_handle();
+        let ptr = func1.expressions.append(Expression::GlobalVariable(gv));
+        let val = func1
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        func1.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        let mut func2 = Function::new("ep2");
+        let gv2 = dummy_gv_handle();
+        let ptr2 = func2.expressions.append(Expression::GlobalVariable(gv2));
+        let val2 = func2
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        func2.body.push(Statement::Store {
+            pointer: ptr2,
+            value: val2,
+        });
+        func2.body.push(Statement::Store {
+            pointer: ptr2,
+            value: val2,
+        });
+
+        module.entry_points.push(nxpu_ir::EntryPoint {
+            name: "ep1".into(),
+            workgroup_size: [1, 1, 1],
+            function: func1,
+        });
+        module.entry_points.push(nxpu_ir::EntryPoint {
+            name: "ep2".into(),
+            workgroup_size: [1, 1, 1],
+            function: func2,
+        });
+
+        let schedules = compute_schedules(&module);
+        assert_eq!(schedules.len(), 2);
+        assert_eq!(schedules[0].0, "ep1");
+        assert_eq!(schedules[1].0, "ep2");
+        assert_eq!(schedules[0].2.total_ops(), 1);
+        assert_eq!(schedules[1].2.total_ops(), 2);
+    }
+
+    #[test]
+    fn format_schedule_with_critical_path() {
+        let mut func = Function::new("test");
+        let gv = dummy_gv_handle();
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+
+        // Create a chain to produce a non-empty critical path
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        let (dfg, schedule) = schedule_function(&func);
+        let output = format_schedule("test_chain", &dfg, &schedule);
+        assert!(output.contains("test_chain"));
+        assert!(output.contains("Nodes: 3"));
+        assert!(output.contains("Critical path:"));
+    }
+
+    #[test]
+    fn schedule_display_with_ops() {
+        let mut func = Function::new("test");
+        let gv = dummy_gv_handle();
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        let (_, schedule) = schedule_function(&func);
+        let s = format!("{schedule}");
+        assert!(s.contains("Schedule (2 slots, 2 ops):"));
+        assert!(s.contains("t=0"));
+        assert!(s.contains("t=1"));
+    }
+
+    #[test]
+    fn schedule_is_valid_missing_node() {
+        // Build a DFG with 2 nodes, but schedule only contains 1 node.
+        // The missing node should cause is_valid to return false.
+        let mut func = Function::new("test");
+        let gv = dummy_gv_handle();
+        let ptr = func.expressions.append(Expression::GlobalVariable(gv));
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: val,
+        });
+
+        let dfg = DataflowGraph::build(&func);
+        // Only schedule node 0, missing node 1
+        let partial = Schedule {
+            slots: vec![ScheduleSlot {
+                time: 0,
+                ops: vec![0],
+            }],
+        };
+        // The edge from 0->1 exists, but node 1 has no time slot -> invalid
+        assert!(!partial.is_valid(&dfg));
+    }
 }
