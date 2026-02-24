@@ -540,9 +540,8 @@ pub fn classify_entry_point(
             }
 
             // ElementWise with embedded weight: 1 storage input + binary op + private init global.
-            if let Some(ew_op) = find_store_binary_op(&ep.function.body, &ep.function.expressions)
-                && let Some(&(wh, wgv)) = init_globals.first()
-            {
+            let ew_op = find_store_binary_op(&ep.function.body, &ep.function.expressions);
+            if let (Some(ew_op), Some(&(wh, wgv))) = (ew_op, init_globals.first()) {
                 let weight = make_binding(module, wh, wgv, TensorRole::Input);
                 let dim_name = shape_names.first().cloned().unwrap_or_else(|| "N".into());
                 return Ok(KernelPattern::ElementWise {
@@ -760,25 +759,32 @@ fn extract_loop_bound_literals(body: &[Statement], exprs: &Arena<Expression>) ->
                     reject,
                 }) = body.iter().find(|s| !matches!(s, Statement::Emit(_)))
                 {
-                    if accept.is_empty()
-                        && matches!(reject.as_slice(), [Statement::Break])
-                        && let Some(&Expression::Binary {
+                    let rhs = match exprs.try_get(*condition) {
+                        Some(&Expression::Binary {
                             op: BinaryOp::Less | BinaryOp::LessEqual,
                             right,
                             ..
-                        }) = exprs.try_get(*condition)
-                        && let Some(&Expression::Literal(Literal::U32(n))) = exprs.try_get(right)
-                    {
-                        bounds.push(n);
-                    } else if reject.is_empty()
-                        && matches!(accept.as_slice(), [Statement::Break])
-                        && let Some(&Expression::Binary {
+                        }) if accept.is_empty()
+                            && matches!(reject.as_slice(), [Statement::Break]) =>
+                        {
+                            Some(right)
+                        }
+                        Some(&Expression::Binary {
                             op: BinaryOp::GreaterEqual | BinaryOp::Greater,
                             right,
                             ..
-                        }) = exprs.try_get(*condition)
-                        && let Some(&Expression::Literal(Literal::U32(n))) = exprs.try_get(right)
-                    {
+                        }) if reject.is_empty()
+                            && matches!(accept.as_slice(), [Statement::Break]) =>
+                        {
+                            Some(right)
+                        }
+                        _ => None,
+                    };
+                    let bound = rhs.and_then(|h| exprs.try_get(h)).and_then(|e| match *e {
+                        Expression::Literal(Literal::U32(n)) => Some(n),
+                        _ => None,
+                    });
+                    if let Some(n) = bound {
                         bounds.push(n);
                     }
                 }
@@ -809,13 +815,9 @@ fn extract_multiply_literals(exprs: &Arena<Expression>) -> Vec<u32> {
         else {
             continue;
         };
-        if let Some(&Expression::Literal(Literal::U32(n))) = exprs.try_get(*right)
-            && n > 1
-        {
+        if let Some(&Expression::Literal(Literal::U32(n @ 2..))) = exprs.try_get(*right) {
             strides.push(n);
-        } else if let Some(&Expression::Literal(Literal::U32(n))) = exprs.try_get(*left)
-            && n > 1
-        {
+        } else if let Some(&Expression::Literal(Literal::U32(n @ 2..))) = exprs.try_get(*left) {
             strides.push(n);
         }
     }
@@ -837,9 +839,7 @@ fn extract_subtract_literals(exprs: &Arena<Expression>) -> Vec<u32> {
         else {
             continue;
         };
-        if let Some(&Expression::Literal(Literal::U32(n))) = exprs.try_get(*right)
-            && n > 0
-        {
+        if let Some(&Expression::Literal(Literal::U32(n @ 1..))) = exprs.try_get(*right) {
             pads.push(n);
         }
     }
