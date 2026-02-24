@@ -45,6 +45,10 @@ struct Cli {
     #[arg(long, default_value = "auto", value_parser = parse_precision)]
     precision: PrecisionPolicy,
 
+    /// Mark the first dimension of all input tensors as dynamic (variable batch size)
+    #[arg(long)]
+    dynamic_batch: bool,
+
     /// List all available target backends and exit
     #[arg(long)]
     list_targets: bool,
@@ -144,6 +148,12 @@ fn run() -> miette::Result<()> {
 
     // 3. Optimize.
     PassManager::for_level(cli.opt_level).run(&mut module);
+
+    // 3b. Apply --dynamic-batch: mark the first dimension of all input
+    //     storage buffer tensor types as Symbolic("batch").
+    if cli.dynamic_batch {
+        apply_dynamic_batch(&mut module);
+    }
 
     // 4. Optionally dump IR to stderr.
     if cli.emit_ir {
@@ -253,6 +263,78 @@ fn run() -> miette::Result<()> {
     Ok(())
 }
 
+/// Apply `--dynamic-batch`: for every storage-buffer global variable whose
+/// type is an `Array` (the common WGSL pattern), wrap it in a rank-2+ Tensor
+/// type with the first dimension set to `Symbolic("batch")`.
+///
+/// This is a best-effort transformation: it only affects storage buffers
+/// (both read-only and read-write), leaving uniforms and other address spaces
+/// untouched.
+fn apply_dynamic_batch(module: &mut nxpu_ir::Module) {
+    use nxpu_ir::{AddressSpace, Dimension, Scalar, TensorShape, Type, TypeInner};
+
+    // Collect storage variable handles and their current array element scalar.
+    let targets: Vec<(nxpu_ir::Handle<nxpu_ir::GlobalVariable>, Scalar)> = module
+        .global_variables
+        .iter()
+        .filter_map(|(handle, gv)| {
+            if let AddressSpace::Storage { .. } = &gv.space {
+                match &module.types[gv.ty].inner {
+                    TypeInner::Array { base, .. } => {
+                        if let TypeInner::Scalar(s) = &module.types[*base].inner {
+                            return Some((handle, *s));
+                        }
+                    }
+                    TypeInner::Tensor { scalar, .. } => {
+                        return Some((handle, *scalar));
+                    }
+                    _ => {}
+                }
+            }
+            None
+        })
+        .collect();
+
+    for (handle, scalar) in targets {
+        let gv = &module.global_variables[handle];
+        let old_ty = gv.ty;
+        let new_ty = match &module.types[old_ty].inner {
+            TypeInner::Array { .. } => {
+                // Convert array<scalar> to tensor<scalar>[batch, ?]
+                module.types.insert(Type {
+                    name: None,
+                    inner: TypeInner::Tensor {
+                        scalar,
+                        shape: TensorShape {
+                            dims: vec![
+                                Dimension::Symbolic("batch".into()),
+                                Dimension::Dynamic(None),
+                            ],
+                        },
+                    },
+                })
+            }
+            TypeInner::Tensor { shape, .. } => {
+                // Tensor type: replace the first dimension with Symbolic("batch")
+                let mut new_dims = shape.dims.clone();
+                if !new_dims.is_empty() {
+                    new_dims[0] = Dimension::Symbolic("batch".into());
+                }
+                module.types.insert(Type {
+                    name: None,
+                    inner: TypeInner::Tensor {
+                        scalar,
+                        shape: TensorShape { dims: new_dims },
+                    },
+                })
+            }
+            _ => continue,
+        };
+        // Update the global variable to use the new type.
+        module.global_variables[handle].ty = new_ty;
+    }
+}
+
 fn write_output_file(path: &std::path::Path, content: &OutputContent) -> miette::Result<()> {
     match content {
         OutputContent::Text(text) => std::fs::write(path, text),
@@ -279,6 +361,7 @@ mod tests {
         assert!(!cli.emit_ir);
         assert!(!cli.emit_memory_plan);
         assert!(!cli.dry_run);
+        assert!(!cli.dynamic_batch);
         assert_eq!(cli.precision, PrecisionPolicy::Auto);
         assert!(!cli.list_targets);
     }
@@ -315,6 +398,12 @@ mod tests {
             Cli::try_parse_from(["nxpu", "in.wgsl", "-t", "tflite", "-o", "out.tflite"]).unwrap();
         assert_eq!(cli.target, "tflite");
         assert_eq!(cli.output.unwrap(), PathBuf::from("out.tflite"));
+    }
+
+    #[test]
+    fn cli_dynamic_batch_flag() {
+        let cli = Cli::try_parse_from(["nxpu", "model.wgsl", "--dynamic-batch"]).unwrap();
+        assert!(cli.dynamic_batch);
     }
 
     #[test]
@@ -456,6 +545,129 @@ mod tests {
         let msg = format!("unknown target 'bogus' (available: {available})");
         assert!(msg.contains("bogus"));
         assert!(msg.contains("ir-dump"));
+    }
+
+    // ---- apply_dynamic_batch ----
+
+    #[test]
+    fn apply_dynamic_batch_rewrites_array_to_tensor() {
+        use nxpu_ir::*;
+
+        let mut module = Module::default();
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let array_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+        let handle = module.global_variables.append(GlobalVariable {
+            name: Some("input".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: None,
+            ty: array_ty,
+            init: None,
+            layout: None,
+        });
+
+        apply_dynamic_batch(&mut module);
+
+        let new_ty = &module.types[module.global_variables[handle].ty].inner;
+        match new_ty {
+            TypeInner::Tensor { scalar, shape } => {
+                assert_eq!(*scalar, Scalar::F32);
+                assert_eq!(shape.rank(), 2);
+                assert_eq!(shape.dims[0], Dimension::Symbolic("batch".into()));
+                assert_eq!(shape.dims[1], Dimension::Dynamic(None));
+            }
+            _ => panic!("expected Tensor type after apply_dynamic_batch"),
+        }
+    }
+
+    #[test]
+    fn apply_dynamic_batch_rewrites_existing_tensor() {
+        use nxpu_ir::*;
+
+        let mut module = Module::default();
+        let tensor_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Tensor {
+                scalar: Scalar::F32,
+                shape: TensorShape {
+                    dims: vec![
+                        Dimension::Fixed(1),
+                        Dimension::Fixed(224),
+                        Dimension::Fixed(224),
+                        Dimension::Fixed(3),
+                    ],
+                },
+            },
+        });
+        let handle = module.global_variables.append(GlobalVariable {
+            name: Some("image".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: None,
+            ty: tensor_ty,
+            init: None,
+            layout: None,
+        });
+
+        apply_dynamic_batch(&mut module);
+
+        let new_ty = &module.types[module.global_variables[handle].ty].inner;
+        match new_ty {
+            TypeInner::Tensor { shape, .. } => {
+                assert_eq!(shape.dims[0], Dimension::Symbolic("batch".into()));
+                assert_eq!(shape.dims[1], Dimension::Fixed(224));
+                assert_eq!(shape.dims[2], Dimension::Fixed(224));
+                assert_eq!(shape.dims[3], Dimension::Fixed(3));
+            }
+            _ => panic!("expected Tensor type"),
+        }
+    }
+
+    #[test]
+    fn apply_dynamic_batch_skips_uniform() {
+        use nxpu_ir::*;
+
+        let mut module = Module::default();
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members: vec![StructMember {
+                    name: Some("N".into()),
+                    ty: u32_ty,
+                    offset: 0,
+                }],
+                span: 4,
+            },
+        });
+        let handle = module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: None,
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        apply_dynamic_batch(&mut module);
+
+        // Uniform variable should not be modified.
+        assert_eq!(module.global_variables[handle].ty, params_ty);
     }
 
     #[test]
