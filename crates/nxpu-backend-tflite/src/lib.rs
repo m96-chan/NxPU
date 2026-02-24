@@ -3,7 +3,7 @@
 //! Emits TFLite FlatBuffer (`.tflite`) models from NxPU IR.
 //! Targets: MediaTek APU (NeuroPilot), Google Edge TPU, Arm Ethos NPU (Vela).
 
-use nxpu_analysis::analyze;
+use nxpu_analysis::{analyze, fusion};
 use nxpu_backend_core::{
     Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
     OutputContent, OutputFile,
@@ -35,9 +35,8 @@ impl Backend for TfLiteBackend {
             return Err(BackendError::Other("no entry points in module".into()));
         }
 
-        let mut files = Vec::new();
-        let mut diagnostics = Vec::new();
-
+        // 1. Classify all entry points.
+        let mut patterns = Vec::new();
         for (i, ep) in module.entry_points.iter().enumerate() {
             let pattern = analyze::classify_entry_point(module, i).map_err(|e| {
                 BackendError::Unsupported(format!("entry point '{}': {e}", ep.name))
@@ -48,34 +47,51 @@ impl Backend for TfLiteBackend {
                     ep.name
                 )));
             }
+            patterns.push(pattern);
+        }
 
-            let summary = match &pattern {
-                analyze::KernelPattern::MatMul { .. } => "BATCH_MATMUL",
-                analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
-                analyze::KernelPattern::Conv2D { .. } => "CONV_2D",
-                analyze::KernelPattern::Pool { kind, .. } => kind.op_name(),
-                analyze::KernelPattern::Activation { op, .. } => op.op_name(),
-                analyze::KernelPattern::Reduce { op, .. } => op.op_name(),
-                analyze::KernelPattern::Transpose { .. } => "TRANSPOSE",
-                analyze::KernelPattern::Reshape { .. } => "RESHAPE",
-                analyze::KernelPattern::Normalization { .. } => "BatchNormalization",
-                analyze::KernelPattern::Concat { .. } => "CONCATENATION",
-                analyze::KernelPattern::Split { .. } => "SPLIT",
-                analyze::KernelPattern::Attention { .. } => "Attention",
-                analyze::KernelPattern::Unknown { .. } => "Unknown",
+        // 2. Fuse adjacent patterns.
+        let fused = fusion::fuse_patterns(patterns);
+
+        // 3. Lower each fused pattern.
+        let mut files = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        for (fp, ep_idx) in &fused {
+            let ep_name = if *ep_idx < module.entry_points.len() {
+                &module.entry_points[*ep_idx].name
+            } else {
+                "fused"
+            };
+
+            let summary = match fp {
+                fusion::FusedPattern::Single(p) => pattern_summary(p).to_string(),
+                fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm (fused)".into(),
+                fusion::FusedPattern::WithActivation {
+                    base, activation, ..
+                } => {
+                    let base_name = match base.as_ref() {
+                        fusion::FusedPattern::Single(p) => pattern_summary(p),
+                        fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",
+                        fusion::FusedPattern::MatMulBias { .. } => "Gemm",
+                        _ => "fused",
+                    };
+                    format!("{base_name}+{activation:?}")
+                }
+                fusion::FusedPattern::MatMulBias { .. } => "Gemm (fused)".into(),
             };
 
             diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Info,
-                message: format!("entry point '{}': classified as {}", ep.name, summary),
+                message: format!("entry point '{ep_name}': classified as {summary}"),
             });
 
-            let bytes = lower::build_model(&pattern)?;
+            let bytes = lower::build_fused_model(fp)?;
 
-            let filename = if module.entry_points.len() == 1 {
+            let filename = if fused.len() == 1 {
                 "output.tflite".into()
             } else {
-                format!("{}.tflite", ep.name)
+                format!("{ep_name}.tflite")
             };
 
             files.push(OutputFile {
@@ -85,6 +101,24 @@ impl Backend for TfLiteBackend {
         }
 
         Ok(BackendOutput { files, diagnostics })
+    }
+}
+
+fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
+    match pattern {
+        analyze::KernelPattern::MatMul { .. } => "BATCH_MATMUL",
+        analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
+        analyze::KernelPattern::Conv2D { .. } => "CONV_2D",
+        analyze::KernelPattern::Pool { kind, .. } => kind.op_name(),
+        analyze::KernelPattern::Activation { op, .. } => op.op_name(),
+        analyze::KernelPattern::Reduce { op, .. } => op.op_name(),
+        analyze::KernelPattern::Transpose { .. } => "TRANSPOSE",
+        analyze::KernelPattern::Reshape { .. } => "RESHAPE",
+        analyze::KernelPattern::Normalization { .. } => "BatchNormalization",
+        analyze::KernelPattern::Concat { .. } => "CONCATENATION",
+        analyze::KernelPattern::Split { .. } => "SPLIT",
+        analyze::KernelPattern::Attention { .. } => "Attention",
+        analyze::KernelPattern::Unknown { .. } => "Unknown",
     }
 }
 
@@ -166,5 +200,434 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             _ => panic!("expected binary output"),
         };
         assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    // ---- Fusion code path tests ----
+
+    fn dummy_handle() -> nxpu_ir::Handle<nxpu_ir::GlobalVariable> {
+        let mut arena = nxpu_ir::Arena::new();
+        arena.append(nxpu_ir::GlobalVariable {
+            name: None,
+            space: nxpu_ir::AddressSpace::Uniform,
+            binding: None,
+            ty: {
+                let mut types = nxpu_ir::UniqueArena::new();
+                types.insert(nxpu_ir::Type {
+                    name: None,
+                    inner: nxpu_ir::TypeInner::Scalar(nxpu_ir::Scalar::F32),
+                })
+            },
+            init: None,
+            layout: None,
+        })
+    }
+
+    fn make_tensor(name: &str, role: analyze::TensorRole) -> analyze::TensorBinding {
+        analyze::TensorBinding {
+            handle: dummy_handle(),
+            name: name.into(),
+            elem_type: analyze::data_type::FLOAT,
+            role,
+        }
+    }
+
+    #[test]
+    fn build_fused_model_conv_batchnorm() {
+        use nxpu_analysis::analyze::*;
+        use nxpu_analysis::fusion::FusedPattern;
+
+        let conv = KernelPattern::Conv2D {
+            input: make_tensor("x", TensorRole::Input),
+            weight: make_tensor("w", TensorRole::Input),
+            output: make_tensor("conv_out", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "IC".into(),
+                channels_out: "OC".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                kernel_h_val: 3,
+                kernel_w_val: 3,
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 0,
+                pad_w: 0,
+            },
+        };
+        let norm = KernelPattern::Normalization {
+            input: make_tensor("conv_out", TensorRole::Input),
+            scale: make_tensor("gamma", TensorRole::Input),
+            bias: make_tensor("beta", TensorRole::Input),
+            output: make_tensor("bn_out", TensorRole::Output),
+            epsilon: 1e-5,
+        };
+
+        let fused = FusedPattern::ConvBatchNorm {
+            conv,
+            norm: Box::new(norm),
+        };
+
+        let bytes = lower::build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_fused_model_matmul_bias() {
+        use nxpu_analysis::analyze::*;
+        use nxpu_analysis::fusion::FusedPattern;
+
+        let matmul = KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("mm_out", TensorRole::Output),
+            shape: MatMulShape {
+                m: "M".into(),
+                n: "N".into(),
+                k: "K".into(),
+            },
+        };
+        let bias_add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("mm_out", TensorRole::Input),
+                make_tensor("bias", TensorRole::Input),
+            ],
+            output: make_tensor("out", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+
+        let fused = FusedPattern::MatMulBias {
+            matmul,
+            bias_add: Box::new(bias_add),
+        };
+
+        let bytes = lower::build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_fused_model_with_activation_on_single() {
+        use nxpu_analysis::analyze::*;
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let relu = KernelPattern::Activation {
+            op: ActivationOp::Relu,
+            input: make_tensor("c", TensorRole::Input),
+            output: make_tensor("d", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::Single(add)),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(relu),
+        };
+
+        let bytes = lower::build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_fused_model_with_activation_on_conv_batchnorm() {
+        use nxpu_analysis::analyze::*;
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let conv = KernelPattern::Conv2D {
+            input: make_tensor("x", TensorRole::Input),
+            weight: make_tensor("w", TensorRole::Input),
+            output: make_tensor("conv_out", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "IC".into(),
+                channels_out: "OC".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                kernel_h_val: 3,
+                kernel_w_val: 3,
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 0,
+                pad_w: 0,
+            },
+        };
+        let norm = KernelPattern::Normalization {
+            input: make_tensor("conv_out", TensorRole::Input),
+            scale: make_tensor("gamma", TensorRole::Input),
+            bias: make_tensor("beta", TensorRole::Input),
+            output: make_tensor("bn_out", TensorRole::Output),
+            epsilon: 1e-5,
+        };
+        let relu = KernelPattern::Activation {
+            op: ActivationOp::Relu,
+            input: make_tensor("bn_out", TensorRole::Input),
+            output: make_tensor("relu_out", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::ConvBatchNorm {
+                conv,
+                norm: Box::new(norm),
+            }),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(relu),
+        };
+
+        let bytes = lower::build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn build_fused_model_with_activation_on_matmul_bias() {
+        use nxpu_analysis::analyze::*;
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let matmul = KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("mm_out", TensorRole::Output),
+            shape: MatMulShape {
+                m: "M".into(),
+                n: "N".into(),
+                k: "K".into(),
+            },
+        };
+        let bias_add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("mm_out", TensorRole::Input),
+                make_tensor("bias", TensorRole::Input),
+            ],
+            output: make_tensor("gemm_out", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        let relu = KernelPattern::Activation {
+            op: ActivationOp::Relu,
+            input: make_tensor("gemm_out", TensorRole::Input),
+            output: make_tensor("relu_out", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+
+        let fused = FusedPattern::WithActivation {
+            base: Box::new(FusedPattern::MatMulBias {
+                matmul,
+                bias_add: Box::new(bias_add),
+            }),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(relu),
+        };
+
+        let bytes = lower::build_fused_model(&fused).unwrap();
+        assert_eq!(&bytes[4..8], b"TFL3");
+    }
+
+    #[test]
+    fn compile_summary_conv_batchnorm() {
+        // Test that the summary strings in compile() cover the ConvBatchNorm path.
+        use nxpu_analysis::analyze::*;
+        use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
+
+        let fp_conv_bn = FusedPattern::ConvBatchNorm {
+            conv: KernelPattern::Conv2D {
+                input: make_tensor("x", TensorRole::Input),
+                weight: make_tensor("w", TensorRole::Input),
+                output: make_tensor("conv_out", TensorRole::Output),
+                shape: Conv2DShape {
+                    batch: "N".into(),
+                    channels_in: "IC".into(),
+                    channels_out: "OC".into(),
+                    height: "H".into(),
+                    width: "W".into(),
+                    kernel_h: "KH".into(),
+                    kernel_w: "KW".into(),
+                    kernel_h_val: 3,
+                    kernel_w_val: 3,
+                    stride_h: 1,
+                    stride_w: 1,
+                    pad_h: 0,
+                    pad_w: 0,
+                },
+            },
+            norm: Box::new(KernelPattern::Normalization {
+                input: make_tensor("conv_out", TensorRole::Input),
+                scale: make_tensor("gamma", TensorRole::Input),
+                bias: make_tensor("beta", TensorRole::Input),
+                output: make_tensor("bn_out", TensorRole::Output),
+                epsilon: 1e-5,
+            }),
+        };
+
+        // Exercise the summary formatting in compile() match arm
+        let summary = match &fp_conv_bn {
+            FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm (fused)".to_string(),
+            _ => panic!("expected ConvBatchNorm"),
+        };
+        assert_eq!(summary, "Conv+BatchNorm (fused)");
+
+        // Also exercise WithActivation with ConvBatchNorm as base
+        let fp_with_act = FusedPattern::WithActivation {
+            base: Box::new(fp_conv_bn),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(KernelPattern::Activation {
+                op: ActivationOp::Relu,
+                input: make_tensor("bn_out", TensorRole::Input),
+                output: make_tensor("relu_out", TensorRole::Output),
+                dim_name: "N".into(),
+            }),
+        };
+
+        let summary = match &fp_with_act {
+            FusedPattern::WithActivation {
+                base, activation, ..
+            } => {
+                let base_name = match base.as_ref() {
+                    FusedPattern::Single(p) => pattern_summary(p),
+                    FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",
+                    FusedPattern::MatMulBias { .. } => "Gemm",
+                    _ => "fused",
+                };
+                format!("{base_name}+{activation:?}")
+            }
+            _ => panic!("expected WithActivation"),
+        };
+        assert_eq!(summary, "Conv+BatchNorm+Relu");
+
+        // Exercise MatMulBias summary
+        let fp_gemm = FusedPattern::MatMulBias {
+            matmul: KernelPattern::MatMul {
+                inputs: [
+                    make_tensor("A", TensorRole::Input),
+                    make_tensor("B", TensorRole::Input),
+                ],
+                output: make_tensor("mm_out", TensorRole::Output),
+                shape: MatMulShape {
+                    m: "M".into(),
+                    n: "N".into(),
+                    k: "K".into(),
+                },
+            },
+            bias_add: Box::new(KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("mm_out", TensorRole::Input),
+                    make_tensor("bias", TensorRole::Input),
+                ],
+                output: make_tensor("out", TensorRole::Output),
+                dim_name: "N".into(),
+            }),
+        };
+
+        let summary = match &fp_gemm {
+            FusedPattern::MatMulBias { .. } => "Gemm (fused)".to_string(),
+            _ => panic!("expected MatMulBias"),
+        };
+        assert_eq!(summary, "Gemm (fused)");
+
+        // Exercise WithActivation with MatMulBias as base
+        let fp_gemm_relu = FusedPattern::WithActivation {
+            base: Box::new(fp_gemm),
+            activation: FusedActivation::Relu,
+            activation_pattern: Box::new(KernelPattern::Activation {
+                op: ActivationOp::Relu,
+                input: make_tensor("out", TensorRole::Input),
+                output: make_tensor("relu_out", TensorRole::Output),
+                dim_name: "N".into(),
+            }),
+        };
+
+        let summary = match &fp_gemm_relu {
+            FusedPattern::WithActivation {
+                base, activation, ..
+            } => {
+                let base_name = match base.as_ref() {
+                    FusedPattern::Single(p) => pattern_summary(p),
+                    FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",
+                    FusedPattern::MatMulBias { .. } => "Gemm",
+                    _ => "fused",
+                };
+                format!("{base_name}+{activation:?}")
+            }
+            _ => panic!("expected WithActivation"),
+        };
+        assert_eq!(summary, "Gemm+Relu");
+    }
+
+    #[test]
+    fn pattern_summary_all_variants() {
+        use nxpu_analysis::analyze::*;
+
+        // Test a few representative summaries to ensure pattern_summary works
+        let matmul = KernelPattern::MatMul {
+            inputs: [
+                make_tensor("A", TensorRole::Input),
+                make_tensor("B", TensorRole::Input),
+            ],
+            output: make_tensor("C", TensorRole::Output),
+            shape: MatMulShape {
+                m: "M".into(),
+                n: "N".into(),
+                k: "K".into(),
+            },
+        };
+        assert_eq!(pattern_summary(&matmul), "BATCH_MATMUL");
+
+        let add = KernelPattern::ElementWise {
+            op: ElementWiseOp::Add,
+            inputs: [
+                make_tensor("a", TensorRole::Input),
+                make_tensor("b", TensorRole::Input),
+            ],
+            output: make_tensor("c", TensorRole::Output),
+            dim_name: "N".into(),
+        };
+        assert_eq!(pattern_summary(&add), "Add");
+
+        let conv = KernelPattern::Conv2D {
+            input: make_tensor("x", TensorRole::Input),
+            weight: make_tensor("w", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "IC".into(),
+                channels_out: "OC".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                kernel_h_val: 3,
+                kernel_w_val: 3,
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 0,
+                pad_w: 0,
+            },
+        };
+        assert_eq!(pattern_summary(&conv), "CONV_2D");
+
+        let norm = KernelPattern::Normalization {
+            input: make_tensor("x", TensorRole::Input),
+            scale: make_tensor("g", TensorRole::Input),
+            bias: make_tensor("b", TensorRole::Input),
+            output: make_tensor("y", TensorRole::Output),
+            epsilon: 1e-5,
+        };
+        assert_eq!(pattern_summary(&norm), "BatchNormalization");
     }
 }

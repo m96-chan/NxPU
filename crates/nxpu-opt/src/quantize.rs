@@ -9,6 +9,7 @@
 use nxpu_ir::{Handle, Module, Scalar, Type, TypeInner};
 
 use crate::Pass;
+use crate::calibrate::CalibrationResult;
 
 /// Parameters describing how floating-point values were quantized to integers.
 ///
@@ -477,7 +478,9 @@ impl Pass for F32ToBf16 {
 /// Converts `array<f32>` global variables to `array<i8>`.
 ///
 /// When calibration data is provided, computes proper scale/zero_point
-/// per tensor from observed min/max ranges.
+/// per tensor from observed min/max ranges. When a `CalibrationResult`
+/// is attached, calibrated parameters are available for downstream
+/// backends to emit quantization metadata (QDQ nodes, TFLite quant params).
 #[derive(Debug)]
 pub struct F32ToInt8 {
     /// Per-tensor quantization parameters.
@@ -486,6 +489,8 @@ pub struct F32ToInt8 {
     pub calibration: Option<CalibrationData>,
     /// Per-tensor computed parameters (populated after run).
     pub tensor_params: Vec<(u32, u32, QuantizationParams)>,
+    /// Optional calibration result from the calibration pipeline.
+    pub calibration_result: Option<CalibrationResult>,
 }
 
 impl Default for F32ToInt8 {
@@ -497,6 +502,7 @@ impl Default for F32ToInt8 {
             },
             calibration: None,
             tensor_params: Vec::new(),
+            calibration_result: None,
         }
     }
 }
@@ -511,6 +517,20 @@ impl F32ToInt8 {
             },
             calibration: Some(calibration),
             tensor_params: Vec::new(),
+            calibration_result: None,
+        }
+    }
+
+    /// Create with a calibration result from the calibration pipeline.
+    pub fn with_calibration_result(result: CalibrationResult) -> Self {
+        Self {
+            params: QuantizationParams {
+                scale: 1.0,
+                zero_point: 0,
+            },
+            calibration: None,
+            tensor_params: Vec::new(),
+            calibration_result: Some(result),
         }
     }
 }
@@ -521,6 +541,10 @@ impl Pass for F32ToInt8 {
     }
 
     fn run(&self, module: &mut Module) -> bool {
+        // Log calibration info if available.
+        if let Some(result) = &self.calibration_result {
+            result.log_summary();
+        }
         // Note: calibration data is used by downstream ONNX QDQ emission
         // and TFLite quantization metadata, not during type rewriting.
         rewrite_elem_precision(module, Scalar::I8)
@@ -824,5 +848,254 @@ mod tests {
         let changed = pass.run(&mut module);
         assert!(changed);
         assert_eq!(get_array_elem_scalar(&module, h0), Scalar::I8);
+    }
+
+    // ---- Tensor type rewriting tests ----
+
+    fn make_f32_tensor_module() -> (Module, Handle<GlobalVariable>, Handle<GlobalVariable>) {
+        let mut module = Module::default();
+
+        let tensor_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Tensor {
+                scalar: Scalar::F32,
+                shape: TensorShape::fixed(&[1, 3, 224, 224]),
+            },
+        });
+
+        let h0 = module.global_variables.append(GlobalVariable {
+            name: Some("weights".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: tensor_f32,
+            init: None,
+            layout: None,
+        });
+        let h1 = module.global_variables.append(GlobalVariable {
+            name: Some("bias".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 1,
+            }),
+            ty: tensor_f32,
+            init: None,
+            layout: None,
+        });
+
+        (module, h0, h1)
+    }
+
+    fn get_tensor_scalar(module: &Module, gv_handle: Handle<GlobalVariable>) -> Scalar {
+        let ty = &module.types[module.global_variables[gv_handle].ty];
+        match &ty.inner {
+            TypeInner::Tensor { scalar, .. } => *scalar,
+            other => panic!("expected Tensor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f32_to_f16_tensor_type() {
+        let (mut module, h0, h1) = make_f32_tensor_module();
+        let changed = F32ToF16.run(&mut module);
+        assert!(changed);
+        assert_eq!(get_tensor_scalar(&module, h0), Scalar::F16);
+        assert_eq!(get_tensor_scalar(&module, h1), Scalar::F16);
+    }
+
+    #[test]
+    fn f32_to_bf16_tensor_type() {
+        let (mut module, h0, _h1) = make_f32_tensor_module();
+        let changed = F32ToBf16.run(&mut module);
+        assert!(changed);
+        assert_eq!(get_tensor_scalar(&module, h0), Scalar::BF16);
+    }
+
+    #[test]
+    fn f32_to_int8_tensor_type() {
+        let (mut module, h0, _h1) = make_f32_tensor_module();
+        let changed = F32ToInt8::default().run(&mut module);
+        assert!(changed);
+        assert_eq!(get_tensor_scalar(&module, h0), Scalar::I8);
+    }
+
+    #[test]
+    fn tensor_type_idempotent() {
+        let (mut module, _h0, _h1) = make_f32_tensor_module();
+        F32ToF16.run(&mut module);
+        let changed = F32ToF16.run(&mut module);
+        assert!(!changed);
+    }
+
+    // ---- with_calibration_result and log_summary path ----
+
+    #[test]
+    fn int8_with_calibration_result() {
+        use crate::calibrate::CalibrationResult;
+
+        let result = CalibrationResult {
+            tensor_params: vec![
+                (
+                    "weights".into(),
+                    QuantizationParams {
+                        scale: 0.05,
+                        zero_point: 0,
+                    },
+                ),
+                (
+                    "bias".into(),
+                    QuantizationParams {
+                        scale: 0.01,
+                        zero_point: 3,
+                    },
+                ),
+            ],
+            weight_params: Vec::new(),
+            method: None,
+        };
+
+        let (mut module, h0, _h1) = make_f32_array_module();
+        let pass = F32ToInt8::with_calibration_result(result);
+
+        // Verify the calibration_result is stored
+        assert!(pass.calibration_result.is_some());
+
+        let changed = pass.run(&mut module);
+        assert!(changed);
+        assert_eq!(get_array_elem_scalar(&module, h0), Scalar::I8);
+    }
+
+    #[test]
+    fn int8_with_calibration_result_on_tensor_types() {
+        use crate::calibrate::CalibrationResult;
+
+        let result = CalibrationResult {
+            tensor_params: vec![(
+                "weights".into(),
+                QuantizationParams {
+                    scale: 0.05,
+                    zero_point: 0,
+                },
+            )],
+            weight_params: Vec::new(),
+            method: None,
+        };
+
+        let (mut module, h0, _h1) = make_f32_tensor_module();
+        let pass = F32ToInt8::with_calibration_result(result);
+        let changed = pass.run(&mut module);
+        assert!(changed);
+        assert_eq!(get_tensor_scalar(&module, h0), Scalar::I8);
+    }
+
+    // ---- MixedPrecisionPass with Tensor types ----
+
+    #[test]
+    fn mixed_precision_pass_with_tensor_types() {
+        let (mut module, h0, h1) = make_f32_tensor_module();
+
+        let pass = MixedPrecisionPass {
+            policy: MixedPrecisionPolicy {
+                overrides: vec![("weights".into(), LayerPrecision::F16)],
+                default: LayerPrecision::Int8,
+            },
+        };
+        let changed = pass.run(&mut module);
+        assert!(changed);
+
+        // "weights" should be F16
+        assert_eq!(get_tensor_scalar(&module, h0), Scalar::F16);
+        // "bias" should be Int8
+        assert_eq!(get_tensor_scalar(&module, h1), Scalar::I8);
+    }
+
+    #[test]
+    fn mixed_precision_pass_skips_already_at_target() {
+        let mut module = Module::default();
+
+        let tensor_f16 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Tensor {
+                scalar: Scalar::F16,
+                shape: TensorShape::fixed(&[1, 3, 224, 224]),
+            },
+        });
+
+        module.global_variables.append(GlobalVariable {
+            name: Some("already_f16".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: None,
+            ty: tensor_f16,
+            init: None,
+            layout: None,
+        });
+
+        let pass = MixedPrecisionPass {
+            policy: MixedPrecisionPolicy {
+                overrides: vec![],
+                default: LayerPrecision::F16,
+            },
+        };
+        // Should not change since it's already F16
+        let changed = pass.run(&mut module);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn mixed_precision_pass_skips_non_f32() {
+        let mut module = Module::default();
+
+        let tensor_i8 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Tensor {
+                scalar: Scalar::I8,
+                shape: TensorShape::fixed(&[1, 256]),
+            },
+        });
+
+        module.global_variables.append(GlobalVariable {
+            name: Some("quantized".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: None,
+            ty: tensor_i8,
+            init: None,
+            layout: None,
+        });
+
+        let pass = MixedPrecisionPass {
+            policy: MixedPrecisionPolicy {
+                overrides: vec![],
+                default: LayerPrecision::F16,
+            },
+        };
+        // Should not change since source is I8, not F32
+        let changed = pass.run(&mut module);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn mixed_precision_bf16_on_tensor_type() {
+        let (mut module, h0, _h1) = make_f32_tensor_module();
+
+        let pass = MixedPrecisionPass {
+            policy: MixedPrecisionPolicy {
+                overrides: vec![("weights".into(), LayerPrecision::BF16)],
+                default: LayerPrecision::F32,
+            },
+        };
+        let changed = pass.run(&mut module);
+        assert!(changed);
+        assert_eq!(get_tensor_scalar(&module, h0), Scalar::BF16);
     }
 }

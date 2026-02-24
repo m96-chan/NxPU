@@ -265,6 +265,7 @@ pub fn format_type_inner(inner: &TypeInner, types: &UniqueArena<Type>) -> String
                 .iter()
                 .map(|d| match d {
                     crate::Dimension::Fixed(n) => n.to_string(),
+                    crate::Dimension::Symbolic(name) => name.clone(),
                     crate::Dimension::Dynamic(Some(name)) => name.clone(),
                     crate::Dimension::Dynamic(None) => "?".into(),
                 })
@@ -889,6 +890,25 @@ mod tests {
                 &types
             ),
             "tensor<f32>[224, batch, ?]"
+        );
+
+        // Tensor with Symbolic dimension
+        assert_eq!(
+            format_type_inner(
+                &TypeInner::Tensor {
+                    scalar: Scalar::F32,
+                    shape: crate::TensorShape {
+                        dims: vec![
+                            crate::Dimension::Symbolic("batch".into()),
+                            crate::Dimension::Fixed(224),
+                            crate::Dimension::Fixed(224),
+                            crate::Dimension::Fixed(3),
+                        ],
+                    }
+                },
+                &types
+            ),
+            "tensor<f32>[batch, 224, 224, 3]"
         );
     }
 

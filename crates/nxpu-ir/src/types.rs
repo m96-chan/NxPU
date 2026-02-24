@@ -84,13 +84,20 @@ pub enum ArraySize {
     Dynamic,
 }
 
-/// A single tensor dimension: either a fixed size or a named symbolic parameter.
+/// A single tensor dimension: either a fixed size, a named symbolic parameter,
+/// or fully dynamic (unknown at compile time).
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub enum Dimension {
     /// Fixed (static) size known at compile time.
     Fixed(u32),
-    /// Dynamic (symbolic) dimension with an optional name (e.g. "batch").
+    /// Dynamic (unknown) dimension with an optional name (e.g. "batch").
     Dynamic(Option<String>),
+    /// Symbolic dimension with a named constraint (e.g. "batch", "seq_len").
+    ///
+    /// Unlike `Dynamic`, symbolic dimensions carry a semantic constraint:
+    /// all dimensions sharing the same symbolic name must have the same
+    /// runtime value. This enables shape validation across tensor operands.
+    Symbolic(String),
 }
 
 impl Dimension {
@@ -99,16 +106,30 @@ impl Dimension {
         matches!(self, Self::Fixed(_))
     }
 
-    /// Returns `true` if this dimension is dynamic.
+    /// Returns `true` if this dimension is dynamic (either unnamed or named).
     pub fn is_dynamic(&self) -> bool {
         matches!(self, Self::Dynamic(_))
+    }
+
+    /// Returns `true` if this dimension is symbolic (named constraint).
+    pub fn is_symbolic(&self) -> bool {
+        matches!(self, Self::Symbolic(_))
     }
 
     /// Returns the fixed size, if known.
     pub fn fixed_size(&self) -> Option<u32> {
         match self {
             Self::Fixed(n) => Some(*n),
-            Self::Dynamic(_) => None,
+            Self::Dynamic(_) | Self::Symbolic(_) => None,
+        }
+    }
+
+    /// Returns the symbolic name, if any.
+    pub fn symbolic_name(&self) -> Option<&str> {
+        match self {
+            Self::Symbolic(name) => Some(name),
+            Self::Dynamic(Some(name)) => Some(name),
+            _ => None,
         }
     }
 }
@@ -148,12 +169,18 @@ impl TensorShape {
         self.dims.iter().all(|d| d.is_fixed())
     }
 
-    /// Returns `true` if all dimensions are dynamic.
+    /// Returns `true` if all dimensions are dynamic (unnamed).
     pub fn is_fully_dynamic(&self) -> bool {
         self.dims.iter().all(|d| d.is_dynamic())
     }
 
-    /// Returns `true` if the shape contains a mix of static and dynamic dims.
+    /// Returns `true` if any dimension is not statically known
+    /// (either dynamic or symbolic).
+    pub fn has_dynamic_dims(&self) -> bool {
+        self.dims.iter().any(|d| !d.is_fixed())
+    }
+
+    /// Returns `true` if the shape contains a mix of static and dynamic/symbolic dims.
     pub fn is_mixed(&self) -> bool {
         !self.is_fully_static() && !self.is_fully_dynamic()
     }
@@ -330,7 +357,33 @@ mod tests {
         let d = Dimension::Dynamic(Some("batch".into()));
         assert!(!d.is_fixed());
         assert!(d.is_dynamic());
+        assert!(!d.is_symbolic());
         assert_eq!(d.fixed_size(), None);
+        assert_eq!(d.symbolic_name(), Some("batch"));
+    }
+
+    #[test]
+    fn dimension_symbolic() {
+        let d = Dimension::Symbolic("batch".into());
+        assert!(!d.is_fixed());
+        assert!(!d.is_dynamic());
+        assert!(d.is_symbolic());
+        assert_eq!(d.fixed_size(), None);
+        assert_eq!(d.symbolic_name(), Some("batch"));
+    }
+
+    #[test]
+    fn tensor_shape_has_dynamic_dims() {
+        let static_shape = TensorShape::fixed(&[1, 224, 224, 3]);
+        assert!(!static_shape.has_dynamic_dims());
+
+        let mixed_shape = TensorShape {
+            dims: vec![Dimension::Symbolic("batch".into()), Dimension::Fixed(224)],
+        };
+        assert!(mixed_shape.has_dynamic_dims());
+
+        let dynamic_shape = TensorShape::all_dynamic(3);
+        assert!(dynamic_shape.has_dynamic_dims());
     }
 
     #[test]

@@ -12,6 +12,7 @@ use nxpu_opt::{OptLevel, PassManager};
 /// NxPU — WGSL to NPU transpiler
 #[derive(Parser)]
 #[command(version, about)]
+#[allow(clippy::struct_excessive_bools)]
 struct Cli {
     /// Input WGSL file
     input: Option<PathBuf>,
@@ -32,6 +33,14 @@ struct Cli {
     #[arg(long)]
     emit_ir: bool,
 
+    /// Print memory plan to stderr (peak memory, buffer count, reuse ratio)
+    #[arg(long)]
+    emit_memory_plan: bool,
+
+    /// Dump operation schedule to stderr (dataflow analysis + scheduling)
+    #[arg(long)]
+    emit_schedule: bool,
+
     /// Validate and optimize without producing output
     #[arg(long)]
     dry_run: bool,
@@ -40,9 +49,31 @@ struct Cli {
     #[arg(long, default_value = "auto", value_parser = parse_precision)]
     precision: PrecisionPolicy,
 
+    /// Mark the first dimension of all input tensors as dynamic (variable batch size)
+    #[arg(long)]
+    dynamic_batch: bool,
+
+    /// Directory containing calibration data (.bin files with f32 values)
+    #[arg(long)]
+    calibration_data: Option<PathBuf>,
+
+    /// Calibration method: minmax, percentile, kl-divergence (default: minmax)
+    #[arg(long, default_value = "minmax", value_parser = parse_calibration_method)]
+    calibration_method: nxpu_opt::CalibrationMethod,
+
+    /// Verbose output (print calibration statistics, etc.)
+    #[arg(short, long)]
+    verbose: bool,
+
     /// List all available target backends and exit
     #[arg(long)]
     list_targets: bool,
+}
+
+fn parse_calibration_method(s: &str) -> Result<nxpu_opt::CalibrationMethod, String> {
+    nxpu_opt::CalibrationMethod::from_str_name(s).ok_or_else(|| {
+        format!("invalid calibration method '{s}', expected minmax, percentile, or kl-divergence")
+    })
 }
 
 fn parse_precision(s: &str) -> Result<PrecisionPolicy, String> {
@@ -140,9 +171,29 @@ fn run() -> miette::Result<()> {
     // 3. Optimize.
     PassManager::for_level(cli.opt_level).run(&mut module);
 
+    // 3b. Apply --dynamic-batch: mark the first dimension of all input
+    //     storage buffer tensor types as Symbolic("batch").
+    if cli.dynamic_batch {
+        apply_dynamic_batch(&mut module);
+    }
+
     // 4. Optionally dump IR to stderr.
     if cli.emit_ir {
         eprintln!("{}", nxpu_ir::dump_module(&module));
+    }
+
+    // 4b. Memory planning (always computed; optionally printed).
+    let memory_plan = nxpu_opt::plan_memory(&module);
+    if cli.emit_memory_plan {
+        eprint!("{memory_plan}");
+    }
+
+    // 4c. Optionally dump schedule to stderr.
+    if cli.emit_schedule {
+        let schedules = nxpu_opt::compute_schedules(&module);
+        for (name, dfg, schedule) in &schedules {
+            eprintln!("{}", nxpu_opt::format_schedule(name, dfg, schedule));
+        }
     }
 
     // 5. Dry-run: stop here.
@@ -181,7 +232,40 @@ fn run() -> miette::Result<()> {
                 nxpu_opt::F32ToBf16.run(&mut module);
             }
             Precision::Int8 => {
-                nxpu_opt::F32ToInt8::default().run(&mut module);
+                // If calibration data directory is provided, run the calibration pipeline.
+                if let Some(cal_dir) = &cli.calibration_data {
+                    let dataset = nxpu_opt::CalibrationDataset::load_from_dir(cal_dir)
+                        .map_err(|e| miette::miette!("calibration failed: {e}"))?;
+
+                    if cli.verbose {
+                        eprintln!(
+                            "Loaded {} calibration samples from {}",
+                            dataset.num_samples(),
+                            cal_dir.display()
+                        );
+                    }
+
+                    let cal_result = nxpu_opt::run_calibration(
+                        &dataset,
+                        &cli.calibration_method,
+                        true, // symmetric for INT8
+                    )
+                    .map_err(|e| miette::miette!("calibration failed: {e}"))?;
+
+                    if cli.verbose {
+                        eprintln!("Calibration results:");
+                        for (name, params) in &cal_result.tensor_params {
+                            eprintln!(
+                                "  {}: scale={:.6}, zero_point={}",
+                                name, params.scale, params.zero_point
+                            );
+                        }
+                    }
+
+                    nxpu_opt::F32ToInt8::with_calibration_result(cal_result).run(&mut module);
+                } else {
+                    nxpu_opt::F32ToInt8::default().run(&mut module);
+                }
             }
             Precision::F32 => {}
         }
@@ -194,6 +278,7 @@ fn run() -> miette::Result<()> {
             OptLevel::O2 => 2,
         },
         precision: cli.precision,
+        memory_plan: Some(memory_plan),
     };
 
     let output = backend
@@ -241,6 +326,78 @@ fn run() -> miette::Result<()> {
     Ok(())
 }
 
+/// Apply `--dynamic-batch`: for every storage-buffer global variable whose
+/// type is an `Array` (the common WGSL pattern), wrap it in a rank-2+ Tensor
+/// type with the first dimension set to `Symbolic("batch")`.
+///
+/// This is a best-effort transformation: it only affects storage buffers
+/// (both read-only and read-write), leaving uniforms and other address spaces
+/// untouched.
+fn apply_dynamic_batch(module: &mut nxpu_ir::Module) {
+    use nxpu_ir::{AddressSpace, Dimension, Scalar, TensorShape, Type, TypeInner};
+
+    // Collect storage variable handles and their current array element scalar.
+    let targets: Vec<(nxpu_ir::Handle<nxpu_ir::GlobalVariable>, Scalar)> = module
+        .global_variables
+        .iter()
+        .filter_map(|(handle, gv)| {
+            if let AddressSpace::Storage { .. } = &gv.space {
+                match &module.types[gv.ty].inner {
+                    TypeInner::Array { base, .. } => {
+                        if let TypeInner::Scalar(s) = &module.types[*base].inner {
+                            return Some((handle, *s));
+                        }
+                    }
+                    TypeInner::Tensor { scalar, .. } => {
+                        return Some((handle, *scalar));
+                    }
+                    _ => {}
+                }
+            }
+            None
+        })
+        .collect();
+
+    for (handle, scalar) in targets {
+        let gv = &module.global_variables[handle];
+        let old_ty = gv.ty;
+        let new_ty = match &module.types[old_ty].inner {
+            TypeInner::Array { .. } => {
+                // Convert array<scalar> to tensor<scalar>[batch, ?]
+                module.types.insert(Type {
+                    name: None,
+                    inner: TypeInner::Tensor {
+                        scalar,
+                        shape: TensorShape {
+                            dims: vec![
+                                Dimension::Symbolic("batch".into()),
+                                Dimension::Dynamic(None),
+                            ],
+                        },
+                    },
+                })
+            }
+            TypeInner::Tensor { shape, .. } => {
+                // Tensor type: replace the first dimension with Symbolic("batch")
+                let mut new_dims = shape.dims.clone();
+                if !new_dims.is_empty() {
+                    new_dims[0] = Dimension::Symbolic("batch".into());
+                }
+                module.types.insert(Type {
+                    name: None,
+                    inner: TypeInner::Tensor {
+                        scalar,
+                        shape: TensorShape { dims: new_dims },
+                    },
+                })
+            }
+            _ => continue,
+        };
+        // Update the global variable to use the new type.
+        module.global_variables[handle].ty = new_ty;
+    }
+}
+
 fn write_output_file(path: &std::path::Path, content: &OutputContent) -> miette::Result<()> {
     match content {
         OutputContent::Text(text) => std::fs::write(path, text),
@@ -265,8 +422,14 @@ mod tests {
         assert!(cli.output.is_none());
         assert_eq!(cli.opt_level, OptLevel::O1);
         assert!(!cli.emit_ir);
+        assert!(!cli.emit_memory_plan);
+        assert!(!cli.emit_schedule);
         assert!(!cli.dry_run);
+        assert!(!cli.dynamic_batch);
         assert_eq!(cli.precision, PrecisionPolicy::Auto);
+        assert!(cli.calibration_data.is_none());
+        assert_eq!(cli.calibration_method, nxpu_opt::CalibrationMethod::MinMax);
+        assert!(!cli.verbose);
         assert!(!cli.list_targets);
     }
 
@@ -282,6 +445,8 @@ mod tests {
             "--opt-level",
             "2",
             "--emit-ir",
+            "--emit-memory-plan",
+            "--emit-schedule",
             "--precision",
             "f16",
         ])
@@ -291,6 +456,8 @@ mod tests {
         assert_eq!(cli.output.unwrap(), PathBuf::from("out.onnx"));
         assert_eq!(cli.opt_level, OptLevel::O2);
         assert!(cli.emit_ir);
+        assert!(cli.emit_memory_plan);
+        assert!(cli.emit_schedule);
         assert_eq!(cli.precision, PrecisionPolicy::Explicit(Precision::F16));
     }
 
@@ -300,6 +467,12 @@ mod tests {
             Cli::try_parse_from(["nxpu", "in.wgsl", "-t", "tflite", "-o", "out.tflite"]).unwrap();
         assert_eq!(cli.target, "tflite");
         assert_eq!(cli.output.unwrap(), PathBuf::from("out.tflite"));
+    }
+
+    #[test]
+    fn cli_dynamic_batch_flag() {
+        let cli = Cli::try_parse_from(["nxpu", "model.wgsl", "--dynamic-batch"]).unwrap();
+        assert!(cli.dynamic_batch);
     }
 
     #[test]
@@ -443,11 +616,230 @@ mod tests {
         assert!(msg.contains("ir-dump"));
     }
 
+    // ---- apply_dynamic_batch ----
+
+    #[test]
+    fn apply_dynamic_batch_rewrites_array_to_tensor() {
+        use nxpu_ir::*;
+
+        let mut module = Module::default();
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let array_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+        let handle = module.global_variables.append(GlobalVariable {
+            name: Some("input".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: None,
+            ty: array_ty,
+            init: None,
+            layout: None,
+        });
+
+        apply_dynamic_batch(&mut module);
+
+        let new_ty = &module.types[module.global_variables[handle].ty].inner;
+        match new_ty {
+            TypeInner::Tensor { scalar, shape } => {
+                assert_eq!(*scalar, Scalar::F32);
+                assert_eq!(shape.rank(), 2);
+                assert_eq!(shape.dims[0], Dimension::Symbolic("batch".into()));
+                assert_eq!(shape.dims[1], Dimension::Dynamic(None));
+            }
+            _ => panic!("expected Tensor type after apply_dynamic_batch"),
+        }
+    }
+
+    #[test]
+    fn apply_dynamic_batch_rewrites_existing_tensor() {
+        use nxpu_ir::*;
+
+        let mut module = Module::default();
+        let tensor_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Tensor {
+                scalar: Scalar::F32,
+                shape: TensorShape {
+                    dims: vec![
+                        Dimension::Fixed(1),
+                        Dimension::Fixed(224),
+                        Dimension::Fixed(224),
+                        Dimension::Fixed(3),
+                    ],
+                },
+            },
+        });
+        let handle = module.global_variables.append(GlobalVariable {
+            name: Some("image".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: None,
+            ty: tensor_ty,
+            init: None,
+            layout: None,
+        });
+
+        apply_dynamic_batch(&mut module);
+
+        let new_ty = &module.types[module.global_variables[handle].ty].inner;
+        match new_ty {
+            TypeInner::Tensor { shape, .. } => {
+                assert_eq!(shape.dims[0], Dimension::Symbolic("batch".into()));
+                assert_eq!(shape.dims[1], Dimension::Fixed(224));
+                assert_eq!(shape.dims[2], Dimension::Fixed(224));
+                assert_eq!(shape.dims[3], Dimension::Fixed(3));
+            }
+            _ => panic!("expected Tensor type"),
+        }
+    }
+
+    #[test]
+    fn apply_dynamic_batch_skips_uniform() {
+        use nxpu_ir::*;
+
+        let mut module = Module::default();
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members: vec![StructMember {
+                    name: Some("N".into()),
+                    ty: u32_ty,
+                    offset: 0,
+                }],
+                span: 4,
+            },
+        });
+        let handle = module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: None,
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        apply_dynamic_batch(&mut module);
+
+        // Uniform variable should not be modified.
+        assert_eq!(module.global_variables[handle].ty, params_ty);
+    }
+
     #[test]
     fn missing_input_error_message() {
         let err = miette::miette!("input file is required (use --list-targets to list backends)");
         let msg = format!("{err}");
         assert!(msg.contains("input file is required"));
         assert!(msg.contains("--list-targets"));
+    }
+
+    // ---- Calibration CLI flags ----
+
+    #[test]
+    fn cli_calibration_defaults() {
+        let cli = Cli::try_parse_from(["nxpu", "input.wgsl"]).unwrap();
+        assert!(cli.calibration_data.is_none());
+        assert_eq!(cli.calibration_method, nxpu_opt::CalibrationMethod::MinMax);
+        assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn cli_calibration_data_flag() {
+        let cli =
+            Cli::try_parse_from(["nxpu", "input.wgsl", "--calibration-data", "/tmp/cal_data"])
+                .unwrap();
+        assert_eq!(
+            cli.calibration_data.unwrap(),
+            PathBuf::from("/tmp/cal_data")
+        );
+    }
+
+    #[test]
+    fn cli_calibration_method_minmax() {
+        let cli =
+            Cli::try_parse_from(["nxpu", "input.wgsl", "--calibration-method", "minmax"]).unwrap();
+        assert_eq!(cli.calibration_method, nxpu_opt::CalibrationMethod::MinMax);
+    }
+
+    #[test]
+    fn cli_calibration_method_percentile() {
+        let cli = Cli::try_parse_from(["nxpu", "input.wgsl", "--calibration-method", "percentile"])
+            .unwrap();
+        assert_eq!(
+            cli.calibration_method,
+            nxpu_opt::CalibrationMethod::Percentile(99.99)
+        );
+    }
+
+    #[test]
+    fn cli_calibration_method_kl() {
+        let cli = Cli::try_parse_from([
+            "nxpu",
+            "input.wgsl",
+            "--calibration-method",
+            "kl-divergence",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.calibration_method,
+            nxpu_opt::CalibrationMethod::KlDivergence
+        );
+    }
+
+    #[test]
+    fn cli_calibration_method_invalid() {
+        let result = Cli::try_parse_from(["nxpu", "input.wgsl", "--calibration-method", "invalid"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_verbose_flag() {
+        let cli = Cli::try_parse_from(["nxpu", "input.wgsl", "--verbose"]).unwrap();
+        assert!(cli.verbose);
+    }
+
+    #[test]
+    fn cli_verbose_short_flag() {
+        let cli = Cli::try_parse_from(["nxpu", "input.wgsl", "-v"]).unwrap();
+        assert!(cli.verbose);
+    }
+
+    // ---- parse_calibration_method ----
+
+    #[test]
+    fn calibration_method_valid_values() {
+        assert_eq!(
+            parse_calibration_method("minmax").unwrap(),
+            nxpu_opt::CalibrationMethod::MinMax
+        );
+        assert_eq!(
+            parse_calibration_method("percentile").unwrap(),
+            nxpu_opt::CalibrationMethod::Percentile(99.99)
+        );
+        assert_eq!(
+            parse_calibration_method("kl-divergence").unwrap(),
+            nxpu_opt::CalibrationMethod::KlDivergence
+        );
+    }
+
+    #[test]
+    fn calibration_method_invalid_value() {
+        let err = parse_calibration_method("bogus").unwrap_err();
+        assert!(err.contains("invalid calibration method"));
+        assert!(err.contains("bogus"));
     }
 }

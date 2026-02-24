@@ -4,22 +4,36 @@
 //! and built-in optimization passes (constant folding, FMA fusion, dead code
 //! elimination).
 
+pub mod calibrate;
 mod const_fold;
 mod dce;
 mod fma_fusion;
+pub mod fusion;
 pub mod layout;
+pub mod memory;
 pub mod quantize;
+pub mod schedule;
 pub mod shape;
 mod validation;
 
+pub use calibrate::{
+    CalibrationDataset, CalibrationError, CalibrationMethod, CalibrationResult, HistogramCollector,
+    TensorHistogram, calibrate, calibrate_kl_divergence, calibrate_minmax, calibrate_percentile,
+    per_channel_quantize, run_calibration,
+};
 pub use const_fold::ConstantFolding;
 pub use dce::DeadCodeElimination;
 pub use fma_fusion::FmaFusion;
+pub use fusion::OperatorFusion;
 pub use layout::LayoutTransform;
+pub use memory::{LiveInterval, MemoryPlanning, plan_memory};
+// Re-export canonical memory plan types from nxpu-backend-core (via memory module).
+pub use memory::{BufferAllocation, MemoryPlan, TensorId};
 pub use quantize::{
     CalibrationData, F32ToBf16, F32ToF16, F32ToInt8, MixedPrecisionPass, MixedPrecisionPolicy,
-    QuantizationParams,
+    PerChannelQuantParams, QuantizationParams,
 };
+pub use schedule::{Schedule, SchedulePass, ScheduleSlot, compute_schedules, format_schedule};
 pub use shape::ShapeInference;
 pub use validation::{IrValidation, ValidationWarning, collect_warnings};
 
@@ -41,7 +55,7 @@ pub trait Pass: Debug {
 pub enum OptLevel {
     /// No optimizations.
     O0,
-    /// Basic optimizations (constant folding, FMA fusion, DCE).
+    /// Basic optimizations (constant folding, FMA fusion, operator fusion, DCE).
     O1,
     /// Aggressive optimizations (same as O1 for now).
     O2,
@@ -82,6 +96,7 @@ impl PassManager {
                 pm.add_pre_pass(Box::new(IrValidation));
                 pm.add_pass(Box::new(ConstantFolding));
                 pm.add_pass(Box::new(FmaFusion));
+                pm.add_pass(Box::new(OperatorFusion));
                 pm.add_pass(Box::new(DeadCodeElimination));
             }
         }

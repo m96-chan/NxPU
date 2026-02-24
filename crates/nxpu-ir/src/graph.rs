@@ -17,6 +17,19 @@ pub struct NodeId(pub u32);
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub struct EdgeId(pub u32);
 
+/// Activation function that can be fused into a preceding operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationFunction {
+    /// No activation (identity).
+    None,
+    /// Rectified Linear Unit.
+    Relu,
+    /// Sigmoid activation.
+    Sigmoid,
+    /// Hyperbolic tangent.
+    Tanh,
+}
+
 /// The operation type for a graph node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GraphOp {
@@ -54,6 +67,26 @@ pub enum GraphOp {
     Concat { axis: i32 },
     /// Custom/vendor-specific operation.
     Custom { op_type: String },
+
+    // --- Fused operations ---
+    /// Fused Conv2D with optional bias addition and activation.
+    /// Inputs: [input, weight, bias?]
+    FusedConv2d { activation: ActivationFunction },
+    /// General matrix multiply: alpha * A @ B + beta * C (ONNX Gemm).
+    /// Inputs: [A, B, C]
+    Gemm {
+        /// Scaling factor for the matrix product.
+        alpha: i32,
+        /// Scaling factor for the bias term.
+        beta: i32,
+    },
+    /// Element-wise binary operation with fused activation.
+    /// Inputs: [lhs, rhs]
+    FusedElementWise {
+        /// The base element-wise operation (Add, Sub, Mul, Div).
+        base_op: Box<GraphOp>,
+        activation: ActivationFunction,
+    },
 }
 
 impl GraphOp {
@@ -77,6 +110,9 @@ impl GraphOp {
             Self::Transpose => "Transpose",
             Self::Concat { .. } => "Concat",
             Self::Custom { op_type } => op_type,
+            Self::FusedConv2d { .. } => "Conv",
+            Self::Gemm { .. } => "Gemm",
+            Self::FusedElementWise { base_op, .. } => base_op.onnx_op_type(),
         }
     }
 }

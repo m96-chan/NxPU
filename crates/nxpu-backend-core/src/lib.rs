@@ -95,14 +95,25 @@ pub struct BackendOptions {
     /// compilation. Backends may use this to emit precision-related
     /// diagnostics or metadata, but should not re-quantize the IR.
     pub precision: PrecisionPolicy,
+    /// Optional memory plan computed by the memory planning pass.
+    ///
+    /// When present, backends can use this to emit buffer allocation metadata
+    /// (e.g. ONNX `metadata_props`, TFLite buffer info). Backends that do not
+    /// support memory plan metadata may ignore this field.
+    pub memory_plan: Option<MemoryPlan>,
 }
 
 impl fmt::Display for BackendOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mem = if self.memory_plan.is_some() {
+            ", memory_plan: yes"
+        } else {
+            ""
+        };
         write!(
             f,
-            "BackendOptions {{ opt_level: {}, precision: {} }}",
-            self.opt_level, self.precision
+            "BackendOptions {{ opt_level: {}, precision: {}{} }}",
+            self.opt_level, self.precision, mem
         )
     }
 }
@@ -269,6 +280,64 @@ pub fn validate_patterns(
         }
     }
     diagnostics
+}
+
+// ---------------------------------------------------------------------------
+// Memory plan types
+// ---------------------------------------------------------------------------
+
+/// A unique identifier for a tensor in the memory plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TensorId(pub usize);
+
+impl fmt::Display for TensorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tensor_{}", self.0)
+    }
+}
+
+/// A buffer allocation for a single tensor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BufferAllocation {
+    /// Which tensor this allocation is for.
+    pub tensor_id: TensorId,
+    /// Byte offset within the unified buffer.
+    pub offset: usize,
+    /// Size of this tensor in bytes.
+    pub size_bytes: usize,
+}
+
+/// The result of memory planning: buffer assignments and peak usage.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryPlan {
+    /// Per-tensor buffer allocations.
+    pub allocations: Vec<BufferAllocation>,
+    /// Peak memory usage in bytes (the minimum buffer size needed).
+    pub peak_bytes: usize,
+}
+
+impl fmt::Display for MemoryPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Memory Plan:")?;
+        writeln!(f, "  Peak memory: {} bytes", self.peak_bytes)?;
+        writeln!(f, "  Buffers: {}", self.allocations.len())?;
+
+        let total: usize = self.allocations.iter().map(|a| a.size_bytes).sum();
+        if total > 0 {
+            let ratio = 1.0 - (self.peak_bytes as f64 / total as f64);
+            writeln!(f, "  Total tensor sizes: {total} bytes")?;
+            writeln!(f, "  Reuse savings: {:.1}%", ratio * 100.0)?;
+        }
+
+        for alloc in &self.allocations {
+            writeln!(
+                f,
+                "  {} -> offset: {}, size: {} bytes",
+                alloc.tensor_id, alloc.offset, alloc.size_bytes
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Errors that can occur during backend compilation.
@@ -451,6 +520,7 @@ mod tests {
         let opts = BackendOptions {
             opt_level: 2,
             precision: PrecisionPolicy::Explicit(Precision::Int8),
+            ..Default::default()
         };
         let s = format!("{opts}");
         assert!(s.contains("opt_level: 2"));
@@ -580,5 +650,70 @@ mod tests {
 
         let e2 = BackendError::Other("internal failure".into());
         assert_eq!(format!("{e2}"), "internal failure");
+    }
+
+    // ---- Memory plan types ----
+
+    #[test]
+    fn tensor_id_display() {
+        assert_eq!(format!("{}", TensorId(0)), "tensor_0");
+        assert_eq!(format!("{}", TensorId(42)), "tensor_42");
+    }
+
+    #[test]
+    fn memory_plan_display() {
+        let plan = MemoryPlan {
+            allocations: vec![
+                BufferAllocation {
+                    tensor_id: TensorId(0),
+                    offset: 0,
+                    size_bytes: 1024,
+                },
+                BufferAllocation {
+                    tensor_id: TensorId(1),
+                    offset: 0,
+                    size_bytes: 512,
+                },
+            ],
+            peak_bytes: 1024,
+        };
+        let s = format!("{plan}");
+        assert!(s.contains("Peak memory: 1024 bytes"));
+        assert!(s.contains("Buffers: 2"));
+        assert!(s.contains("Reuse savings:"));
+        assert!(s.contains("tensor_0"));
+        assert!(s.contains("tensor_1"));
+    }
+
+    #[test]
+    fn memory_plan_default() {
+        let plan = MemoryPlan::default();
+        assert!(plan.allocations.is_empty());
+        assert_eq!(plan.peak_bytes, 0);
+    }
+
+    #[test]
+    fn display_backend_options_with_memory_plan() {
+        let opts = BackendOptions {
+            opt_level: 1,
+            precision: PrecisionPolicy::Auto,
+            memory_plan: Some(MemoryPlan {
+                allocations: vec![],
+                peak_bytes: 0,
+            }),
+        };
+        let s = format!("{opts}");
+        assert!(s.contains("memory_plan: yes"));
+    }
+
+    #[test]
+    fn display_backend_options_without_memory_plan() {
+        let opts = BackendOptions {
+            opt_level: 1,
+            precision: PrecisionPolicy::Auto,
+            memory_plan: None,
+        };
+        let s = format!("{opts}");
+        assert!(!s.contains("memory_plan"));
     }
 }
