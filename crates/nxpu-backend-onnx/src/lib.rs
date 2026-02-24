@@ -146,6 +146,8 @@ fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
         analyze::KernelPattern::Concat { .. } => "Concat",
         analyze::KernelPattern::Split { .. } => "Split",
         analyze::KernelPattern::Attention { .. } => "Attention",
+        analyze::KernelPattern::Gather { .. } => "Gather",
+        analyze::KernelPattern::Scatter { .. } => "ScatterND",
         analyze::KernelPattern::Unknown { .. } => "Unknown",
     }
 }

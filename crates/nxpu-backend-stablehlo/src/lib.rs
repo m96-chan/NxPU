@@ -61,6 +61,8 @@ impl Backend for StableHloBackend {
                 analyze::KernelPattern::Concat { .. } => "concatenate",
                 analyze::KernelPattern::Split { .. } => "slice",
                 analyze::KernelPattern::Attention { .. } => "attention",
+                analyze::KernelPattern::Gather { .. } => "gather",
+                analyze::KernelPattern::Scatter { .. } => "scatter",
                 analyze::KernelPattern::Unknown { .. } => "Unknown",
             };
 

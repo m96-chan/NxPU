@@ -167,6 +167,8 @@ fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
         analyze::KernelPattern::Concat { .. } => "CONCATENATION",
         analyze::KernelPattern::Split { .. } => "SPLIT",
         analyze::KernelPattern::Attention { .. } => "Attention",
+        analyze::KernelPattern::Gather { .. } => "GATHER",
+        analyze::KernelPattern::Scatter { .. } => "SCATTER_ND",
         analyze::KernelPattern::Unknown { .. } => "Unknown",
     }
 }
@@ -303,6 +305,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 stride_w: 1,
                 pad_h: 0,
                 pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
             },
         };
         let norm = KernelPattern::Normalization {
@@ -311,6 +316,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor("bn_out", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
 
         let fused = FusedPattern::ConvBatchNorm {
@@ -412,6 +418,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 stride_w: 1,
                 pad_h: 0,
                 pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
             },
         };
         let norm = KernelPattern::Normalization {
@@ -420,6 +429,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor("bn_out", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
         let relu = KernelPattern::Activation {
             op: ActivationOp::Relu,
@@ -512,6 +522,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     stride_w: 1,
                     pad_h: 0,
                     pad_w: 0,
+                    groups: 1,
+                    dilation_h: 1,
+                    dilation_w: 1,
                 },
             },
             norm: Box::new(KernelPattern::Normalization {
@@ -520,6 +533,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 bias: make_tensor("beta", TensorRole::Input),
                 output: make_tensor("bn_out", TensorRole::Output),
                 epsilon: 1e-5,
+                norm_type: NormType::Batch,
             }),
         };
 
@@ -725,6 +739,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 stride_w: 1,
                 pad_h: 0,
                 pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
             },
         };
         assert_eq!(pattern_summary(&conv), "CONV_2D");
@@ -735,6 +752,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             bias: make_tensor("b", TensorRole::Input),
             output: make_tensor("y", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
         assert_eq!(pattern_summary(&norm), "BatchNormalization");
     }

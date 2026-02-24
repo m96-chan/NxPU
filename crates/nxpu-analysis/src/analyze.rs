@@ -123,6 +123,9 @@ pub enum ActivationOp {
     Sigmoid,
     Tanh,
     Softmax,
+    Gelu,
+    Silu,
+    Mish,
 }
 
 impl fmt::Display for ActivationOp {
@@ -139,6 +142,9 @@ impl ActivationOp {
             Self::Sigmoid => "Sigmoid",
             Self::Tanh => "Tanh",
             Self::Softmax => "Softmax",
+            Self::Gelu => "Gelu",
+            Self::Silu => "Silu",
+            Self::Mish => "Mish",
         }
     }
 }
@@ -193,6 +199,22 @@ impl PoolKind {
     }
 }
 
+/// Normalization type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormType {
+    Batch,
+    Layer,
+}
+
+impl fmt::Display for NormType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Batch => "Batch",
+            Self::Layer => "Layer",
+        })
+    }
+}
+
 /// Conv2D shape parameters extracted from uniform params.
 #[derive(Debug, Clone)]
 pub struct Conv2DShape {
@@ -222,14 +244,27 @@ pub struct Conv2DShape {
     pub pad_h: i64,
     /// Horizontal padding.
     pub pad_w: i64,
+    /// Number of groups (1 = standard conv, channels_in = depthwise).
+    pub groups: i64,
+    /// Vertical dilation.
+    pub dilation_h: i64,
+    /// Horizontal dilation.
+    pub dilation_w: i64,
 }
 
 impl fmt::Display for Conv2DShape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Conv2D({}x{}x{} k{}x{})",
-            self.channels_in, self.height, self.width, self.kernel_h, self.kernel_w
+            "Conv2D({}x{}x{} k{}x{} g{} d{}x{})",
+            self.channels_in,
+            self.height,
+            self.width,
+            self.kernel_h,
+            self.kernel_w,
+            self.groups,
+            self.dilation_h,
+            self.dilation_w
         )
     }
 }
@@ -319,6 +354,7 @@ pub enum KernelPattern {
         bias: TensorBinding,
         output: TensorBinding,
         epsilon: f32,
+        norm_type: NormType,
     },
     /// Concatenation of multiple inputs along an axis.
     Concat {
@@ -347,6 +383,21 @@ pub enum KernelPattern {
         /// Whether a causal mask is applied.
         causal: bool,
     },
+    /// Gather: index into data tensor using indices.
+    Gather {
+        data: TensorBinding,
+        indices: TensorBinding,
+        output: TensorBinding,
+        axis: i64,
+    },
+    /// Scatter: write updates into output tensor at given indices.
+    Scatter {
+        data: TensorBinding,
+        indices: TensorBinding,
+        updates: TensorBinding,
+        output: TensorBinding,
+        axis: i64,
+    },
     /// Unrecognized pattern — classification could not determine a known op.
     Unknown { reason: String },
 }
@@ -368,7 +419,9 @@ impl fmt::Display for KernelPattern {
             Self::Reduce { op, axis, .. } => write!(f, "{op}(axis={axis})"),
             Self::Transpose { perm, .. } => write!(f, "Transpose({perm:?})"),
             Self::Reshape { .. } => f.write_str("Reshape"),
-            Self::Normalization { epsilon, .. } => write!(f, "Normalization(eps={epsilon})"),
+            Self::Normalization {
+                epsilon, norm_type, ..
+            } => write!(f, "{norm_type}Normalization(eps={epsilon})"),
             Self::Concat { axis, .. } => write!(f, "Concat(axis={axis})"),
             Self::Split { axis, .. } => write!(f, "Split(axis={axis})"),
             Self::Attention {
@@ -384,6 +437,8 @@ impl fmt::Display for KernelPattern {
                     "Attention(d_k={d_k}, seq_len={seq_len}, heads={num_heads}{mask})"
                 )
             }
+            Self::Gather { axis, .. } => write!(f, "Gather(axis={axis})"),
+            Self::Scatter { axis, .. } => write!(f, "Scatter(axis={axis})"),
             Self::Unknown { reason } => write!(f, "Unknown({reason})"),
         }
     }
@@ -798,7 +853,7 @@ pub fn classify_entry_point(
         ));
     }
 
-    // 3+ inputs: check for Attention before Normalization
+    // 3+ inputs: check for Attention, Normalization, Scatter
     if num_inputs >= 3 {
         // Attention heuristic: 3 inputs + has loop + contains Exp + Sqrt.
         // NOTE: This is fragile — any 3-input kernel with loop + exp() + sqrt()
@@ -833,9 +888,24 @@ pub fn classify_entry_point(
             });
         }
 
-        // 3+ inputs but no recognized attention pattern — unknown.
+        // Scatter: 3 inputs + 1 output + no loop (simple scatter write)
+        if num_inputs == 3 && outputs.len() == 1 && !has_loop {
+            let data = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
+            let indices = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
+            let updates = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
+            let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
+            return Ok(KernelPattern::Scatter {
+                data,
+                indices,
+                updates,
+                output,
+                axis: 0,
+            });
+        }
+
+        // 3+ inputs but no recognized attention/scatter pattern — unknown.
         return Ok(KernelPattern::Unknown {
-            reason: "3+ inputs but no recognized pattern (expected Attention)".into(),
+            reason: "3+ inputs but no recognized pattern (expected Attention or Scatter)".into(),
         });
     }
 
@@ -846,6 +916,23 @@ pub fn classify_entry_point(
 
     if !has_loop {
         let has_if = has_if_statement(&ep.function.body);
+
+        // Gather: 2 inputs + no loop + one input is u32 array (indices)
+        // Check if second input is a u32 array (integer index type).
+        let second_is_int = input_b.elem_type == data_type::UINT32
+            || input_b.elem_type == data_type::INT32
+            || input_b.elem_type == data_type::INT64;
+        if second_is_int
+            && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none()
+            && !has_if
+        {
+            return Ok(KernelPattern::Gather {
+                data: input_a,
+                indices: input_b,
+                output: output_c,
+                axis: 0,
+            });
+        }
 
         // Concat: 2 inputs + no loop + has If + no binary store op
         if has_if && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none() {
@@ -1088,6 +1175,14 @@ fn extract_conv2d_shape(
             (0, 0, 1, 1, 0, 0)
         };
 
+    // Detect groups parameter: if shape_names contains "groups", use it.
+    let groups = if shape_names.iter().any(|n| n.eq_ignore_ascii_case("groups")) {
+        // Depthwise convention: groups == channels_in
+        -1 // Sentinel: resolved at runtime or marked as depthwise
+    } else {
+        1
+    };
+
     Conv2DShape {
         batch: get(0),
         channels_in: get(1),
@@ -1102,6 +1197,9 @@ fn extract_conv2d_shape(
         stride_w,
         pad_h,
         pad_w,
+        groups,
+        dilation_h: 1,
+        dilation_w: 1,
     }
 }
 
@@ -1340,11 +1438,50 @@ fn classify_activation_expr(
             fun: MathFunction::Max,
             ..
         } => Some(ActivationOp::Relu),
-        // tanh(x) → Tanh
+        // tanh(x) → Tanh (standalone, not part of a Multiply)
         Expression::Math {
             fun: MathFunction::Tanh,
             ..
         } => Some(ActivationOp::Tanh),
+        // Multiply patterns: GELU, SiLU, Mish
+        Expression::Binary {
+            op: BinaryOp::Multiply,
+            left,
+            right,
+            ..
+        } => {
+            let has_tanh_left = contains_math_fun(exprs, *left, MathFunction::Tanh);
+            let has_tanh_right = contains_math_fun(exprs, *right, MathFunction::Tanh);
+            let has_exp_left = contains_math_fun(exprs, *left, MathFunction::Exp);
+            let has_exp_right = contains_math_fun(exprs, *right, MathFunction::Exp);
+
+            // GELU: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+            // Detected as Multiply where one sub-expression contains Tanh
+            // but NOT Exp (to distinguish from Mish which has tanh+exp)
+            if (has_tanh_left || has_tanh_right) && !has_exp_left && !has_exp_right {
+                return Some(ActivationOp::Gelu);
+            }
+
+            // Mish: x * tanh(ln(1 + exp(x))) = x * tanh(softplus(x))
+            // Detected as Multiply containing both Tanh and Exp
+            if (has_tanh_left || has_tanh_right) && (has_exp_left || has_exp_right) {
+                return Some(ActivationOp::Mish);
+            }
+
+            // SiLU: x * sigmoid(x) = x * (1 / (1 + exp(-x)))
+            // Detected as Multiply where one sub-expression contains Divide+Exp (sigmoid pattern)
+            if has_exp_left || has_exp_right {
+                let has_div_left = contains_binary_op(exprs, *left, BinaryOp::Divide);
+                let has_div_right = contains_binary_op(exprs, *right, BinaryOp::Divide);
+                if has_div_left || has_div_right {
+                    return Some(ActivationOp::Silu);
+                }
+            }
+
+            // Not a recognized activation multiply, try recursing
+            classify_activation_expr(exprs, *left)
+                .or_else(|| classify_activation_expr(exprs, *right))
+        }
         // 1/(1+exp(-x)) → Sigmoid: detected as Divide whose right is Add(1, Exp(Negate(x)))
         // exp(x)/sum(exp(x)) → Softmax: detected as Divide with Exp on left
         Expression::Binary {
@@ -1364,6 +1501,26 @@ fn classify_activation_expr(
             }
         }
         _ => None,
+    }
+}
+
+/// Check if an expression (recursively) contains a specific binary operation.
+fn contains_binary_op(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    target: BinaryOp,
+) -> bool {
+    match exprs.try_get(handle) {
+        Some(Expression::Binary {
+            op, left, right, ..
+        }) => {
+            *op == target
+                || contains_binary_op(exprs, *left, target)
+                || contains_binary_op(exprs, *right, target)
+        }
+        Some(Expression::Math { arg, .. }) => contains_binary_op(exprs, *arg, target),
+        Some(Expression::Unary { expr, .. }) => contains_binary_op(exprs, *expr, target),
+        _ => false,
     }
 }
 
