@@ -888,6 +888,33 @@ pub fn classify_entry_point(
             });
         }
 
+        // Normalization: 3 inputs (input, scale, bias) + 1 output + loop + Sqrt, no Exp.
+        // Distinguishes LayerNorm (2 shape params: N, C) from BatchNorm (3+: N, C, HW).
+        if num_inputs == 3
+            && outputs.len() == 1
+            && has_loop
+            && has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sqrt)
+            && !has_math_function_in_expressions(&ep.function.expressions, MathFunction::Exp)
+        {
+            let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
+            let scale = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
+            let bias = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
+            let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
+            let norm_type = if shape_names.len() <= 2 {
+                NormType::Layer
+            } else {
+                NormType::Batch
+            };
+            return Ok(KernelPattern::Normalization {
+                input,
+                scale,
+                bias,
+                output,
+                epsilon: 1e-5,
+                norm_type,
+            });
+        }
+
         // Scatter: 3 inputs + 1 output + no loop (simple scatter write)
         if num_inputs == 3 && outputs.len() == 1 && !has_loop {
             let data = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
@@ -903,9 +930,9 @@ pub fn classify_entry_point(
             });
         }
 
-        // 3+ inputs but no recognized attention/scatter pattern — unknown.
+        // 3+ inputs but no recognized pattern — unknown.
         return Ok(KernelPattern::Unknown {
-            reason: "3+ inputs but no recognized pattern (expected Attention or Scatter)".into(),
+            reason: "3+ inputs but no recognized pattern (expected Attention, Normalization, or Scatter)".into(),
         });
     }
 
@@ -915,7 +942,7 @@ pub fn classify_entry_point(
     let output_c = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
 
     if !has_loop {
-        let has_if = has_if_statement(&ep.function.body);
+        let has_structural_if = has_non_guard_if(&ep.function.body);
 
         // Gather: 2 inputs + no loop + one input is u32 array (indices)
         // Check if second input is a u32 array (integer index type).
@@ -924,7 +951,7 @@ pub fn classify_entry_point(
             || input_b.elem_type == data_type::INT64;
         if second_is_int
             && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none()
-            && !has_if
+            && !has_structural_if
         {
             return Ok(KernelPattern::Gather {
                 data: input_a,
@@ -935,7 +962,9 @@ pub fn classify_entry_point(
         }
 
         // Concat: 2 inputs + no loop + has If + no binary store op
-        if has_if && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none() {
+        if has_structural_if
+            && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none()
+        {
             let axis = infer_concat_axis(&ep.function.body, &ep.function.expressions, &shape_names);
             return Ok(KernelPattern::Concat {
                 inputs: vec![input_a, input_b],
@@ -1360,6 +1389,24 @@ fn has_if_statement(body: &[Statement]) -> bool {
         Statement::Loop {
             body, continuing, ..
         } => has_if_statement(body) || has_if_statement(continuing),
+        _ => false,
+    })
+}
+
+/// Check if a block contains a non-guard If statement (i.e., one that is not
+/// just a bounds-check early return like `if (idx >= N) { return; }`).
+fn has_non_guard_if(body: &[Statement]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Statement::If { accept, reject, .. } => {
+            // A guard-if has only a Return in accept and empty reject (or vice-versa).
+            let is_guard = reject.is_empty()
+                && accept.len() == 1
+                && matches!(accept[0], Statement::Return { .. });
+            !is_guard
+        }
+        Statement::Loop {
+            body, continuing, ..
+        } => has_non_guard_if(body) || has_non_guard_if(continuing),
         _ => false,
     })
 }
@@ -3934,5 +3981,26 @@ mod tests {
             display.contains("heads=1"),
             "display should show heads=1: {display}"
         );
+    }
+
+    #[test]
+    fn classify_gqa_defaults_to_mha() {
+        // GQA detection is not yet implemented; num_kv_heads always equals num_heads.
+        let module = make_attention_module(&["seq_len", "d_model", "num_heads"], Some(4), false);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Attention {
+                num_heads,
+                num_kv_heads,
+                ..
+            } => {
+                assert_eq!(*num_heads, 4);
+                assert_eq!(
+                    *num_kv_heads, *num_heads,
+                    "GQA not implemented: kv_heads defaults to num_heads"
+                );
+            }
+            _ => panic!("expected Attention pattern, got {pattern:?}"),
+        }
     }
 }

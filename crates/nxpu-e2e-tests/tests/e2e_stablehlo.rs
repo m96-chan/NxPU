@@ -89,11 +89,11 @@ fn transpose_stablehlo_unknown() {
 }
 
 #[test]
-fn batchnorm_stablehlo_unknown() {
-    // BatchNorm is now classified as Unknown (no silent fallback — #64).
+fn batchnorm_stablehlo_compiles() {
     let source = common::load_example("batchnorm");
-    let result = common::try_compile_wgsl(&source, &StableHloBackend, 1);
-    assert!(result.is_err(), "expected Unsupported error for batchnorm");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(mlir.contains("stablehlo"));
 }
 
 #[test]
@@ -126,4 +126,69 @@ fn attention_stablehlo_dot_general() {
     let output = common::compile_wgsl(&source, &StableHloBackend, 1);
     let mlir = common::first_text(&output);
     assert!(mlir.contains("stablehlo.dot_general"));
+}
+
+// --- GELU ---
+
+#[test]
+fn gelu_stablehlo_compiles() {
+    let source = common::load_example("gelu");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(
+        mlir.contains("stablehlo"),
+        "expected stablehlo in MLIR output"
+    );
+}
+
+// --- LayerNorm ---
+
+#[test]
+fn layernorm_stablehlo_compiles() {
+    let source = common::load_example("layernorm");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(
+        mlir.contains("stablehlo"),
+        "expected stablehlo in MLIR output"
+    );
+}
+
+// --- Gather ---
+
+#[test]
+fn gather_stablehlo_compiles() {
+    let source = common::load_example("gather");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(
+        mlir.contains("stablehlo"),
+        "expected stablehlo in MLIR output"
+    );
+}
+
+// --- Scatter ---
+
+#[test]
+fn scatter_stablehlo_compiles() {
+    let source = common::load_example("scatter");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(
+        mlir.contains("stablehlo"),
+        "expected stablehlo in MLIR output"
+    );
+}
+
+// --- Depthwise Conv ---
+
+#[test]
+fn depthwise_conv_stablehlo_compiles() {
+    let source = common::load_example("depthwise_conv");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(
+        mlir.contains("stablehlo"),
+        "expected stablehlo in MLIR output"
+    );
 }

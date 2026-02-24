@@ -130,7 +130,11 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<Model, Back
                 value: Some(ml_attribute::Value::Int(*axis)),
             }],
         ),
-        KernelPattern::Split { input, outputs, .. } => build_split(input, outputs),
+        KernelPattern::Split {
+            input,
+            outputs,
+            axis,
+        } => build_split(input, outputs, *axis),
         KernelPattern::Attention {
             query,
             key,
@@ -419,6 +423,7 @@ fn build_nary_op<'a>(
 fn build_split<'a>(
     input: &'a TensorBinding,
     outputs: &'a [TensorBinding],
+    axis: i64,
 ) -> (
     Vec<&'a TensorBinding>,
     Vec<&'a TensorBinding>,
@@ -436,7 +441,10 @@ fn build_split<'a>(
                 name: o.name.clone(),
             })
             .collect(),
-        attributes: vec![],
+        attributes: vec![MlAttribute {
+            name: "axis".into(),
+            value: Some(ml_attribute::Value::Int(axis)),
+        }],
     };
     let out_refs: Vec<&TensorBinding> = outputs.iter().collect();
     (vec![input], out_refs, vec![op])

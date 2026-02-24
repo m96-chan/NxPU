@@ -166,11 +166,15 @@ fn transpose_produces_unknown_pattern() {
 // --- BatchNorm ---
 
 #[test]
-fn batchnorm_produces_unknown_pattern() {
-    // BatchNorm is now classified as Unknown (no silent fallback — #64).
+fn batchnorm_produces_normalization_node() {
     let source = common::load_example("batchnorm");
-    let result = common::try_compile_wgsl(&source, &OnnxBackend, 1);
-    assert!(result.is_err(), "expected Unsupported error for batchnorm");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.as_ref().unwrap();
+    assert!(
+        graph.node.iter().any(|n| n.op_type == "BatchNormalization"),
+        "expected BatchNormalization node in ONNX graph"
+    );
 }
 
 // --- MaxPool ---
@@ -236,4 +240,75 @@ fn attention_produces_attention_subgraph() {
     assert!(op_types.contains(&"Sqrt"));
     assert!(op_types.contains(&"Div"));
     assert!(op_types.contains(&"Softmax"));
+}
+
+// --- GELU ---
+
+#[test]
+fn gelu_produces_erf_decomposition() {
+    let source = common::load_example("gelu");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.as_ref().unwrap();
+    let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
+    assert!(
+        op_types.contains(&"Erf"),
+        "expected Erf node in GELU decomposition, got: {op_types:?}"
+    );
+}
+
+// --- LayerNorm ---
+
+#[test]
+fn layernorm_produces_layernormalization_node() {
+    let source = common::load_example("layernorm");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.as_ref().unwrap();
+    assert!(
+        graph.node.iter().any(|n| n.op_type == "LayerNormalization"),
+        "expected LayerNormalization node in ONNX graph"
+    );
+}
+
+// --- Gather ---
+
+#[test]
+fn gather_produces_gather_node() {
+    let source = common::load_example("gather");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.as_ref().unwrap();
+    assert!(
+        graph.node.iter().any(|n| n.op_type == "Gather"),
+        "expected Gather node in ONNX graph"
+    );
+}
+
+// --- Scatter ---
+
+#[test]
+fn scatter_produces_scatternd_node() {
+    let source = common::load_example("scatter");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.as_ref().unwrap();
+    assert!(
+        graph.node.iter().any(|n| n.op_type == "ScatterND"),
+        "expected ScatterND node in ONNX graph"
+    );
+}
+
+// --- Depthwise Conv ---
+
+#[test]
+fn depthwise_conv_produces_conv_node() {
+    let source = common::load_example("depthwise_conv");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.as_ref().unwrap();
+    assert!(
+        graph.node.iter().any(|n| n.op_type == "Conv"),
+        "expected Conv node in ONNX graph for depthwise convolution"
+    );
 }

@@ -595,4 +595,28 @@ mod tests {
         assert_eq!(cloned.perm, vec![0, 3, 1, 2]);
         assert!(cloned.is_input);
     }
+
+    #[test]
+    fn layout_conv2d_shape_nhwc_to_nchw() {
+        // Conv2D NHWC [1, 224, 224, 3] -> NCHW [1, 3, 224, 224]
+        let nhwc = [1i64, 224, 224, 3];
+        let result = reorder_dims(&nhwc, MemoryLayout::Nhwc, MemoryLayout::Nchw);
+        assert_eq!(result, vec![1, 3, 224, 224]);
+    }
+
+    #[test]
+    fn layout_pool_shape_nchw_to_nhwc() {
+        // Pool NCHW [1, 64, 56, 56] -> NHWC [1, 56, 56, 64]
+        let nchw = [1i64, 64, 56, 56];
+        let result = reorder_dims(&nchw, MemoryLayout::Nchw, MemoryLayout::Nhwc);
+        assert_eq!(result, vec![1, 56, 56, 64]);
+    }
+
+    #[test]
+    fn layout_batchnorm_shape_nhwc_to_nchw() {
+        // BatchNorm NHWC [1, 32, 32, 128] -> NCHW [1, 128, 32, 32]
+        let nhwc = [1i64, 32, 32, 128];
+        let result = reorder_dims(&nhwc, MemoryLayout::Nhwc, MemoryLayout::Nchw);
+        assert_eq!(result, vec![1, 128, 32, 32]);
+    }
 }
