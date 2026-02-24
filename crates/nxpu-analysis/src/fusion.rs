@@ -903,6 +903,9 @@ mod tests {
             output: make_tensor("o", TensorRole::Output),
             d_k: "D".into(),
             seq_len: "S".into(),
+            num_heads: 1,
+            num_kv_heads: 1,
+            causal: false,
         };
         let names = input_tensor_names(&pattern);
         assert_eq!(names, vec!["q", "k", "v"]);

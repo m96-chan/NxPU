@@ -342,6 +342,12 @@ pub enum KernelPattern {
         output: TensorBinding,
         d_k: String,
         seq_len: String,
+        /// Number of attention heads (1 = single-head).
+        num_heads: u32,
+        /// Number of K/V heads (for GQA; equals num_heads for MHA).
+        num_kv_heads: u32,
+        /// Whether a causal mask is applied.
+        causal: bool,
     },
     /// Unrecognized pattern — classification could not determine a known op.
     Unknown { reason: String },
@@ -367,8 +373,18 @@ impl fmt::Display for KernelPattern {
             Self::Normalization { epsilon, .. } => write!(f, "Normalization(eps={epsilon})"),
             Self::Concat { axis, .. } => write!(f, "Concat(axis={axis})"),
             Self::Split { axis, .. } => write!(f, "Split(axis={axis})"),
-            Self::Attention { d_k, seq_len, .. } => {
-                write!(f, "Attention(d_k={d_k}, seq_len={seq_len})")
+            Self::Attention {
+                d_k,
+                seq_len,
+                num_heads,
+                causal,
+                ..
+            } => {
+                let mask = if *causal { ", causal" } else { "" };
+                write!(
+                    f,
+                    "Attention(d_k={d_k}, seq_len={seq_len}, heads={num_heads}{mask})"
+                )
             }
             Self::Unknown { reason } => write!(f, "Unknown({reason})"),
         }
@@ -447,6 +463,177 @@ fn type_dims(ty_handle: Handle<Type>, types: &UniqueArena<Type>) -> Vec<i64> {
             ..
         } => vec![*n as i64],
         _ => vec![],
+    }
+}
+
+/// Detect number of attention heads from shape_names or literal divisions.
+fn detect_num_heads(shape_names: &[String], exprs: &Arena<Expression>) -> u32 {
+    // Look for param named "num_heads", "n_head", "H", "n_heads", "nhead"
+    for name in shape_names.iter() {
+        let lower = name.to_lowercase();
+        if lower == "num_heads" || lower == "n_head" || lower == "n_heads" || lower == "nhead" {
+            // Can't get runtime value, but if there's a matching literal, use it
+            // Otherwise return 1 as we know it's multi-head but can't determine count
+            return find_division_literal(exprs).unwrap_or(1);
+        }
+    }
+    // Also check for "H" (common in transformer code)
+    if shape_names.iter().any(|n| n == "H") {
+        return find_division_literal(exprs).unwrap_or(1);
+    }
+    1
+}
+
+/// Look for a division by a literal (d_model / num_heads -> head_dim).
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
+fn find_division_literal(exprs: &Arena<Expression>) -> Option<u32> {
+    for (_, expr) in exprs.iter() {
+        if let Expression::Binary {
+            op: BinaryOp::Divide,
+            right,
+            ..
+        } = expr
+        {
+            if let Some(Expression::Literal(Literal::U32(n))) = exprs.try_get(*right) {
+                if *n > 1 {
+                    return Some(*n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Detect causal attention mask: look for an If guarding assignment of a large
+/// negative literal inside a loop. The pattern is:
+///   `if (j > i) { score = -1e30; }` or similar.
+///
+/// We specifically look for an `If` whose accept or reject block contains (or
+/// leads to) a Store of a large negative float literal. This avoids false
+/// positives from for-loop break conditions and numerically-stable softmax
+/// `max_score` initializations that also use large negative values but are
+/// not inside an If-guarded store.
+fn detect_causal_mask(body: &[Statement], exprs: &Arena<Expression>) -> bool {
+    has_causal_if_in_loop(body, exprs)
+}
+
+/// Recursively search loops for an `If` whose condition is a Greater/Less
+/// comparison and whose accept or reject branch stores a large negative
+/// float literal (like -1e30, -1e9, or -inf).
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
+fn has_causal_if_in_loop(body: &[Statement], exprs: &Arena<Expression>) -> bool {
+    for stmt in body {
+        if let Statement::Loop {
+            body, continuing, ..
+        } = stmt
+        {
+            // Search loop body; skip the first non-Emit If that acts as a
+            // for-loop break guard.
+            let mut saw_non_emit = false;
+            for s in body.iter() {
+                match s {
+                    Statement::Emit(_) => {}
+                    Statement::If {
+                        condition,
+                        accept,
+                        reject,
+                    } => {
+                        // The first non-emit If in a naga for-loop is the break
+                        // guard (e.g. `if (j < N) {} else { break; }`). Skip it.
+                        if !saw_non_emit
+                            && (matches!(accept.as_slice(), [Statement::Break])
+                                || matches!(reject.as_slice(), [Statement::Break]))
+                        {
+                            saw_non_emit = true;
+                            continue;
+                        }
+                        saw_non_emit = true;
+                        if is_causal_guard(*condition, accept, reject, exprs) {
+                            return true;
+                        }
+                    }
+                    _ => {
+                        saw_non_emit = true;
+                    }
+                }
+            }
+            // Also search the continuing block
+            for s in continuing.iter() {
+                if let Statement::If {
+                    condition,
+                    accept,
+                    reject,
+                } = s
+                {
+                    if is_causal_guard(*condition, accept, reject, exprs) {
+                        return true;
+                    }
+                }
+            }
+            // Recurse into nested loops
+            if has_causal_if_in_loop(body, exprs) || has_causal_if_in_loop(continuing, exprs) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if a conditional is a comparison (Greater/Less/GE/LE) and one of
+/// its branches (accept or reject) contains a Store of a large negative float.
+fn is_causal_guard(
+    condition: Handle<Expression>,
+    accept: &[Statement],
+    reject: &[Statement],
+    exprs: &Arena<Expression>,
+) -> bool {
+    let is_comparison = match exprs.try_get(condition) {
+        Some(Expression::Binary { op, .. }) => matches!(
+            op,
+            BinaryOp::Greater | BinaryOp::Less | BinaryOp::GreaterEqual | BinaryOp::LessEqual
+        ),
+        _ => false,
+    };
+    if !is_comparison {
+        return false;
+    }
+    block_stores_large_negative(accept, exprs) || block_stores_large_negative(reject, exprs)
+}
+
+/// Check if a block contains a Store whose value is a large negative float literal.
+fn block_stores_large_negative(body: &[Statement], exprs: &Arena<Expression>) -> bool {
+    for stmt in body {
+        match stmt {
+            Statement::Store { value, .. } => {
+                if expr_is_large_negative(*value, exprs) {
+                    return true;
+                }
+            }
+            Statement::If { accept, reject, .. } => {
+                if block_stores_large_negative(accept, exprs)
+                    || block_stores_large_negative(reject, exprs)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Check if an expression is (or contains) a large negative float literal (< -1e6).
+fn expr_is_large_negative(handle: Handle<Expression>, exprs: &Arena<Expression>) -> bool {
+    match exprs.try_get(handle) {
+        Some(Expression::Literal(Literal::F32(v))) => *v < -1e6,
+        Some(Expression::Unary {
+            op: nxpu_ir::UnaryOp::Negate,
+            expr,
+        }) => {
+            // -literal
+            matches!(exprs.try_get(*expr), Some(Expression::Literal(Literal::F32(v))) if *v > 1e6)
+        }
+        _ => false,
     }
 }
 
@@ -632,6 +819,8 @@ pub fn classify_entry_point(
                 .cloned()
                 .unwrap_or_else(|| "seq_len".into());
             let d_k = shape_names.get(1).cloned().unwrap_or_else(|| "d_k".into());
+            let num_heads = detect_num_heads(&shape_names, &ep.function.expressions);
+            let causal = detect_causal_mask(&ep.function.body, &ep.function.expressions);
             return Ok(KernelPattern::Attention {
                 query,
                 key,
@@ -639,6 +828,9 @@ pub fn classify_entry_point(
                 output,
                 d_k,
                 seq_len,
+                num_heads,
+                num_kv_heads: num_heads, // Default: MHA (same as num_heads)
+                causal,
             });
         }
 
@@ -2743,5 +2935,263 @@ mod tests {
 
         let weights = extract_embedded_weights(&module);
         assert!(weights.is_empty());
+    }
+
+    // --- Multi-head & causal attention classification tests ---
+
+    /// Build a module with 3 inputs (query, key, value), 1 output, a uniform
+    /// params struct with the given member names, Loop + Exp + Sqrt in the
+    /// function expressions, and optionally a division-by-literal and/or a
+    /// causal If-guard inside the loop body.
+    fn make_attention_module(param_names: &[&str], divide_by: Option<u32>, causal: bool) -> Module {
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let array_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+
+        // Build params struct from provided member names
+        let members: Vec<StructMember> = param_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| StructMember {
+                name: Some((*name).into()),
+                ty: u32_ty,
+                offset: (i * 4) as u32,
+            })
+            .collect();
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members,
+                span: (param_names.len() * 4) as u32,
+            },
+        });
+
+        // 3 storage-read inputs (query, key, value)
+        for (i, name) in ["query", "key", "value"].iter().enumerate() {
+            module.global_variables.append(GlobalVariable {
+                name: Some((*name).into()),
+                space: AddressSpace::Storage {
+                    access: StorageAccess::LOAD,
+                },
+                binding: Some(ResourceBinding {
+                    group: 0,
+                    binding: i as u32,
+                }),
+                ty: array_f32,
+                init: None,
+                layout: None,
+            });
+        }
+
+        // 1 storage-read_write output
+        module.global_variables.append(GlobalVariable {
+            name: Some("output".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 3,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+
+        // Uniform params
+        module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 4,
+            }),
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Build function with Exp, Sqrt, and optionally Division + causal If
+        let mut func = Function::new("main");
+
+        // Exp expression
+        let arg_exp = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        func.expressions.append(Expression::Math {
+            fun: MathFunction::Exp,
+            arg: arg_exp,
+            arg1: None,
+            arg2: None,
+            arg3: None,
+        });
+
+        // Sqrt expression
+        let arg_sqrt = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        func.expressions.append(Expression::Math {
+            fun: MathFunction::Sqrt,
+            arg: arg_sqrt,
+            arg1: None,
+            arg2: None,
+            arg3: None,
+        });
+
+        // Optional: division by literal (e.g. d_model / num_heads)
+        if let Some(n) = divide_by {
+            let dividend = func
+                .expressions
+                .append(Expression::Literal(Literal::U32(64)));
+            let divisor = func
+                .expressions
+                .append(Expression::Literal(Literal::U32(n)));
+            func.expressions.append(Expression::Binary {
+                op: BinaryOp::Divide,
+                left: dividend,
+                right: divisor,
+            });
+        }
+
+        // Build loop body contents
+        let mut loop_inner: Vec<Statement> = Vec::new();
+
+        if causal {
+            // Causal mask pattern: If(j > i) { score = -1e30; }
+            // First, add a comparison expression: Greater(j, i)
+            let j_expr = func
+                .expressions
+                .append(Expression::Literal(Literal::U32(0)));
+            let i_expr = func
+                .expressions
+                .append(Expression::Literal(Literal::U32(0)));
+            let cmp = func.expressions.append(Expression::Binary {
+                op: BinaryOp::Greater,
+                left: j_expr,
+                right: i_expr,
+            });
+
+            // Store of large negative literal
+            let neg_val = func
+                .expressions
+                .append(Expression::Literal(Literal::F32(-1e30)));
+            let ptr = func
+                .expressions
+                .append(Expression::Literal(Literal::F32(0.0)));
+
+            // The for-loop break guard (first If in naga loop)
+            let break_cond = func
+                .expressions
+                .append(Expression::Literal(Literal::Bool(true)));
+            loop_inner.push(Statement::If {
+                condition: break_cond,
+                accept: vec![],
+                reject: vec![Statement::Break],
+            });
+
+            // The causal If guard (second If in the loop)
+            loop_inner.push(Statement::If {
+                condition: cmp,
+                accept: vec![Statement::Store {
+                    pointer: ptr,
+                    value: neg_val,
+                }],
+                reject: vec![],
+            });
+        }
+
+        loop_inner.push(Statement::Break);
+
+        func.body.push(Statement::Loop {
+            body: loop_inner,
+            continuing: vec![],
+            break_if: None,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [16, 16, 1],
+            function: func,
+        });
+
+        module
+    }
+
+    #[test]
+    fn classify_multihead_4_heads() {
+        let module = make_attention_module(&["seq_len", "d_model", "num_heads"], Some(4), false);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Attention {
+                num_heads,
+                num_kv_heads,
+                causal,
+                seq_len,
+                ..
+            } => {
+                assert_eq!(*num_heads, 4, "expected 4 heads from division literal");
+                assert_eq!(
+                    *num_kv_heads, 4,
+                    "num_kv_heads should equal num_heads for MHA"
+                );
+                assert!(!causal, "should not detect causal mask");
+                assert_eq!(seq_len, "seq_len");
+            }
+            _ => panic!("expected Attention pattern, got {pattern:?}"),
+        }
+        // Display should include heads=4 and no causal marker
+        let display = format!("{pattern}");
+        assert!(
+            display.contains("heads=4"),
+            "display should show heads=4: {display}"
+        );
+        assert!(
+            !display.contains("causal"),
+            "display should not mention causal: {display}"
+        );
+    }
+
+    #[test]
+    fn classify_causal_attention() {
+        let module = make_attention_module(&["seq_len", "d_k"], None, true);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Attention {
+                num_heads,
+                causal,
+                d_k,
+                ..
+            } => {
+                assert_eq!(*num_heads, 1, "no num_heads param → default 1");
+                assert!(*causal, "should detect causal mask from If + Store(-1e30)");
+                assert_eq!(d_k, "d_k");
+            }
+            _ => panic!("expected Attention pattern, got {pattern:?}"),
+        }
+        // Display should include causal marker
+        let display = format!("{pattern}");
+        assert!(
+            display.contains("causal"),
+            "display should mention causal: {display}"
+        );
+        assert!(
+            display.contains("heads=1"),
+            "display should show heads=1: {display}"
+        );
     }
 }

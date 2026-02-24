@@ -83,7 +83,12 @@ pub fn build_model(
             output,
             d_k,
             seq_len,
-        } => build_attention_graph(query, key, value, output, seq_len, d_k, ep_name),
+            num_heads,
+            causal,
+            ..
+        } => build_attention_graph(
+            query, key, value, output, seq_len, d_k, *num_heads, *causal, ep_name,
+        ),
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
                 "cannot lower Unknown pattern to ONNX: {reason}"
@@ -913,6 +918,7 @@ fn build_split_graph(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_attention_graph(
     query: &TensorBinding,
     key: &TensorBinding,
@@ -920,9 +926,13 @@ fn build_attention_graph(
     output: &TensorBinding,
     seq_len: &str,
     d_k: &str,
+    num_heads: u32,
+    causal: bool,
     ep_name: &str,
 ) -> GraphProto {
     // Emit a subgraph: Transpose(K) → MatMul(Q,K^T) → Div(sqrt_dk) → Softmax → MatMul(attn,V)
+    // For multi-head: prepend Reshape+Transpose for Q/K/V, and append Reshape after.
+    // For causal: insert a Where node with a triangular mask before Softmax.
     let kt_name = "key_transposed";
     let scores_name = "scores";
     let scaled_name = "scaled_scores";
@@ -935,92 +945,204 @@ fn build_attention_graph(
     let k_shape = q_shape.clone();
     let v_shape = q_shape.clone();
     let out_shape = q_shape.clone();
-    // Dynamic sqrt(d_k): extract d_k from query tensor's last dimension at runtime.
-    // Shape(Q) → Gather(shape, 1) → Cast(to FLOAT) → Sqrt → Div(scores, sqrt_dk)
+
+    let mut nodes = Vec::new();
+    let mut initializers = vec![TensorProto {
+        dims: vec![],
+        data_type: data_type::INT64,
+        name: "dk_axis".into(),
+        float_data: vec![],
+        int64_data: vec![1],
+        raw_data: vec![],
+    }];
+
+    // Source names for Q/K/V (may be overwritten by multi-head reshape)
+    let mut q_src = query.name.clone();
+    let mut k_src = key.name.clone();
+    let mut v_src = value.name.clone();
+    let final_output_name;
+
+    if num_heads > 1 {
+        // Multi-head: Reshape Q/K/V from [batch, seq, d_model] → [batch, num_heads, seq, head_dim]
+        // Then Transpose to [batch, num_heads, seq, head_dim] (perm [0,2,1,3])
+        for (src_name, reshaped, transposed) in [
+            (&query.name, "q_reshaped", "q_mh"),
+            (&key.name, "k_reshaped", "k_mh"),
+            (&value.name, "v_reshaped", "v_mh"),
+        ] {
+            nodes.push(NodeProto::with_attrs(
+                "Reshape",
+                format!("reshape_{reshaped}"),
+                vec![src_name.clone(), "mh_shape".into()],
+                vec![reshaped.into()],
+                vec![],
+            ));
+            nodes.push(NodeProto::with_attrs(
+                "Transpose",
+                format!("transpose_{transposed}"),
+                vec![reshaped.into()],
+                vec![transposed.into()],
+                vec![AttributeProto::ints("perm", vec![0, 2, 1, 3])],
+            ));
+        }
+        q_src = "q_mh".into();
+        k_src = "k_mh".into();
+        v_src = "v_mh".into();
+        final_output_name = "attn_mh_out".to_string();
+
+        // mh_shape initializer: symbolic reshape target
+        initializers.push(TensorProto {
+            dims: vec![4],
+            data_type: data_type::INT64,
+            name: "mh_shape".into(),
+            float_data: vec![],
+            int64_data: vec![0, -1, num_heads as i64, -1],
+            raw_data: vec![],
+        });
+    } else {
+        final_output_name = output.name.clone();
+    }
+
+    // Transpose K
+    nodes.push(NodeProto::with_attrs(
+        "Transpose",
+        "transpose_k",
+        vec![k_src.clone()],
+        vec![kt_name.into()],
+        vec![AttributeProto::ints("perm", vec![1, 0])],
+    ));
+    // MatMul(Q, K^T) → scores
+    nodes.push(NodeProto::simple(
+        "MatMul",
+        "matmul_qk",
+        vec![q_src, kt_name.into()],
+        vec![scores_name.into()],
+    ));
+    // Shape(Q) → [seq_len, d_k]
+    nodes.push(NodeProto::simple(
+        "Shape",
+        "shape_q",
+        vec![query.name.clone()],
+        vec!["query_shape".into()],
+    ));
+    // Gather(query_shape, 1) → d_k dimension (scalar)
+    nodes.push(NodeProto::simple(
+        "Gather",
+        "gather_dk",
+        vec!["query_shape".into(), "dk_axis".into()],
+        vec!["dk_dim".into()],
+    ));
+    // Cast(dk_dim, to=FLOAT) → scalar f32
+    nodes.push(NodeProto::with_attrs(
+        "Cast",
+        "cast_dk",
+        vec!["dk_dim".into()],
+        vec!["dk_float".into()],
+        vec![AttributeProto::int("to", data_type::FLOAT as i64)],
+    ));
+    // Sqrt(dk_float) → sqrt(d_k)
+    nodes.push(NodeProto::simple(
+        "Sqrt",
+        "sqrt_dk",
+        vec!["dk_float".into()],
+        vec!["sqrt_dk_val".into()],
+    ));
+    // Div(scores, sqrt_dk_val) → scaled_scores
+    nodes.push(NodeProto::simple(
+        "Div",
+        "scale_scores",
+        vec![scores_name.into(), "sqrt_dk_val".into()],
+        vec![scaled_name.into()],
+    ));
+
+    // Causal mask: Where(tri_mask, scaled_scores, -1e9)
+    let softmax_input = if causal {
+        let neg_inf_bytes: Vec<u8> = (-1e9_f32).to_le_bytes().to_vec();
+        initializers.push(TensorProto {
+            dims: vec![],
+            data_type: data_type::FLOAT,
+            name: "neg_inf".into(),
+            float_data: vec![],
+            int64_data: vec![],
+            raw_data: neg_inf_bytes,
+        });
+        // tri_mask is a boolean constant that must be provided at runtime or as an initializer.
+        // We add a placeholder input for it.
+        nodes.push(NodeProto::simple(
+            "Where",
+            "causal_mask",
+            vec!["tri_mask".into(), scaled_name.into(), "neg_inf".into()],
+            vec!["masked_scores".into()],
+        ));
+        "masked_scores"
+    } else {
+        scaled_name
+    };
+
+    // Softmax
+    nodes.push(NodeProto::simple(
+        "Softmax",
+        "softmax_0",
+        vec![softmax_input.into()],
+        vec![attn_name.into()],
+    ));
+    // MatMul(attn, V) → output
+    nodes.push(NodeProto::simple(
+        "MatMul",
+        "matmul_av",
+        vec![attn_name.into(), v_src],
+        vec![final_output_name.clone()],
+    ));
+
+    if num_heads > 1 {
+        // Reshape back: [batch, num_heads, seq, head_dim] → [batch, seq, d_model]
+        nodes.push(NodeProto::with_attrs(
+            "Transpose",
+            "transpose_mh_out",
+            vec![final_output_name],
+            vec!["attn_transposed".into()],
+            vec![AttributeProto::ints("perm", vec![0, 2, 1, 3])],
+        ));
+        nodes.push(NodeProto::with_attrs(
+            "Reshape",
+            "reshape_mh_out",
+            vec!["attn_transposed".into(), "out_shape".into()],
+            vec![output.name.clone()],
+            vec![],
+        ));
+        initializers.push(TensorProto {
+            dims: vec![3],
+            data_type: data_type::INT64,
+            name: "out_shape".into(),
+            float_data: vec![],
+            int64_data: vec![0, -1, -1],
+            raw_data: vec![],
+        });
+    }
+
+    let mut inputs = vec![
+        ValueInfoProto::tensor(&query.name, query.elem_type, q_shape),
+        ValueInfoProto::tensor(&key.name, key.elem_type, k_shape),
+        ValueInfoProto::tensor(&value.name, value.elem_type, v_shape),
+        // dk_axis is an initializer with default value; listed as input for ONNX compliance.
+        ValueInfoProto::tensor("dk_axis", data_type::INT64, vec![]),
+    ];
+    if causal {
+        inputs.push(ValueInfoProto::tensor(
+            "tri_mask",
+            data_type::BOOL,
+            vec![
+                TensorShapeDimension::symbolic(seq_len),
+                TensorShapeDimension::symbolic(seq_len),
+            ],
+        ));
+    }
+
     GraphProto {
         name: ep_name.into(),
-        initializer: vec![TensorProto {
-            dims: vec![],
-            data_type: data_type::INT64,
-            name: "dk_axis".into(),
-            float_data: vec![],
-            int64_data: vec![1],
-            raw_data: vec![],
-        }],
-        node: vec![
-            // Transpose K
-            NodeProto::with_attrs(
-                "Transpose",
-                "transpose_k",
-                vec![key.name.clone()],
-                vec![kt_name.into()],
-                vec![AttributeProto::ints("perm", vec![1, 0])],
-            ),
-            // MatMul(Q, K^T) → scores
-            NodeProto::simple(
-                "MatMul",
-                "matmul_qk",
-                vec![query.name.clone(), kt_name.into()],
-                vec![scores_name.into()],
-            ),
-            // Shape(Q) → [seq_len, d_k]
-            NodeProto::simple(
-                "Shape",
-                "shape_q",
-                vec![query.name.clone()],
-                vec!["query_shape".into()],
-            ),
-            // Gather(query_shape, 1) → d_k dimension (scalar)
-            NodeProto::simple(
-                "Gather",
-                "gather_dk",
-                vec!["query_shape".into(), "dk_axis".into()],
-                vec!["dk_dim".into()],
-            ),
-            // Cast(dk_dim, to=FLOAT) → scalar f32
-            NodeProto::with_attrs(
-                "Cast",
-                "cast_dk",
-                vec!["dk_dim".into()],
-                vec!["dk_float".into()],
-                vec![AttributeProto::int("to", data_type::FLOAT as i64)],
-            ),
-            // Sqrt(dk_float) → sqrt(d_k)
-            NodeProto::simple(
-                "Sqrt",
-                "sqrt_dk",
-                vec!["dk_float".into()],
-                vec!["sqrt_dk_val".into()],
-            ),
-            // Div(scores, sqrt_dk_val) → scaled_scores
-            NodeProto::simple(
-                "Div",
-                "scale_scores",
-                vec![scores_name.into(), "sqrt_dk_val".into()],
-                vec![scaled_name.into()],
-            ),
-            // Softmax
-            NodeProto::simple(
-                "Softmax",
-                "softmax_0",
-                vec![scaled_name.into()],
-                vec![attn_name.into()],
-            ),
-            // MatMul(attn, V) → output
-            NodeProto::simple(
-                "MatMul",
-                "matmul_av",
-                vec![attn_name.into(), value.name.clone()],
-                vec![output.name.clone()],
-            ),
-        ],
-        input: vec![
-            ValueInfoProto::tensor(&query.name, query.elem_type, q_shape),
-            ValueInfoProto::tensor(&key.name, key.elem_type, k_shape),
-            ValueInfoProto::tensor(&value.name, value.elem_type, v_shape),
-            // dk_axis is an initializer with default value; listed as input for ONNX compliance.
-            ValueInfoProto::tensor("dk_axis", data_type::INT64, vec![]),
-        ],
+        initializer: initializers,
+        node: nodes,
+        input: inputs,
         output: vec![ValueInfoProto::tensor(
             &output.name,
             output.elem_type,
@@ -1321,6 +1443,9 @@ mod tests {
             output: make_tensor("out", TensorRole::Output),
             d_k: "d_k".into(),
             seq_len: "seq_len".into(),
+            num_heads: 1,
+            num_kv_heads: 1,
+            causal: false,
         };
         let model = build_model(&pattern, "attention", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
