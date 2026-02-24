@@ -190,22 +190,17 @@ fn split_produces_split_node() {
     assert_eq!(graph.node[0].op_type, "Split");
 }
 
-// --- Embedded weights ---
+// --- VecAdd with embedded constant weight ---
 
 #[test]
-fn vecadd_const_has_embedded_weights() {
+fn vecadd_const_has_initializer() {
     let source = common::load_example("vecadd_const");
-    let module = common::parse_wgsl(&source);
-    let weights = nxpu_analysis::extract_embedded_weights(&module);
-    assert!(!weights.is_empty(), "expected at least one embedded weight");
-    let bias = weights
-        .iter()
-        .find(|w| w.name == "bias")
-        .expect("expected 'bias' weight");
-    assert_eq!(bias.dims, vec![4]);
-    assert_eq!(bias.data.len(), 4);
-    assert!((bias.data[0] - 0.1).abs() < 1e-6);
-    assert!((bias.data[3] - 0.4).abs() < 1e-6);
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.as_ref().unwrap();
+    assert_eq!(graph.node[0].op_type, "Add");
+    assert!(!graph.initializer.is_empty(), "expected initializer");
+    assert_eq!(graph.initializer[0].name, "bias");
 }
 
 // --- Attention ---

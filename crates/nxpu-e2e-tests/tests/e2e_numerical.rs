@@ -179,6 +179,15 @@ fn vecadd_numerical() {
     assert_close(&result, &[5.0, 7.0, 9.0]);
 }
 
+// --- VecAdd with embedded constant ---
+
+#[test]
+fn vecadd_const_numerical() {
+    let source = common::load_example("vecadd_const");
+    let result = run_onnx_1d(&source, vec![vec![1.0, 2.0, 3.0, 4.0]]);
+    assert_close(&result, &[1.1, 2.2, 3.3, 4.4]);
+}
+
 // --- VecSub ---
 
 #[test]
@@ -328,7 +337,8 @@ fn batchnorm_numerical() {
 #[test]
 fn attention_numerical() {
     let source = common::load_example("attention");
-    // Q=K=V: 2×2 identity matrix; the lowering bakes sqrt_dk = sqrt(64) = 8.0
+    // Q=K=V: 2×2 identity matrix
+    // Dynamic sqrt(d_k): d_k = last dim of Q = 2, so sqrt(d_k) = sqrt(2) ≈ 1.4142
     let eye = vec![1.0, 0.0, 0.0, 1.0];
     let result = run_onnx(
         &source,
@@ -338,9 +348,10 @@ fn attention_numerical() {
             (eye, vec![2, 2]),
         ],
     );
-    // scores = Q·K^T / 8 = I / 8 = [[0.125, 0], [0, 0.125]]
-    // softmax row0: [e^0.125/(e^0.125+1), 1/(e^0.125+1)]
-    let e = (0.125_f32).exp();
+    // scores = Q·K^T / sqrt(2) = I / sqrt(2) = [[0.7071, 0], [0, 0.7071]]
+    // softmax row0: [e^0.7071/(e^0.7071+1), 1/(e^0.7071+1)]
+    let scale = 1.0_f32 / 2.0_f32.sqrt();
+    let e = scale.exp();
     let s = e + 1.0;
     let w_hi = e / s;
     let w_lo = 1.0 / s;

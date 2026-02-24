@@ -466,6 +466,7 @@ pub fn classify_entry_point(
     // 1. Classify globals by address space.
     let mut inputs: Vec<(Handle<GlobalVariable>, &GlobalVariable)> = Vec::new();
     let mut outputs: Vec<(Handle<GlobalVariable>, &GlobalVariable)> = Vec::new();
+    let mut init_globals: Vec<(Handle<GlobalVariable>, &GlobalVariable)> = Vec::new();
     let mut params_members: Option<&[nxpu_ir::StructMember]> = None;
 
     for (handle, gv) in module.global_variables.iter() {
@@ -482,7 +483,11 @@ pub fn classify_entry_point(
                     params_members = Some(members);
                 }
             }
-            _ => {}
+            _ => {
+                if gv.init.is_some() {
+                    init_globals.push((handle, gv));
+                }
+            }
         }
     }
 
@@ -529,6 +534,20 @@ pub fn classify_entry_point(
                 return Ok(KernelPattern::Activation {
                     op: act_op,
                     input,
+                    output,
+                    dim_name,
+                });
+            }
+
+            // ElementWise with embedded weight: 1 storage input + binary op + private init global.
+            if let Some(ew_op) = find_store_binary_op(&ep.function.body, &ep.function.expressions)
+                && let Some(&(wh, wgv)) = init_globals.first()
+            {
+                let weight = make_binding(module, wh, wgv, TensorRole::Input);
+                let dim_name = shape_names.first().cloned().unwrap_or_else(|| "N".into());
+                return Ok(KernelPattern::ElementWise {
+                    op: ew_op,
+                    inputs: [input, weight],
                     output,
                     dim_name,
                 });
@@ -1756,6 +1775,160 @@ mod tests {
             matches!(&pattern, KernelPattern::Unknown { .. }),
             "expected Unknown pattern, got {pattern:?}"
         );
+    }
+
+    #[test]
+    fn classify_elementwise_with_embedded_weight() {
+        // 1 storage input + 1 output + private global with init + binary Add → ElementWise.
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let array_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+        let array_f32_4 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Constant(4),
+                stride: 4,
+            },
+        });
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members: vec![StructMember {
+                    name: Some("N".into()),
+                    ty: u32_ty,
+                    offset: 0,
+                }],
+                span: 4,
+            },
+        });
+
+        // Storage input (binding 0)
+        module.global_variables.append(GlobalVariable {
+            name: Some("input".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Storage output (binding 1)
+        module.global_variables.append(GlobalVariable {
+            name: Some("output".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 1,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+
+        // Private global with init (embedded weight)
+        let lit0 = module
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(0.1)));
+        let lit1 = module
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(0.2)));
+        let lit2 = module
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(0.3)));
+        let lit3 = module
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(0.4)));
+        let compose = module.global_expressions.append(Expression::Compose {
+            ty: array_f32_4,
+            components: vec![lit0, lit1, lit2, lit3],
+        });
+        module.global_variables.append(GlobalVariable {
+            name: Some("bias".into()),
+            space: AddressSpace::Private,
+            binding: None,
+            ty: array_f32_4,
+            init: Some(compose),
+            layout: None,
+        });
+
+        // Uniform params
+        module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 2,
+            }),
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Entry point: Store of Binary Add (no loop)
+        let mut func = Function::new("main");
+        let left = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        let right = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(2.0)));
+        let binary = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        });
+        let ptr = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        func.body.push(Statement::Store {
+            pointer: ptr,
+            value: binary,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [64, 1, 1],
+            function: func,
+        });
+
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::ElementWise {
+                op,
+                inputs,
+                output,
+                dim_name,
+            } => {
+                assert_eq!(*op, ElementWiseOp::Add);
+                assert_eq!(inputs[0].name, "input");
+                assert_eq!(inputs[1].name, "bias");
+                assert_eq!(output.name, "output");
+                assert_eq!(dim_name, "N");
+            }
+            _ => panic!("expected ElementWise pattern, got {pattern:?}"),
+        }
     }
 
     #[test]

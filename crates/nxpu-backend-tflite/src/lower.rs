@@ -908,10 +908,11 @@ fn build_tflite_pool(
 /// Build a TFLite model for attention:
 ///   BATCH_MATMUL(Q,K) → DIV(scores, sqrt_dk) → SOFTMAX(beta=1.0) → BATCH_MATMUL(attn,V).
 ///
-/// The `d_k` string is parsed to an f32; if parsing fails a fallback of 64.0 is used
-/// (matching ONNX and StableHLO backends).
-/// `sqrt(d_k)` is embedded as a scalar constant tensor so the runtime performs the
-/// standard scaled dot-product attention.
+/// The `d_k` string is parsed to an f32; if parsing fails a fallback of 64.0 is used.
+/// NOTE: Unlike the ONNX and StableHLO backends which compute sqrt(d_k) dynamically
+/// from the query tensor's shape, TFLite lacks dynamic shape operators. The sqrt(d_k)
+/// value is embedded as a compile-time constant. When d_k is symbolic (a param name
+/// rather than a number), the fallback value of sqrt(64) = 8.0 is used.
 fn build_tflite_attention(
     query: &TensorBinding,
     key: &TensorBinding,

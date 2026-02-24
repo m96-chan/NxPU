@@ -74,6 +74,11 @@ pub struct TensorProto {
     pub float_data: Vec<f32>,
     #[prost(int64, repeated, tag = "7")]
     pub int64_data: Vec<i64>,
+    /// Raw binary tensor data. When present, data is serialized as little-endian
+    /// bytes and `float_data`/`int64_data` should be empty. This is the preferred
+    /// format for large tensors (weights, embeddings).
+    #[prost(bytes = "vec", tag = "9")]
+    pub raw_data: Vec<u8>,
 }
 
 /// A single operator invocation.
@@ -381,5 +386,42 @@ mod tests {
         let type_proto::Value::TensorType(tensor) = ty.value.unwrap();
         assert_eq!(tensor.elem_type, data_type::FLOAT);
         assert_eq!(tensor.shape.unwrap().dim.len(), 1);
+    }
+
+    #[test]
+    fn tensor_proto_raw_data_roundtrip() {
+        // 6 floats as raw little-endian bytes (24 bytes)
+        let floats = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let raw: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let tensor = TensorProto {
+            dims: vec![2, 3],
+            data_type: data_type::FLOAT,
+            name: "weights".into(),
+            float_data: vec![],
+            int64_data: vec![],
+            raw_data: raw.clone(),
+        };
+        let bytes = tensor.encode_to_vec();
+        let decoded = TensorProto::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.dims, vec![2, 3]);
+        assert_eq!(decoded.name, "weights");
+        assert_eq!(decoded.raw_data, raw);
+        assert!(decoded.float_data.is_empty());
+    }
+
+    #[test]
+    fn tensor_proto_raw_data_empty_when_using_float_data() {
+        let tensor = TensorProto {
+            dims: vec![2],
+            data_type: data_type::FLOAT,
+            name: "bias".into(),
+            float_data: vec![0.1, 0.2],
+            int64_data: vec![],
+            raw_data: vec![],
+        };
+        let bytes = tensor.encode_to_vec();
+        let decoded = TensorProto::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.float_data, vec![0.1, 0.2]);
+        assert!(decoded.raw_data.is_empty());
     }
 }
