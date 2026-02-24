@@ -209,6 +209,7 @@ fn run() -> miette::Result<()> {
     })?;
 
     // 6b. Resolve precision and run quantization pass.
+    let mut quantization_params: Vec<nxpu_backend_core::QuantParam> = Vec::new();
     let resolved_precision = match cli.precision {
         PrecisionPolicy::Keep => None,
         PrecisionPolicy::Explicit(p) => Some(p),
@@ -262,6 +263,15 @@ fn run() -> miette::Result<()> {
                         }
                     }
 
+                    // Capture quantization params for embedding in output.
+                    for (name, params) in &cal_result.tensor_params {
+                        quantization_params.push(nxpu_backend_core::QuantParam {
+                            name: name.clone(),
+                            scale: params.scale,
+                            zero_point: params.zero_point,
+                        });
+                    }
+
                     nxpu_opt::F32ToInt8::with_calibration_result(cal_result).run(&mut module);
                 } else {
                     nxpu_opt::F32ToInt8::default().run(&mut module);
@@ -279,6 +289,7 @@ fn run() -> miette::Result<()> {
         },
         precision: cli.precision,
         memory_plan: Some(memory_plan),
+        quantization_params,
     };
 
     let output = backend

@@ -416,9 +416,13 @@ pub fn calibrate_percentile(
 
 /// Compute quantization parameters using KL-divergence (entropy) calibration.
 ///
-/// Finds the optimal threshold that minimizes the KL divergence between the
-/// original float distribution and the quantized distribution. This is the
-/// standard TensorRT-style calibration approach.
+/// Finds the optimal symmetric clipping threshold that minimizes the KL
+/// divergence between the original float distribution and the quantized
+/// distribution. This is the standard TensorRT-style calibration approach.
+///
+/// The search expands outward from the histogram center (value 0),
+/// trying symmetric clip ranges `[-T, T]` and selecting the T that
+/// minimizes KL divergence.
 pub fn calibrate_kl_divergence(hist: &TensorHistogram) -> QuantizationParams {
     let num_bins = hist.bins.len();
     if num_bins < 128 {
@@ -438,21 +442,45 @@ pub fn calibrate_kl_divergence(hist: &TensorHistogram) -> QuantizationParams {
     let reference: Vec<f64> = hist.bins.iter().map(|&c| c as f64 / total as f64).collect();
 
     let target_bins: usize = 128; // int8 quantization levels
+    let bin_width = (hist.max - hist.min) / num_bins as f32;
+
+    // Find the bin index closest to value 0 (center for symmetric quantization).
+    let zero_bin = if hist.min >= 0.0 {
+        0
+    } else if hist.max <= 0.0 {
+        num_bins
+    } else {
+        ((-hist.min) / bin_width) as usize
+    };
+    let zero_bin = zero_bin.min(num_bins);
+
+    // Search for the optimal symmetric threshold by expanding from center.
+    // `extent` is the number of bins on each side of zero_bin.
+    let max_extent = zero_bin.max(num_bins - zero_bin);
+    let min_extent = target_bins / 2; // need at least 64 bins per side
+
     let mut best_divergence = f64::INFINITY;
-    let mut best_threshold_bin = num_bins;
+    let mut best_abs_threshold = hist.min.abs().max(hist.max.abs());
 
-    // Try different thresholds starting from 128 bins up to the full histogram.
-    let start_bin = target_bins;
-    for threshold_bin in start_bin..=num_bins {
-        // Create a truncated distribution clipped at threshold_bin.
-        let mut truncated = reference[..threshold_bin].to_vec();
+    for extent in min_extent..=max_extent {
+        let lo = zero_bin.saturating_sub(extent);
+        let hi = (zero_bin + extent).min(num_bins);
+        let clip_len = hi - lo;
 
-        // Collect outlier mass into the last bin.
-        if threshold_bin < num_bins {
-            let outlier_mass: f64 = reference[threshold_bin..].iter().sum();
-            if let Some(last) = truncated.last_mut() {
-                *last += outlier_mass;
-            }
+        if clip_len < target_bins {
+            continue;
+        }
+
+        // Create the clipped distribution, folding outliers from both sides.
+        let mut truncated = reference[lo..hi].to_vec();
+
+        let left_outlier: f64 = reference[..lo].iter().sum();
+        let right_outlier: f64 = reference[hi..].iter().sum();
+        if let Some(first) = truncated.first_mut() {
+            *first += left_outlier;
+        }
+        if let Some(last) = truncated.last_mut() {
+            *last += right_outlier;
         }
 
         let truncated_sum: f64 = truncated.iter().sum();
@@ -460,8 +488,8 @@ pub fn calibrate_kl_divergence(hist: &TensorHistogram) -> QuantizationParams {
             continue;
         }
 
-        // Quantize: map threshold_bin bins down to target_bins.
-        let bins_per_quant = threshold_bin as f64 / target_bins as f64;
+        // Quantize: map clip_len bins down to target_bins.
+        let bins_per_quant = clip_len as f64 / target_bins as f64;
         let mut quantized = vec![0.0f64; target_bins];
 
         for (i, &val) in truncated.iter().enumerate() {
@@ -470,16 +498,15 @@ pub fn calibrate_kl_divergence(hist: &TensorHistogram) -> QuantizationParams {
             quantized[q_idx] += val;
         }
 
-        // Expand quantized distribution back to threshold_bin bins.
-        let mut expanded = vec![0.0f64; threshold_bin];
+        // Expand quantized distribution back to clip_len bins.
+        let mut expanded = vec![0.0f64; clip_len];
         for (q_idx, &q_val) in quantized.iter().enumerate() {
             let start = (q_idx as f64 * bins_per_quant) as usize;
-            let end = (((q_idx + 1) as f64 * bins_per_quant) as usize).min(threshold_bin);
+            let end = (((q_idx + 1) as f64 * bins_per_quant) as usize).min(clip_len);
             let num_expanded = end - start;
             if num_expanded == 0 {
                 continue;
             }
-            // Count non-zero bins in this range.
             let nonzero_count = truncated[start..end].iter().filter(|&&v| v > 1e-12).count();
             if nonzero_count == 0 {
                 continue;
@@ -496,23 +523,20 @@ pub fn calibrate_kl_divergence(hist: &TensorHistogram) -> QuantizationParams {
         let divergence = kl_divergence(&truncated, &expanded);
         if divergence < best_divergence {
             best_divergence = divergence;
-            best_threshold_bin = threshold_bin;
+            let lo_val = hist.min + bin_width * lo as f32;
+            let hi_val = hist.min + bin_width * hi as f32;
+            best_abs_threshold = lo_val.abs().max(hi_val.abs());
         }
     }
 
-    // Convert best threshold bin to a clipping range.
-    let bin_width = (hist.max - hist.min) / num_bins as f32;
-    let threshold = hist.min + bin_width * best_threshold_bin as f32;
-    let abs_threshold = hist.min.abs().max(threshold.abs());
-
-    if abs_threshold < f32::EPSILON {
+    if best_abs_threshold < f32::EPSILON {
         return QuantizationParams {
             scale: 1.0,
             zero_point: 0,
         };
     }
 
-    let scale = abs_threshold / 127.0;
+    let scale = best_abs_threshold / 127.0;
     QuantizationParams {
         scale,
         zero_point: 0,
@@ -1119,5 +1143,95 @@ mod tests {
         let params = calibrate(&hist, &CalibrationMethod::KlDivergence, true);
         assert!(params.scale > 0.0);
         assert_eq!(params.zero_point, 0);
+    }
+
+    // ---- KL vs MinMax accuracy comparison ----
+
+    /// Compute mean squared quantization error for a set of values given params.
+    fn quantization_mse(values: &[f32], params: &QuantizationParams) -> f64 {
+        let mut mse = 0.0f64;
+        for &v in values {
+            let q = ((v / params.scale) + params.zero_point as f32).round();
+            let q = q.clamp(-128.0, 127.0);
+            let dequant = (q - params.zero_point as f32) * params.scale;
+            let err = (v - dequant) as f64;
+            mse += err * err;
+        }
+        mse / values.len() as f64
+    }
+
+    #[test]
+    fn kl_produces_tighter_range_than_minmax_for_nonuniform() {
+        // Generate a peaked (approximately normal) distribution with heavy tails.
+        // KL calibration should find a tighter clipping threshold that reduces
+        // quantization error compared to MinMax, which uses the full range
+        // including distant outliers.
+        let mut values = Vec::new();
+        // Core distribution: many values clustered around 0 (range ~[-3,3])
+        for i in 0..50000 {
+            let x = (i as f32 - 25000.0) / 8000.0; // range ~ [-3.1, 3.1]
+            let density = (-x * x / 2.0).exp();
+            let count = (density * 20.0) as usize;
+            for _ in 0..count.max(1) {
+                values.push(x);
+            }
+        }
+        // Add very sparse, extreme outliers to stretch the MinMax range
+        // These are few compared to the core (< 0.1%) but push min/max far out.
+        for i in 0..5 {
+            values.push(200.0 + i as f32);
+            values.push(-200.0 - i as f32);
+        }
+
+        let hist = TensorHistogram::from_values(&values, 2048).unwrap();
+
+        let minmax_params = calibrate_minmax(&hist, true);
+        let kl_params = calibrate_kl_divergence(&hist);
+
+        // KL should find a smaller scale (tighter range) than MinMax because
+        // it ignores the sparse outliers.
+        assert!(
+            kl_params.scale < minmax_params.scale,
+            "KL scale ({}) should be less than MinMax scale ({})",
+            kl_params.scale,
+            minmax_params.scale,
+        );
+
+        // KL should have lower quantization error on the core distribution
+        // (the non-outlier values).
+        let core_values: Vec<f32> = values
+            .iter()
+            .filter(|&&v| v.abs() < 10.0)
+            .copied()
+            .collect();
+
+        let mse_minmax = quantization_mse(&core_values, &minmax_params);
+        let mse_kl = quantization_mse(&core_values, &kl_params);
+
+        assert!(
+            mse_kl < mse_minmax,
+            "KL MSE ({mse_kl:.6}) should be less than MinMax MSE ({mse_minmax:.6}) on core distribution",
+        );
+    }
+
+    #[test]
+    fn kl_always_produces_tighter_or_equal_range_to_minmax() {
+        // For any distribution, KL should never produce a LARGER scale than
+        // MinMax, since MinMax uses the absolute range and KL optimizes for
+        // the best fit.
+        let values: Vec<f32> = (0..10000).map(|i| i as f32 / 10000.0 * 6.0 - 3.0).collect();
+
+        let hist = TensorHistogram::from_values(&values, 2048).unwrap();
+
+        let minmax_params = calibrate_minmax(&hist, true);
+        let kl_params = calibrate_kl_divergence(&hist);
+
+        assert!(
+            kl_params.scale <= minmax_params.scale + 1e-6,
+            "KL scale ({}) should be <= MinMax scale ({})",
+            kl_params.scale,
+            minmax_params.scale,
+        );
+        assert!(kl_params.scale > 0.0);
     }
 }

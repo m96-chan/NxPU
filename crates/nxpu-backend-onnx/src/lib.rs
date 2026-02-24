@@ -32,7 +32,7 @@ impl Backend for OnnxBackend {
     fn compile(
         &self,
         module: &Module,
-        _opts: &BackendOptions,
+        opts: &BackendOptions,
     ) -> Result<BackendOutput, BackendError> {
         if module.entry_points.is_empty() {
             return Err(BackendError::Other("no entry points in module".into()));
@@ -92,7 +92,20 @@ impl Backend for OnnxBackend {
                 message: format!("entry point '{ep_name}': classified as {summary}"),
             });
 
-            let model = lower::build_fused_model(fp, ep_name, &weights)?;
+            let mut model = lower::build_fused_model(fp, ep_name, &weights)?;
+
+            // Embed quantization parameters in ONNX metadata_props.
+            for qp in &opts.quantization_params {
+                model.metadata_props.push(proto::StringStringEntryProto {
+                    key: format!("quant:{}:scale", qp.name),
+                    value: format!("{}", qp.scale),
+                });
+                model.metadata_props.push(proto::StringStringEntryProto {
+                    key: format!("quant:{}:zero_point", qp.name),
+                    value: format!("{}", qp.zero_point),
+                });
+            }
+
             let bytes = model.encode_to_vec();
 
             let filename = if fused.len() == 1 {

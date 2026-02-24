@@ -29,7 +29,7 @@ impl Backend for TfLiteBackend {
     fn compile(
         &self,
         module: &Module,
-        _opts: &BackendOptions,
+        opts: &BackendOptions,
     ) -> Result<BackendOutput, BackendError> {
         if module.entry_points.is_empty() {
             return Err(BackendError::Other("no entry points in module".into()));
@@ -97,6 +97,25 @@ impl Backend for TfLiteBackend {
             files.push(OutputFile {
                 name: filename,
                 content: OutputContent::Binary(bytes),
+            });
+        }
+
+        // 4. Emit quantization parameters as a companion JSON file.
+        if !opts.quantization_params.is_empty() {
+            let mut json = String::from("{\n  \"quantization_params\": [\n");
+            for (i, qp) in opts.quantization_params.iter().enumerate() {
+                if i > 0 {
+                    json.push_str(",\n");
+                }
+                json.push_str(&format!(
+                    "    {{\"name\": \"{}\", \"scale\": {}, \"zero_point\": {}}}",
+                    qp.name, qp.scale, qp.zero_point
+                ));
+            }
+            json.push_str("\n  ]\n}\n");
+            files.push(OutputFile {
+                name: "quant_params.json".into(),
+                content: OutputContent::Text(json),
             });
         }
 
