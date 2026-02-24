@@ -198,6 +198,80 @@ mod tests {
     }
 
     #[test]
+    fn compile_with_quantization_params_sets_metadata() {
+        let source = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+struct Params { N: u32 }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.N) { return; }
+  c[idx] = a[idx] + b[idx];
+}
+"#;
+
+        let module = nxpu_parser::parse(source).unwrap();
+        let backend = OnnxBackend;
+        let opts = BackendOptions {
+            quantization_params: vec![
+                nxpu_backend_core::QuantParam {
+                    name: "x".into(),
+                    scale: 0.5,
+                    zero_point: 0,
+                },
+                nxpu_backend_core::QuantParam {
+                    name: "y".into(),
+                    scale: 0.25,
+                    zero_point: 128,
+                },
+            ],
+            ..Default::default()
+        };
+        let output = backend.compile(&module, &opts).unwrap();
+
+        assert_eq!(output.files.len(), 1);
+        let bytes = match &output.files[0].content {
+            OutputContent::Binary(b) => b,
+            _ => panic!("expected binary output"),
+        };
+
+        let model = proto::ModelProto::decode(bytes.as_slice()).unwrap();
+
+        // Should have 4 metadata_props: scale+zero_point for each of "x" and "y"
+        assert_eq!(model.metadata_props.len(), 4);
+
+        let keys: Vec<&str> = model
+            .metadata_props
+            .iter()
+            .map(|p| p.key.as_str())
+            .collect();
+        assert!(keys.contains(&"quant:x:scale"));
+        assert!(keys.contains(&"quant:x:zero_point"));
+        assert!(keys.contains(&"quant:y:scale"));
+        assert!(keys.contains(&"quant:y:zero_point"));
+
+        // Verify values
+        let x_scale = model
+            .metadata_props
+            .iter()
+            .find(|p| p.key == "quant:x:scale")
+            .unwrap();
+        assert_eq!(x_scale.value, "0.5");
+
+        let y_zp = model
+            .metadata_props
+            .iter()
+            .find(|p| p.key == "quant:y:zero_point")
+            .unwrap();
+        assert_eq!(y_zp.value, "128");
+    }
+
+    #[test]
     fn compile_vecadd_wgsl() {
         let source = r#"
 @group(0) @binding(0) var<storage, read> a: array<f32>;

@@ -589,6 +589,65 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     #[test]
+    fn compile_with_quantization_params_emits_json() {
+        let source = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+struct Params { N: u32 }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.N) { return; }
+  c[idx] = a[idx] + b[idx];
+}
+"#;
+
+        let module = nxpu_parser::parse(source).unwrap();
+        let backend = TfLiteBackend;
+        let opts = BackendOptions {
+            quantization_params: vec![
+                nxpu_backend_core::QuantParam {
+                    name: "x".into(),
+                    scale: 0.5,
+                    zero_point: 0,
+                },
+                nxpu_backend_core::QuantParam {
+                    name: "y".into(),
+                    scale: 0.25,
+                    zero_point: 128,
+                },
+            ],
+            ..Default::default()
+        };
+        let output = backend.compile(&module, &opts).unwrap();
+
+        // Should have the .tflite file plus quant_params.json
+        assert!(output.files.len() >= 2);
+
+        let json_file = output
+            .files
+            .iter()
+            .find(|f| f.name == "quant_params.json")
+            .expect("expected quant_params.json file");
+
+        let json_text = match &json_file.content {
+            OutputContent::Text(t) => t,
+            _ => panic!("expected text content for quant_params.json"),
+        };
+
+        assert!(json_text.contains("\"name\": \"x\""));
+        assert!(json_text.contains("\"scale\": 0.5"));
+        assert!(json_text.contains("\"zero_point\": 0"));
+        assert!(json_text.contains("\"name\": \"y\""));
+        assert!(json_text.contains("\"scale\": 0.25"));
+        assert!(json_text.contains("\"zero_point\": 128"));
+    }
+
+    #[test]
     fn pattern_summary_all_variants() {
         use nxpu_analysis::analyze::*;
 
