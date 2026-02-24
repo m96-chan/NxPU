@@ -6,6 +6,7 @@
 
 pub mod calibrate;
 mod const_fold;
+mod cse;
 mod dce;
 mod fma_fusion;
 pub mod fusion;
@@ -14,7 +15,10 @@ pub mod memory;
 pub mod quantize;
 pub mod schedule;
 pub mod shape;
+pub mod tiling;
 mod validation;
+pub mod vectorize;
+pub mod workgroup;
 
 pub use calibrate::{
     CalibrationDataset, CalibrationError, CalibrationMethod, CalibrationResult, HistogramCollector,
@@ -22,6 +26,7 @@ pub use calibrate::{
     per_channel_quantize, run_calibration,
 };
 pub use const_fold::ConstantFolding;
+pub use cse::CommonSubexprElimination;
 pub use dce::DeadCodeElimination;
 pub use fma_fusion::FmaFusion;
 pub use fusion::OperatorFusion;
@@ -37,7 +42,16 @@ pub use quantize::{
 };
 pub use schedule::{Schedule, SchedulePass, ScheduleSlot, compute_schedules, format_schedule};
 pub use shape::ShapeInference;
+pub use tiling::{
+    Conv2DShape as TilingConv2DShape, MatMulShape as TilingMatMulShape, TileConfig, TilingDefaults,
+    TilingPass, TilingPlan, tile_conv2d, tile_matmul,
+};
 pub use validation::{IrValidation, ValidationWarning, collect_warnings};
+pub use vectorize::{VectorWidth, VectorizationHint, VectorizationPass, analyze_vectorization};
+pub use workgroup::{
+    OccupancyResult, WorkgroupHwParams, WorkgroupOptimization, calculate_occupancy,
+    optimize_workgroup_size,
+};
 
 use std::fmt::Debug;
 
@@ -98,6 +112,7 @@ impl PassManager {
                 pm.add_pre_pass(Box::new(IrValidation));
                 pm.add_pass(Box::new(ConstantFolding));
                 pm.add_pass(Box::new(FmaFusion));
+                pm.add_pass(Box::new(CommonSubexprElimination));
                 pm.add_pass(Box::new(OperatorFusion));
                 pm.add_pass(Box::new(DeadCodeElimination));
             }

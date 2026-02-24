@@ -61,6 +61,10 @@ struct Cli {
     #[arg(long, default_value = "minmax", value_parser = parse_calibration_method)]
     calibration_method: nxpu_opt::CalibrationMethod,
 
+    /// Print per-op cost estimation and roofline latency analysis to stderr
+    #[arg(long)]
+    estimate_latency: bool,
+
     /// Verbose output (print calibration statistics, etc.)
     #[arg(short, long)]
     verbose: bool,
@@ -196,6 +200,35 @@ fn run() -> miette::Result<()> {
         }
     }
 
+    // 4d. Optionally estimate per-op latency using roofline model.
+    if cli.estimate_latency {
+        let profiles = nxpu_analysis::default_profiles();
+        for (i, ep) in module.entry_points.iter().enumerate() {
+            let pattern = match nxpu_analysis::classify_entry_point(&module, i) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Entry point '{}': classification failed: {e}", ep.name);
+                    continue;
+                }
+            };
+            let cost = nxpu_analysis::estimate_kernel_cost(&pattern);
+            eprintln!("Entry point '{}': {}", ep.name, pattern);
+            eprintln!("  {cost}");
+            eprintln!(
+                "  Arithmetic intensity: {:.2} FLOP/byte",
+                cost.arithmetic_intensity()
+            );
+            for (target, profile) in &profiles {
+                let latency = profile.predict_latency_secs(&cost);
+                let bottleneck = profile.bottleneck(&cost);
+                eprintln!(
+                    "  [{target}] {}: {latency:.6}s ({bottleneck})",
+                    profile.name
+                );
+            }
+        }
+    }
+
     // 5. Dry-run: stop here.
     if cli.dry_run {
         return Ok(());
@@ -302,6 +335,8 @@ fn run() -> miette::Result<()> {
         memory_plan: Some(memory_plan),
         quantization_params,
         per_channel_params,
+        tiling_plans: Vec::new(),
+        vectorization_hints: Vec::new(),
     };
 
     let output = backend
