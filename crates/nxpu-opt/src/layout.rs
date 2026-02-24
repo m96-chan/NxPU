@@ -8,6 +8,96 @@ use nxpu_ir::{MemoryLayout, Module, TypeInner};
 
 use crate::Pass;
 
+/// Returns the permutation needed to convert from one layout to another.
+///
+/// NHWC -> NCHW = [0, 3, 1, 2]  (move channels from last to second)
+/// NCHW -> NHWC = [0, 2, 3, 1]  (move channels from second to last)
+///
+/// Returns `None` if layouts are the same or conversion is not applicable
+/// (e.g. between `RowMajor` and a spatial layout).
+pub fn layout_permutation(from: MemoryLayout, to: MemoryLayout) -> Option<Vec<i64>> {
+    match (from, to) {
+        (MemoryLayout::Nhwc, MemoryLayout::Nchw) => Some(vec![0, 3, 1, 2]),
+        (MemoryLayout::Nchw, MemoryLayout::Nhwc) => Some(vec![0, 2, 3, 1]),
+        _ => None, // Same layout or not a spatial layout conversion
+    }
+}
+
+/// Reorder 4-D shape dimensions from one layout to another.
+///
+/// Given dimensions in `from` layout order, returns them in `to` layout order.
+/// For example, if `from` = NCHW and the dims are `[N, C, H, W]`, converting to
+/// NHWC gives `[N, H, W, C]`.
+///
+/// Non-4-D shapes are returned unchanged, as are shapes where no permutation
+/// applies (same layout, or non-spatial layout pair).
+pub fn reorder_dims(dims: &[i64], from: MemoryLayout, to: MemoryLayout) -> Vec<i64> {
+    if dims.len() != 4 {
+        return dims.to_vec();
+    }
+    match layout_permutation(from, to) {
+        Some(perm) => perm.iter().map(|&p| dims[p as usize]).collect(),
+        None => dims.to_vec(),
+    }
+}
+
+/// Information about a needed transpose at a graph boundary.
+#[derive(Debug, Clone)]
+pub struct TransposeRecord {
+    /// Name of the global variable that needs transposing.
+    pub var_name: String,
+    /// The permutation to apply (e.g. `[0, 3, 1, 2]`).
+    pub perm: Vec<i64>,
+    /// Whether this is an input transpose (before computation) or output (after).
+    pub is_input: bool,
+}
+
+/// Pass that detects layout mismatches at graph boundaries and records
+/// the transposes needed to convert between layouts.
+///
+/// This is a two-phase approach:
+/// 1. [`LayoutTransform`] assigns target layouts to uninitialized globals.
+/// 2. `TransposeInsertion` detects globals whose current layout differs from
+///    the target and updates them, so the backend can emit the appropriate
+///    transpose operations.
+///
+/// The backend can call [`layout_permutation`] with the original and target
+/// layouts to obtain the concrete permutation vector.
+#[derive(Debug)]
+pub struct TransposeInsertion {
+    /// The target layout that the backend expects.
+    pub target: MemoryLayout,
+}
+
+impl Pass for TransposeInsertion {
+    fn name(&self) -> &str {
+        "TransposeInsertion"
+    }
+
+    fn run(&self, module: &mut Module) -> bool {
+        let mut changed = false;
+
+        for (_handle, gv) in module.global_variables.iter_mut() {
+            let current_layout = match gv.layout {
+                Some(l) => l,
+                None => continue,
+            };
+
+            if current_layout == self.target {
+                continue;
+            }
+
+            // Only convert between spatial layouts (NHWC <-> NCHW).
+            if layout_permutation(current_layout, self.target).is_some() {
+                gv.layout = Some(self.target);
+                changed = true;
+            }
+        }
+
+        changed
+    }
+}
+
 /// Assigns a target memory layout to all tensor-typed global variables
 /// that do not already have a layout annotation.
 ///
@@ -275,5 +365,258 @@ mod tests {
             }
         }
         assert_eq!(count_layout_mismatches(&module), 1);
+    }
+
+    // ---- layout_permutation tests ----
+
+    #[test]
+    fn layout_permutation_nhwc_to_nchw() {
+        assert_eq!(
+            layout_permutation(MemoryLayout::Nhwc, MemoryLayout::Nchw),
+            Some(vec![0, 3, 1, 2])
+        );
+    }
+
+    #[test]
+    fn layout_permutation_nchw_to_nhwc() {
+        assert_eq!(
+            layout_permutation(MemoryLayout::Nchw, MemoryLayout::Nhwc),
+            Some(vec![0, 2, 3, 1])
+        );
+    }
+
+    #[test]
+    fn layout_permutation_same_layout() {
+        assert_eq!(
+            layout_permutation(MemoryLayout::Nhwc, MemoryLayout::Nhwc),
+            None
+        );
+        assert_eq!(
+            layout_permutation(MemoryLayout::Nchw, MemoryLayout::Nchw),
+            None
+        );
+    }
+
+    #[test]
+    fn layout_permutation_row_major() {
+        assert_eq!(
+            layout_permutation(MemoryLayout::RowMajor, MemoryLayout::Nhwc),
+            None
+        );
+        assert_eq!(
+            layout_permutation(MemoryLayout::Nhwc, MemoryLayout::RowMajor),
+            None
+        );
+    }
+
+    #[test]
+    fn layout_permutation_col_major() {
+        assert_eq!(
+            layout_permutation(MemoryLayout::ColMajor, MemoryLayout::Nchw),
+            None
+        );
+    }
+
+    // ---- reorder_dims tests ----
+
+    #[test]
+    fn reorder_dims_nchw_to_nhwc() {
+        // NCHW [1, 3, 224, 224] -> NHWC [1, 224, 224, 3]
+        let nchw = vec![1, 3, 224, 224];
+        let nhwc = reorder_dims(&nchw, MemoryLayout::Nchw, MemoryLayout::Nhwc);
+        assert_eq!(nhwc, vec![1, 224, 224, 3]);
+    }
+
+    #[test]
+    fn reorder_dims_nhwc_to_nchw() {
+        // NHWC [1, 224, 224, 3] -> NCHW [1, 3, 224, 224]
+        let nhwc = vec![1, 224, 224, 3];
+        let nchw = reorder_dims(&nhwc, MemoryLayout::Nhwc, MemoryLayout::Nchw);
+        assert_eq!(nchw, vec![1, 3, 224, 224]);
+    }
+
+    #[test]
+    fn reorder_dims_non_4d_passthrough() {
+        let dims = vec![1, 2, 3];
+        assert_eq!(
+            reorder_dims(&dims, MemoryLayout::Nhwc, MemoryLayout::Nchw),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn reorder_dims_same_layout_passthrough() {
+        let dims = vec![1, 3, 224, 224];
+        assert_eq!(
+            reorder_dims(&dims, MemoryLayout::Nchw, MemoryLayout::Nchw),
+            vec![1, 3, 224, 224]
+        );
+    }
+
+    #[test]
+    fn reorder_dims_5d_passthrough() {
+        let dims = vec![1, 2, 3, 4, 5];
+        assert_eq!(
+            reorder_dims(&dims, MemoryLayout::Nhwc, MemoryLayout::Nchw),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn reorder_dims_roundtrip() {
+        let original = vec![1, 224, 224, 3]; // NHWC
+        let nchw = reorder_dims(&original, MemoryLayout::Nhwc, MemoryLayout::Nchw);
+        let back = reorder_dims(&nchw, MemoryLayout::Nchw, MemoryLayout::Nhwc);
+        assert_eq!(back, original);
+    }
+
+    // ---- TransposeInsertion pass tests ----
+
+    #[test]
+    fn no_transpose_when_layout_matches() {
+        let mut module = make_tensor_module();
+        // Assign all to Nhwc
+        let pass = LayoutTransform {
+            target: MemoryLayout::Nhwc,
+        };
+        pass.run(&mut module);
+        // All are Nhwc now, so TransposeInsertion targeting Nhwc should be a no-op
+        let pass2 = TransposeInsertion {
+            target: MemoryLayout::Nhwc,
+        };
+        assert!(!pass2.run(&mut module));
+    }
+
+    #[test]
+    fn insert_transpose_nhwc_to_nchw() {
+        let mut module = make_tensor_module();
+        // Assign Nhwc layout
+        let pass = LayoutTransform {
+            target: MemoryLayout::Nhwc,
+        };
+        pass.run(&mut module);
+        // Now convert to Nchw
+        let pass2 = TransposeInsertion {
+            target: MemoryLayout::Nchw,
+        };
+        assert!(pass2.run(&mut module));
+        // All tensor globals should now have Nchw layout
+        for (_, gv) in module.global_variables.iter() {
+            if gv.layout.is_some() {
+                assert_eq!(gv.layout, Some(MemoryLayout::Nchw));
+            }
+        }
+    }
+
+    #[test]
+    fn insert_transpose_nchw_to_nhwc() {
+        let mut module = make_tensor_module();
+        let pass = LayoutTransform {
+            target: MemoryLayout::Nchw,
+        };
+        pass.run(&mut module);
+        let pass2 = TransposeInsertion {
+            target: MemoryLayout::Nhwc,
+        };
+        assert!(pass2.run(&mut module));
+        for (_, gv) in module.global_variables.iter() {
+            if gv.layout.is_some() {
+                assert_eq!(gv.layout, Some(MemoryLayout::Nhwc));
+            }
+        }
+    }
+
+    #[test]
+    fn transpose_insertion_idempotent() {
+        let mut module = make_tensor_module();
+        let pass = LayoutTransform {
+            target: MemoryLayout::Nhwc,
+        };
+        pass.run(&mut module);
+        let pass2 = TransposeInsertion {
+            target: MemoryLayout::Nchw,
+        };
+        pass2.run(&mut module);
+        // Running again should be a no-op
+        assert!(!pass2.run(&mut module));
+    }
+
+    #[test]
+    fn transpose_insertion_skips_non_spatial() {
+        let mut module = make_tensor_module();
+        // Assign RowMajor layout to all
+        for (_, gv) in module.global_variables.iter_mut() {
+            let is_tensor_like = match &module.types[gv.ty].inner {
+                TypeInner::Tensor { .. } => true,
+                TypeInner::Array { .. } => {
+                    matches!(gv.space, AddressSpace::Storage { .. })
+                }
+                _ => false,
+            };
+            if is_tensor_like {
+                gv.layout = Some(MemoryLayout::RowMajor);
+            }
+        }
+        // TransposeInsertion to Nchw should not change RowMajor layouts
+        // (no permutation exists for RowMajor -> Nchw)
+        let pass = TransposeInsertion {
+            target: MemoryLayout::Nchw,
+        };
+        assert!(!pass.run(&mut module));
+    }
+
+    #[test]
+    fn transpose_insertion_skips_unset_layout() {
+        let mut module = make_tensor_module();
+        // No layouts are assigned yet
+        let pass = TransposeInsertion {
+            target: MemoryLayout::Nchw,
+        };
+        assert!(!pass.run(&mut module));
+    }
+
+    #[test]
+    fn transpose_insertion_name() {
+        let pass = TransposeInsertion {
+            target: MemoryLayout::Nchw,
+        };
+        assert_eq!(pass.name(), "TransposeInsertion");
+    }
+
+    #[test]
+    fn transpose_record_clone() {
+        let record = TransposeRecord {
+            var_name: "input".into(),
+            perm: vec![0, 3, 1, 2],
+            is_input: true,
+        };
+        let cloned = record.clone();
+        assert_eq!(cloned.var_name, "input");
+        assert_eq!(cloned.perm, vec![0, 3, 1, 2]);
+        assert!(cloned.is_input);
+    }
+
+    #[test]
+    fn layout_conv2d_shape_nhwc_to_nchw() {
+        // Conv2D NHWC [1, 224, 224, 3] -> NCHW [1, 3, 224, 224]
+        let nhwc = [1i64, 224, 224, 3];
+        let result = reorder_dims(&nhwc, MemoryLayout::Nhwc, MemoryLayout::Nchw);
+        assert_eq!(result, vec![1, 3, 224, 224]);
+    }
+
+    #[test]
+    fn layout_pool_shape_nchw_to_nhwc() {
+        // Pool NCHW [1, 64, 56, 56] -> NHWC [1, 56, 56, 64]
+        let nchw = [1i64, 64, 56, 56];
+        let result = reorder_dims(&nchw, MemoryLayout::Nchw, MemoryLayout::Nhwc);
+        assert_eq!(result, vec![1, 56, 56, 64]);
+    }
+
+    #[test]
+    fn layout_batchnorm_shape_nhwc_to_nchw() {
+        // BatchNorm NHWC [1, 32, 32, 128] -> NCHW [1, 128, 32, 32]
+        let nhwc = [1i64, 32, 32, 128];
+        let result = reorder_dims(&nhwc, MemoryLayout::Nhwc, MemoryLayout::Nchw);
+        assert_eq!(result, vec![1, 128, 32, 32]);
     }
 }

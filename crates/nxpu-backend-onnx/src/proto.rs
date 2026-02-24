@@ -72,6 +72,9 @@ pub struct TensorProto {
     pub name: String,
     #[prost(float, repeated, tag = "4")]
     pub float_data: Vec<f32>,
+    /// Packed int32 data (used for INT32/INT8 zero points, etc.).
+    #[prost(int32, repeated, tag = "5")]
+    pub int32_data: Vec<i32>,
     #[prost(int64, repeated, tag = "7")]
     pub int64_data: Vec<i64>,
     /// Raw binary tensor data. When present, data is serialized as little-endian
@@ -398,6 +401,7 @@ mod tests {
             data_type: data_type::FLOAT,
             name: "weights".into(),
             float_data: vec![],
+            int32_data: vec![],
             int64_data: vec![],
             raw_data: raw.clone(),
         };
@@ -416,6 +420,7 @@ mod tests {
             data_type: data_type::FLOAT,
             name: "bias".into(),
             float_data: vec![0.1, 0.2],
+            int32_data: vec![],
             int64_data: vec![],
             raw_data: vec![],
         };

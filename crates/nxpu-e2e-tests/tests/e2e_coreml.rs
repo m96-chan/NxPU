@@ -108,11 +108,12 @@ fn transpose_coreml_unknown() {
 }
 
 #[test]
-fn batchnorm_coreml_unknown() {
-    // BatchNorm is now classified as Unknown (no silent fallback — #64).
+fn batchnorm_coreml_compiles() {
     let source = common::load_example("batchnorm");
-    let result = common::try_compile_wgsl(&source, &CoreMlBackend, 1);
-    assert!(result.is_err(), "expected Unsupported error for batchnorm");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "batch_norm");
 }
 
 #[test]
@@ -149,4 +150,90 @@ fn attention_coreml_attention_op() {
     let model = decode_coreml(&output);
     let ops = get_mil_ops(&model);
     assert_eq!(ops[0].r#type, "scaled_dot_product_attention");
+}
+
+// --- GELU ---
+
+#[test]
+fn gelu_coreml_gelu_op() {
+    let source = common::load_example("gelu");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "gelu");
+}
+
+// --- LayerNorm ---
+
+#[test]
+fn layernorm_coreml_compiles() {
+    let source = common::load_example("layernorm");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert!(
+        !ops.is_empty(),
+        "expected at least one MIL operation for layernorm"
+    );
+}
+
+// --- Gather ---
+
+#[test]
+fn gather_coreml_gather_op() {
+    let source = common::load_example("gather");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "gather");
+}
+
+// --- Scatter ---
+
+#[test]
+fn scatter_coreml_scatter_op() {
+    let source = common::load_example("scatter");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "scatter");
+}
+
+// --- Depthwise Conv ---
+
+#[test]
+fn depthwise_conv_coreml_conv_op() {
+    let source = common::load_example("depthwise_conv");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert_eq!(ops[0].r#type, "conv");
+}
+
+// --- Multi-head Attention ---
+
+#[test]
+fn multihead_attention_coreml_compiles() {
+    let source = common::load_example("multihead_attention");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert!(
+        !ops.is_empty(),
+        "expected at least one MIL operation for multihead attention"
+    );
+}
+
+// --- Causal Attention ---
+
+#[test]
+fn causal_attention_coreml_compiles() {
+    let source = common::load_example("causal_attention");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert!(
+        !ops.is_empty(),
+        "expected at least one MIL operation for causal attention"
+    );
 }

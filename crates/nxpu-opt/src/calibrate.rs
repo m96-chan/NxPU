@@ -1234,4 +1234,49 @@ mod tests {
         );
         assert!(kl_params.scale > 0.0);
     }
+
+    #[test]
+    fn per_channel_more_accurate_than_per_tensor() {
+        // Weights with different ranges per channel — per-channel should be more accurate
+        let weights = vec![
+            // Channel 0: range [0, 1]
+            0.1, 0.5, 0.9, // Channel 1: range [0, 100]
+            10.0, 50.0, 90.0, // Channel 2: range [0, 0.01]
+            0.001, 0.005, 0.009,
+        ];
+        let shape = [3usize, 3]; // 3 channels, 3 elements each
+
+        // Per-tensor: single scale for all values
+        let global_max = weights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let global_min = weights.iter().copied().fold(f32::INFINITY, f32::min);
+        let pt_scale = (global_max - global_min) / 255.0;
+        let pt_zp = (-global_min / pt_scale).round() as i8;
+        let pt_error: f32 = weights
+            .iter()
+            .map(|&w| {
+                let q = ((w / pt_scale) + pt_zp as f32).round().clamp(-128.0, 127.0) as i8;
+                let dq = (q as f32 - pt_zp as f32) * pt_scale;
+                (w - dq).abs()
+            })
+            .sum();
+
+        // Per-channel
+        let pc_result = per_channel_quantize(&weights, &shape, 0);
+        let pc_error: f32 = weights
+            .chunks(3)
+            .zip(pc_result.scales.iter().zip(pc_result.zero_points.iter()))
+            .flat_map(|(ch, (&s, &zp))| {
+                ch.iter().map(move |&w| {
+                    let q = ((w / s) + zp as f32).round().clamp(-128.0, 127.0) as i8;
+                    let dq = (q as f32 - zp as f32) * s;
+                    (w - dq).abs()
+                })
+            })
+            .sum();
+
+        assert!(
+            pc_error < pt_error,
+            "per-channel error ({pc_error}) should be less than per-tensor error ({pt_error})"
+        );
+    }
 }

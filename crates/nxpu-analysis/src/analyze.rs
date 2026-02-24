@@ -123,6 +123,9 @@ pub enum ActivationOp {
     Sigmoid,
     Tanh,
     Softmax,
+    Gelu,
+    Silu,
+    Mish,
 }
 
 impl fmt::Display for ActivationOp {
@@ -139,6 +142,9 @@ impl ActivationOp {
             Self::Sigmoid => "Sigmoid",
             Self::Tanh => "Tanh",
             Self::Softmax => "Softmax",
+            Self::Gelu => "Gelu",
+            Self::Silu => "Silu",
+            Self::Mish => "Mish",
         }
     }
 }
@@ -193,6 +199,22 @@ impl PoolKind {
     }
 }
 
+/// Normalization type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormType {
+    Batch,
+    Layer,
+}
+
+impl fmt::Display for NormType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Batch => "Batch",
+            Self::Layer => "Layer",
+        })
+    }
+}
+
 /// Conv2D shape parameters extracted from uniform params.
 #[derive(Debug, Clone)]
 pub struct Conv2DShape {
@@ -222,14 +244,27 @@ pub struct Conv2DShape {
     pub pad_h: i64,
     /// Horizontal padding.
     pub pad_w: i64,
+    /// Number of groups (1 = standard conv, channels_in = depthwise).
+    pub groups: i64,
+    /// Vertical dilation.
+    pub dilation_h: i64,
+    /// Horizontal dilation.
+    pub dilation_w: i64,
 }
 
 impl fmt::Display for Conv2DShape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Conv2D({}x{}x{} k{}x{})",
-            self.channels_in, self.height, self.width, self.kernel_h, self.kernel_w
+            "Conv2D({}x{}x{} k{}x{} g{} d{}x{})",
+            self.channels_in,
+            self.height,
+            self.width,
+            self.kernel_h,
+            self.kernel_w,
+            self.groups,
+            self.dilation_h,
+            self.dilation_w
         )
     }
 }
@@ -319,16 +354,15 @@ pub enum KernelPattern {
         bias: TensorBinding,
         output: TensorBinding,
         epsilon: f32,
+        norm_type: NormType,
     },
     /// Concatenation of multiple inputs along an axis.
-    // TODO: axis is always 0; infer actual concat axis from IR when possible.
     Concat {
         inputs: Vec<TensorBinding>,
         output: TensorBinding,
         axis: i64,
     },
     /// Split a single input into multiple outputs along an axis.
-    // TODO: axis is always 0; infer actual split axis from IR when possible.
     Split {
         input: TensorBinding,
         outputs: Vec<TensorBinding>,
@@ -342,6 +376,27 @@ pub enum KernelPattern {
         output: TensorBinding,
         d_k: String,
         seq_len: String,
+        /// Number of attention heads (1 = single-head).
+        num_heads: u32,
+        /// Number of K/V heads (for GQA; equals num_heads for MHA).
+        num_kv_heads: u32,
+        /// Whether a causal mask is applied.
+        causal: bool,
+    },
+    /// Gather: index into data tensor using indices.
+    Gather {
+        data: TensorBinding,
+        indices: TensorBinding,
+        output: TensorBinding,
+        axis: i64,
+    },
+    /// Scatter: write updates into output tensor at given indices.
+    Scatter {
+        data: TensorBinding,
+        indices: TensorBinding,
+        updates: TensorBinding,
+        output: TensorBinding,
+        axis: i64,
     },
     /// Unrecognized pattern — classification could not determine a known op.
     Unknown { reason: String },
@@ -364,12 +419,26 @@ impl fmt::Display for KernelPattern {
             Self::Reduce { op, axis, .. } => write!(f, "{op}(axis={axis})"),
             Self::Transpose { perm, .. } => write!(f, "Transpose({perm:?})"),
             Self::Reshape { .. } => f.write_str("Reshape"),
-            Self::Normalization { epsilon, .. } => write!(f, "Normalization(eps={epsilon})"),
+            Self::Normalization {
+                epsilon, norm_type, ..
+            } => write!(f, "{norm_type}Normalization(eps={epsilon})"),
             Self::Concat { axis, .. } => write!(f, "Concat(axis={axis})"),
             Self::Split { axis, .. } => write!(f, "Split(axis={axis})"),
-            Self::Attention { d_k, seq_len, .. } => {
-                write!(f, "Attention(d_k={d_k}, seq_len={seq_len})")
+            Self::Attention {
+                d_k,
+                seq_len,
+                num_heads,
+                causal,
+                ..
+            } => {
+                let mask = if *causal { ", causal" } else { "" };
+                write!(
+                    f,
+                    "Attention(d_k={d_k}, seq_len={seq_len}, heads={num_heads}{mask})"
+                )
             }
+            Self::Gather { axis, .. } => write!(f, "Gather(axis={axis})"),
+            Self::Scatter { axis, .. } => write!(f, "Scatter(axis={axis})"),
             Self::Unknown { reason } => write!(f, "Unknown({reason})"),
         }
     }
@@ -450,6 +519,177 @@ fn type_dims(ty_handle: Handle<Type>, types: &UniqueArena<Type>) -> Vec<i64> {
     }
 }
 
+/// Detect number of attention heads from shape_names or literal divisions.
+fn detect_num_heads(shape_names: &[String], exprs: &Arena<Expression>) -> u32 {
+    // Look for param named "num_heads", "n_head", "H", "n_heads", "nhead"
+    for name in shape_names.iter() {
+        let lower = name.to_lowercase();
+        if lower == "num_heads" || lower == "n_head" || lower == "n_heads" || lower == "nhead" {
+            // Can't get runtime value, but if there's a matching literal, use it
+            // Otherwise return 1 as we know it's multi-head but can't determine count
+            return find_division_literal(exprs).unwrap_or(1);
+        }
+    }
+    // Also check for "H" (common in transformer code)
+    if shape_names.iter().any(|n| n == "H") {
+        return find_division_literal(exprs).unwrap_or(1);
+    }
+    1
+}
+
+/// Look for a division by a literal (d_model / num_heads -> head_dim).
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
+fn find_division_literal(exprs: &Arena<Expression>) -> Option<u32> {
+    for (_, expr) in exprs.iter() {
+        if let Expression::Binary {
+            op: BinaryOp::Divide,
+            right,
+            ..
+        } = expr
+        {
+            if let Some(Expression::Literal(Literal::U32(n))) = exprs.try_get(*right) {
+                if *n > 1 {
+                    return Some(*n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Detect causal attention mask: look for an If guarding assignment of a large
+/// negative literal inside a loop. The pattern is:
+///   `if (j > i) { score = -1e30; }` or similar.
+///
+/// We specifically look for an `If` whose accept or reject block contains (or
+/// leads to) a Store of a large negative float literal. This avoids false
+/// positives from for-loop break conditions and numerically-stable softmax
+/// `max_score` initializations that also use large negative values but are
+/// not inside an If-guarded store.
+fn detect_causal_mask(body: &[Statement], exprs: &Arena<Expression>) -> bool {
+    has_causal_if_in_loop(body, exprs)
+}
+
+/// Recursively search loops for an `If` whose condition is a Greater/Less
+/// comparison and whose accept or reject branch stores a large negative
+/// float literal (like -1e30, -1e9, or -inf).
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
+fn has_causal_if_in_loop(body: &[Statement], exprs: &Arena<Expression>) -> bool {
+    for stmt in body {
+        if let Statement::Loop {
+            body, continuing, ..
+        } = stmt
+        {
+            // Search loop body; skip the first non-Emit If that acts as a
+            // for-loop break guard.
+            let mut saw_non_emit = false;
+            for s in body.iter() {
+                match s {
+                    Statement::Emit(_) => {}
+                    Statement::If {
+                        condition,
+                        accept,
+                        reject,
+                    } => {
+                        // The first non-emit If in a naga for-loop is the break
+                        // guard (e.g. `if (j < N) {} else { break; }`). Skip it.
+                        if !saw_non_emit
+                            && (matches!(accept.as_slice(), [Statement::Break])
+                                || matches!(reject.as_slice(), [Statement::Break]))
+                        {
+                            saw_non_emit = true;
+                            continue;
+                        }
+                        saw_non_emit = true;
+                        if is_causal_guard(*condition, accept, reject, exprs) {
+                            return true;
+                        }
+                    }
+                    _ => {
+                        saw_non_emit = true;
+                    }
+                }
+            }
+            // Also search the continuing block
+            for s in continuing.iter() {
+                if let Statement::If {
+                    condition,
+                    accept,
+                    reject,
+                } = s
+                {
+                    if is_causal_guard(*condition, accept, reject, exprs) {
+                        return true;
+                    }
+                }
+            }
+            // Recurse into nested loops
+            if has_causal_if_in_loop(body, exprs) || has_causal_if_in_loop(continuing, exprs) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if a conditional is a comparison (Greater/Less/GE/LE) and one of
+/// its branches (accept or reject) contains a Store of a large negative float.
+fn is_causal_guard(
+    condition: Handle<Expression>,
+    accept: &[Statement],
+    reject: &[Statement],
+    exprs: &Arena<Expression>,
+) -> bool {
+    let is_comparison = match exprs.try_get(condition) {
+        Some(Expression::Binary { op, .. }) => matches!(
+            op,
+            BinaryOp::Greater | BinaryOp::Less | BinaryOp::GreaterEqual | BinaryOp::LessEqual
+        ),
+        _ => false,
+    };
+    if !is_comparison {
+        return false;
+    }
+    block_stores_large_negative(accept, exprs) || block_stores_large_negative(reject, exprs)
+}
+
+/// Check if a block contains a Store whose value is a large negative float literal.
+fn block_stores_large_negative(body: &[Statement], exprs: &Arena<Expression>) -> bool {
+    for stmt in body {
+        match stmt {
+            Statement::Store { value, .. } => {
+                if expr_is_large_negative(*value, exprs) {
+                    return true;
+                }
+            }
+            Statement::If { accept, reject, .. } => {
+                if block_stores_large_negative(accept, exprs)
+                    || block_stores_large_negative(reject, exprs)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Check if an expression is (or contains) a large negative float literal (< -1e6).
+fn expr_is_large_negative(handle: Handle<Expression>, exprs: &Arena<Expression>) -> bool {
+    match exprs.try_get(handle) {
+        Some(Expression::Literal(Literal::F32(v))) => *v < -1e6,
+        Some(Expression::Unary {
+            op: nxpu_ir::UnaryOp::Negate,
+            expr,
+        }) => {
+            // -literal
+            matches!(exprs.try_get(*expr), Some(Expression::Literal(Literal::F32(v))) if *v > 1e6)
+        }
+        _ => false,
+    }
+}
+
 /// Classify an entry point into a known ONNX-mappable pattern.
 pub fn classify_entry_point(
     module: &Module,
@@ -517,10 +757,11 @@ pub fn classify_entry_point(
                 .iter()
                 .map(|(h, gv)| make_binding(module, *h, gv, TensorRole::Output))
                 .collect();
+            let axis = infer_split_axis(&ep.function.body, &ep.function.expressions, &shape_names);
             return Ok(KernelPattern::Split {
                 input,
                 outputs: out_bindings,
-                axis: 0,
+                axis,
             });
         }
 
@@ -612,7 +853,7 @@ pub fn classify_entry_point(
         ));
     }
 
-    // 3+ inputs: check for Attention before Normalization
+    // 3+ inputs: check for Attention, Normalization, Scatter
     if num_inputs >= 3 {
         // Attention heuristic: 3 inputs + has loop + contains Exp + Sqrt.
         // NOTE: This is fragile — any 3-input kernel with loop + exp() + sqrt()
@@ -632,6 +873,8 @@ pub fn classify_entry_point(
                 .cloned()
                 .unwrap_or_else(|| "seq_len".into());
             let d_k = shape_names.get(1).cloned().unwrap_or_else(|| "d_k".into());
+            let num_heads = detect_num_heads(&shape_names, &ep.function.expressions);
+            let causal = detect_causal_mask(&ep.function.body, &ep.function.expressions);
             return Ok(KernelPattern::Attention {
                 query,
                 key,
@@ -639,12 +882,57 @@ pub fn classify_entry_point(
                 output,
                 d_k,
                 seq_len,
+                num_heads,
+                num_kv_heads: num_heads, // Default: MHA (same as num_heads)
+                causal,
             });
         }
 
-        // 3+ inputs but no recognized attention pattern — unknown.
+        // Normalization: 3 inputs (input, scale, bias) + 1 output + loop + Sqrt, no Exp.
+        // Distinguishes LayerNorm (2 shape params: N, C) from BatchNorm (3+: N, C, HW).
+        if num_inputs == 3
+            && outputs.len() == 1
+            && has_loop
+            && has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sqrt)
+            && !has_math_function_in_expressions(&ep.function.expressions, MathFunction::Exp)
+        {
+            let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
+            let scale = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
+            let bias = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
+            let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
+            let norm_type = if shape_names.len() <= 2 {
+                NormType::Layer
+            } else {
+                NormType::Batch
+            };
+            return Ok(KernelPattern::Normalization {
+                input,
+                scale,
+                bias,
+                output,
+                epsilon: 1e-5,
+                norm_type,
+            });
+        }
+
+        // Scatter: 3 inputs + 1 output + no loop (simple scatter write)
+        if num_inputs == 3 && outputs.len() == 1 && !has_loop {
+            let data = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
+            let indices = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
+            let updates = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
+            let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
+            return Ok(KernelPattern::Scatter {
+                data,
+                indices,
+                updates,
+                output,
+                axis: 0,
+            });
+        }
+
+        // 3+ inputs but no recognized pattern — unknown.
         return Ok(KernelPattern::Unknown {
-            reason: "3+ inputs but no recognized pattern (expected Attention)".into(),
+            reason: "3+ inputs but no recognized pattern (expected Attention, Normalization, or Scatter)".into(),
         });
     }
 
@@ -654,14 +942,34 @@ pub fn classify_entry_point(
     let output_c = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
 
     if !has_loop {
-        let has_if = has_if_statement(&ep.function.body);
+        let has_structural_if = has_non_guard_if(&ep.function.body);
+
+        // Gather: 2 inputs + no loop + one input is u32 array (indices)
+        // Check if second input is a u32 array (integer index type).
+        let second_is_int = input_b.elem_type == data_type::UINT32
+            || input_b.elem_type == data_type::INT32
+            || input_b.elem_type == data_type::INT64;
+        if second_is_int
+            && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none()
+            && !has_structural_if
+        {
+            return Ok(KernelPattern::Gather {
+                data: input_a,
+                indices: input_b,
+                output: output_c,
+                axis: 0,
+            });
+        }
 
         // Concat: 2 inputs + no loop + has If + no binary store op
-        if has_if && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none() {
+        if has_structural_if
+            && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none()
+        {
+            let axis = infer_concat_axis(&ep.function.body, &ep.function.expressions, &shape_names);
             return Ok(KernelPattern::Concat {
                 inputs: vec![input_a, input_b],
                 output: output_c,
-                axis: 0,
+                axis,
             });
         }
 
@@ -896,6 +1204,14 @@ fn extract_conv2d_shape(
             (0, 0, 1, 1, 0, 0)
         };
 
+    // Detect groups parameter: if shape_names contains "groups", use it.
+    let groups = if shape_names.iter().any(|n| n.eq_ignore_ascii_case("groups")) {
+        // Depthwise convention: groups == channels_in
+        -1 // Sentinel: resolved at runtime or marked as depthwise
+    } else {
+        1
+    };
+
     Conv2DShape {
         batch: get(0),
         channels_in: get(1),
@@ -910,6 +1226,9 @@ fn extract_conv2d_shape(
         stride_w,
         pad_h,
         pad_w,
+        groups,
+        dilation_h: 1,
+        dilation_w: 1,
     }
 }
 
@@ -958,6 +1277,107 @@ fn scalar_to_onnx_data_type(scalar: &Scalar) -> i32 {
     }
 }
 
+/// Normalize a potentially negative axis to a positive axis.
+///
+/// For example, `normalize_axis(-1, 4)` returns `3`.
+pub fn normalize_axis(axis: i64, ndim: usize) -> i64 {
+    if axis < 0 {
+        let ndim = ndim as i64;
+        ((axis % ndim) + ndim) % ndim
+    } else {
+        axis
+    }
+}
+
+/// Infer the concat axis from the If condition in the function body.
+///
+/// In WGSL concat patterns, the If condition checks whether the linear index
+/// falls before or after a boundary (e.g., `if idx < params.C1`). The boundary
+/// param name maps to a position in the params struct, which gives us the axis.
+fn infer_concat_axis(body: &[Statement], exprs: &Arena<Expression>, shape_names: &[String]) -> i64 {
+    find_if_comparison_axis(body, exprs, shape_names).unwrap_or(0)
+}
+
+/// Infer the split axis from the If condition in the function body.
+///
+/// Works identically to [`infer_concat_axis`]: the If condition compares
+/// against a params struct member whose index indicates the split axis.
+fn infer_split_axis(body: &[Statement], exprs: &Arena<Expression>, shape_names: &[String]) -> i64 {
+    find_if_comparison_axis(body, exprs, shape_names).unwrap_or(0)
+}
+
+/// Walk the statement tree to find an If whose condition is a comparison
+/// (Less, LessEqual, Greater, GreaterEqual) where one operand is an
+/// `AccessIndex` into the uniform params struct. The `index` field of
+/// `AccessIndex` gives the struct member position, which corresponds to
+/// the concat/split axis.
+fn find_if_comparison_axis(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    _shape_names: &[String],
+) -> Option<i64> {
+    for stmt in body {
+        match stmt {
+            Statement::If { condition, .. } => {
+                // Split into nested ifs to avoid let-chains (unstable in MSRV 1.87).
+                #[allow(clippy::collapsible_if)]
+                if let Some(Expression::Binary {
+                    op, left, right, ..
+                }) = exprs.try_get(*condition)
+                {
+                    if matches!(
+                        op,
+                        BinaryOp::Less
+                            | BinaryOp::LessEqual
+                            | BinaryOp::Greater
+                            | BinaryOp::GreaterEqual
+                    ) {
+                        // Check right operand first (most common: `idx < params.C1`)
+                        if let Some(idx) = extract_uniform_member_index(exprs, *right) {
+                            return Some(idx as i64);
+                        }
+                        if let Some(idx) = extract_uniform_member_index(exprs, *left) {
+                            return Some(idx as i64);
+                        }
+                    }
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                if let Some(axis) = find_if_comparison_axis(body, exprs, _shape_names) {
+                    return Some(axis);
+                }
+                if let Some(axis) = find_if_comparison_axis(continuing, exprs, _shape_names) {
+                    return Some(axis);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract the struct member index from an expression that accesses a
+/// uniform params member.
+///
+/// Handles both direct `AccessIndex { base, index }` and
+/// `Load { pointer: AccessIndex { base, index } }` patterns, since
+/// different naga versions may emit either form.
+fn extract_uniform_member_index(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+) -> Option<u32> {
+    match exprs.try_get(handle)? {
+        Expression::AccessIndex { index, .. } => Some(*index),
+        Expression::Load { pointer } => match exprs.try_get(*pointer)? {
+            Expression::AccessIndex { index, .. } => Some(*index),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Check if any expression in the arena uses a specific math function.
 fn has_math_function_in_expressions(exprs: &Arena<Expression>, target: MathFunction) -> bool {
     exprs
@@ -972,6 +1392,24 @@ fn has_if_statement(body: &[Statement]) -> bool {
         Statement::Loop {
             body, continuing, ..
         } => has_if_statement(body) || has_if_statement(continuing),
+        _ => false,
+    })
+}
+
+/// Check if a block contains a non-guard If statement (i.e., one that is not
+/// just a bounds-check early return like `if (idx >= N) { return; }`).
+fn has_non_guard_if(body: &[Statement]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Statement::If { accept, reject, .. } => {
+            // A guard-if has only a Return in accept and empty reject (or vice-versa).
+            let is_guard = reject.is_empty()
+                && accept.len() == 1
+                && matches!(accept[0], Statement::Return { .. });
+            !is_guard
+        }
+        Statement::Loop {
+            body, continuing, ..
+        } => has_non_guard_if(body) || has_non_guard_if(continuing),
         _ => false,
     })
 }
@@ -1050,11 +1488,50 @@ fn classify_activation_expr(
             fun: MathFunction::Max,
             ..
         } => Some(ActivationOp::Relu),
-        // tanh(x) → Tanh
+        // tanh(x) → Tanh (standalone, not part of a Multiply)
         Expression::Math {
             fun: MathFunction::Tanh,
             ..
         } => Some(ActivationOp::Tanh),
+        // Multiply patterns: GELU, SiLU, Mish
+        Expression::Binary {
+            op: BinaryOp::Multiply,
+            left,
+            right,
+            ..
+        } => {
+            let has_tanh_left = contains_math_fun(exprs, *left, MathFunction::Tanh);
+            let has_tanh_right = contains_math_fun(exprs, *right, MathFunction::Tanh);
+            let has_exp_left = contains_math_fun(exprs, *left, MathFunction::Exp);
+            let has_exp_right = contains_math_fun(exprs, *right, MathFunction::Exp);
+
+            // GELU: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+            // Detected as Multiply where one sub-expression contains Tanh
+            // but NOT Exp (to distinguish from Mish which has tanh+exp)
+            if (has_tanh_left || has_tanh_right) && !has_exp_left && !has_exp_right {
+                return Some(ActivationOp::Gelu);
+            }
+
+            // Mish: x * tanh(ln(1 + exp(x))) = x * tanh(softplus(x))
+            // Detected as Multiply containing both Tanh and Exp
+            if (has_tanh_left || has_tanh_right) && (has_exp_left || has_exp_right) {
+                return Some(ActivationOp::Mish);
+            }
+
+            // SiLU: x * sigmoid(x) = x * (1 / (1 + exp(-x)))
+            // Detected as Multiply where one sub-expression contains Divide+Exp (sigmoid pattern)
+            if has_exp_left || has_exp_right {
+                let has_div_left = contains_binary_op(exprs, *left, BinaryOp::Divide);
+                let has_div_right = contains_binary_op(exprs, *right, BinaryOp::Divide);
+                if has_div_left || has_div_right {
+                    return Some(ActivationOp::Silu);
+                }
+            }
+
+            // Not a recognized activation multiply, try recursing
+            classify_activation_expr(exprs, *left)
+                .or_else(|| classify_activation_expr(exprs, *right))
+        }
         // 1/(1+exp(-x)) → Sigmoid: detected as Divide whose right is Add(1, Exp(Negate(x)))
         // exp(x)/sum(exp(x)) → Softmax: detected as Divide with Exp on left
         Expression::Binary {
@@ -1074,6 +1551,26 @@ fn classify_activation_expr(
             }
         }
         _ => None,
+    }
+}
+
+/// Check if an expression (recursively) contains a specific binary operation.
+fn contains_binary_op(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    target: BinaryOp,
+) -> bool {
+    match exprs.try_get(handle) {
+        Some(Expression::Binary {
+            op, left, right, ..
+        }) => {
+            *op == target
+                || contains_binary_op(exprs, *left, target)
+                || contains_binary_op(exprs, *right, target)
+        }
+        Some(Expression::Math { arg, .. }) => contains_binary_op(exprs, *arg, target),
+        Some(Expression::Unary { expr, .. }) => contains_binary_op(exprs, *expr, target),
+        _ => false,
     }
 }
 
@@ -2743,5 +3240,796 @@ mod tests {
 
         let weights = extract_embedded_weights(&module);
         assert!(weights.is_empty());
+    }
+
+    // --- Concat/Split axis inference tests ---
+
+    /// Build a concat-like module with 2 inputs, 1 output, and an If condition
+    /// that compares against `AccessIndex { base: params, index: boundary_index }`.
+    /// This simulates the IR that naga produces for `if c < params.C1`.
+    fn make_concat_module(boundary_index: u32, shape_names: &[&str]) -> Module {
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let array_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members: shape_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| StructMember {
+                        name: Some((*name).into()),
+                        ty: u32_ty,
+                        offset: (i * 4) as u32,
+                    })
+                    .collect(),
+                span: (shape_names.len() * 4) as u32,
+            },
+        });
+
+        // Input a (binding 0)
+        module.global_variables.append(GlobalVariable {
+            name: Some("a".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Input b (binding 1)
+        module.global_variables.append(GlobalVariable {
+            name: Some("b".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 1,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Output (binding 2)
+        module.global_variables.append(GlobalVariable {
+            name: Some("result".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 2,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Uniform params (binding 3)
+        module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 3,
+            }),
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Build function with If(idx < AccessIndex(params, boundary_index))
+        let mut func = Function::new("main");
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        // params GlobalVariable (handle index 3)
+        let params_gv = {
+            let mut iter = module.global_variables.iter();
+            iter.nth(3).unwrap().0
+        };
+        let params_expr = func
+            .expressions
+            .append(Expression::GlobalVariable(params_gv));
+        let access = func.expressions.append(Expression::AccessIndex {
+            base: params_expr,
+            index: boundary_index,
+        });
+        let load = func
+            .expressions
+            .append(Expression::Load { pointer: access });
+        let cmp = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Less,
+            left: idx,
+            right: load,
+        });
+
+        // If body: Store (accept), Store (reject)
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        let ptr = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        func.body.push(Statement::If {
+            condition: cmp,
+            accept: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+            reject: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [256, 1, 1],
+            function: func,
+        });
+
+        module
+    }
+
+    /// Build a split-like module with 1 input, 2 outputs, and an If condition
+    /// that compares against `AccessIndex { base: params, index: boundary_index }`.
+    fn make_split_module(boundary_index: u32, shape_names: &[&str]) -> Module {
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let array_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members: shape_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| StructMember {
+                        name: Some((*name).into()),
+                        ty: u32_ty,
+                        offset: (i * 4) as u32,
+                    })
+                    .collect(),
+                span: (shape_names.len() * 4) as u32,
+            },
+        });
+
+        // Input (binding 0) - read-only storage
+        module.global_variables.append(GlobalVariable {
+            name: Some("input".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Output a (binding 1)
+        module.global_variables.append(GlobalVariable {
+            name: Some("out_a".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 1,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Output b (binding 2)
+        module.global_variables.append(GlobalVariable {
+            name: Some("out_b".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 2,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Uniform params (binding 3)
+        module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 3,
+            }),
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Build function with If(idx < AccessIndex(params, boundary_index))
+        let mut func = Function::new("main");
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let params_gv = {
+            let mut iter = module.global_variables.iter();
+            iter.nth(3).unwrap().0
+        };
+        let params_expr = func
+            .expressions
+            .append(Expression::GlobalVariable(params_gv));
+        let access = func.expressions.append(Expression::AccessIndex {
+            base: params_expr,
+            index: boundary_index,
+        });
+        let load = func
+            .expressions
+            .append(Expression::Load { pointer: access });
+        let cmp = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Less,
+            left: idx,
+            right: load,
+        });
+
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        let ptr = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        func.body.push(Statement::If {
+            condition: cmp,
+            accept: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+            reject: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [256, 1, 1],
+            function: func,
+        });
+
+        module
+    }
+
+    #[test]
+    fn classify_concat_axis_0_default() {
+        // Concat with boundary at index 0 → axis = 0 (same as before).
+        let module = make_concat_module(0, &["N_a", "N_b"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Concat { axis, .. } => {
+                assert_eq!(*axis, 0, "expected axis 0 for boundary at index 0");
+            }
+            _ => panic!("expected Concat pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_concat_axis_1_inferred() {
+        // Concat with boundary at index 1 (params.C1) → axis = 1.
+        let module = make_concat_module(1, &["N", "C1", "C2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Concat {
+                axis,
+                inputs,
+                output,
+                ..
+            } => {
+                assert_eq!(*axis, 1, "expected axis 1 for boundary at index 1");
+                assert_eq!(inputs[0].name, "a");
+                assert_eq!(inputs[1].name, "b");
+                assert_eq!(output.name, "result");
+            }
+            _ => panic!("expected Concat pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_concat_axis_2_inferred() {
+        // Concat with boundary at index 2 → axis = 2.
+        let module = make_concat_module(2, &["N", "C", "W1", "W2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Concat { axis, .. } => {
+                assert_eq!(*axis, 2, "expected axis 2 for boundary at index 2");
+            }
+            _ => panic!("expected Concat pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_concat_axis_3_inferred() {
+        // Concat with boundary at index 3 → axis = 3 (4D shape: N, C, H, W).
+        let module = make_concat_module(3, &["N", "C", "H", "W1", "W2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Concat { axis, .. } => {
+                assert_eq!(*axis, 3, "expected axis 3 for boundary at index 3");
+            }
+            _ => panic!("expected Concat pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_split_axis_0_default() {
+        // Split with boundary at index 0 → axis = 0.
+        let module = make_split_module(0, &["N_a", "N_b"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Split { axis, .. } => {
+                assert_eq!(*axis, 0, "expected axis 0 for boundary at index 0");
+            }
+            _ => panic!("expected Split pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_split_axis_1_inferred() {
+        // Split with boundary at index 1 (params.C1) → axis = 1.
+        let module = make_split_module(1, &["N", "C1", "C2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Split {
+                axis,
+                input,
+                outputs,
+                ..
+            } => {
+                assert_eq!(*axis, 1, "expected axis 1 for boundary at index 1");
+                assert_eq!(input.name, "input");
+                assert_eq!(outputs.len(), 2);
+                assert_eq!(outputs[0].name, "out_a");
+                assert_eq!(outputs[1].name, "out_b");
+            }
+            _ => panic!("expected Split pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_split_axis_2_inferred() {
+        // Split with boundary at index 2 → axis = 2.
+        let module = make_split_module(2, &["N", "C", "W1", "W2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Split { axis, .. } => {
+                assert_eq!(*axis, 2, "expected axis 2 for boundary at index 2");
+            }
+            _ => panic!("expected Split pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_split_axis_3_inferred() {
+        // Split with boundary at index 3 → axis = 3 (4D shape: N, C, H, W).
+        let module = make_split_module(3, &["N", "C", "H", "W1", "W2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Split { axis, .. } => {
+                assert_eq!(*axis, 3, "expected axis 3 for boundary at index 3");
+            }
+            _ => panic!("expected Split pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_axis_positive() {
+        assert_eq!(normalize_axis(0, 3), 0);
+        assert_eq!(normalize_axis(1, 4), 1);
+        assert_eq!(normalize_axis(2, 4), 2);
+    }
+
+    #[test]
+    fn normalize_axis_negative() {
+        assert_eq!(normalize_axis(-1, 4), 3);
+        assert_eq!(normalize_axis(-2, 4), 2);
+        assert_eq!(normalize_axis(-3, 4), 1);
+        assert_eq!(normalize_axis(-4, 4), 0);
+    }
+
+    #[test]
+    fn normalize_axis_negative_wraps() {
+        // -1 with ndim 3 → 2
+        assert_eq!(normalize_axis(-1, 3), 2);
+        // -2 with ndim 3 → 1
+        assert_eq!(normalize_axis(-2, 3), 1);
+    }
+
+    #[test]
+    fn find_if_comparison_axis_direct_access_index() {
+        // Test that find_if_comparison_axis works with direct AccessIndex
+        // (without Load wrapper).
+        let mut func = Function::new("test");
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let base = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let access = func
+            .expressions
+            .append(Expression::AccessIndex { base, index: 2 });
+        let cmp = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Less,
+            left: idx,
+            right: access,
+        });
+
+        let body = vec![Statement::If {
+            condition: cmp,
+            accept: vec![],
+            reject: vec![],
+        }];
+        let names: Vec<String> = vec!["N".into(), "C".into(), "W".into()];
+        let result = find_if_comparison_axis(&body, &func.expressions, &names);
+        assert_eq!(result, Some(2));
+    }
+
+    #[test]
+    fn find_if_comparison_axis_in_loop() {
+        // Test that the function searches into Loop bodies.
+        let mut func = Function::new("test");
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let base = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let access = func
+            .expressions
+            .append(Expression::AccessIndex { base, index: 1 });
+        let load = func
+            .expressions
+            .append(Expression::Load { pointer: access });
+        let cmp = func.expressions.append(Expression::Binary {
+            op: BinaryOp::LessEqual,
+            left: idx,
+            right: load,
+        });
+
+        let body = vec![Statement::Loop {
+            body: vec![Statement::If {
+                condition: cmp,
+                accept: vec![],
+                reject: vec![],
+            }],
+            continuing: vec![],
+            break_if: None,
+        }];
+        let names: Vec<String> = vec!["N".into(), "C".into()];
+        let result = find_if_comparison_axis(&body, &func.expressions, &names);
+        assert_eq!(result, Some(1));
+    }
+
+    #[test]
+    fn find_if_comparison_axis_no_if_returns_none() {
+        let func = Function::new("test");
+        let body = vec![Statement::Break];
+        let names: Vec<String> = vec!["N".into()];
+        let result = find_if_comparison_axis(&body, &func.expressions, &names);
+        assert_eq!(result, None);
+    }
+
+    // --- Multi-head & causal attention classification tests ---
+
+    /// Build a module with 3 inputs (query, key, value), 1 output, a uniform
+    /// params struct with the given member names, Loop + Exp + Sqrt in the
+    /// function expressions, and optionally a division-by-literal and/or a
+    /// causal If-guard inside the loop body.
+    fn make_attention_module(param_names: &[&str], divide_by: Option<u32>, causal: bool) -> Module {
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let array_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+
+        // Build params struct from provided member names
+        let members: Vec<StructMember> = param_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| StructMember {
+                name: Some((*name).into()),
+                ty: u32_ty,
+                offset: (i * 4) as u32,
+            })
+            .collect();
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members,
+                span: (param_names.len() * 4) as u32,
+            },
+        });
+
+        // 3 storage-read inputs (query, key, value)
+        for (i, name) in ["query", "key", "value"].iter().enumerate() {
+            module.global_variables.append(GlobalVariable {
+                name: Some((*name).into()),
+                space: AddressSpace::Storage {
+                    access: StorageAccess::LOAD,
+                },
+                binding: Some(ResourceBinding {
+                    group: 0,
+                    binding: i as u32,
+                }),
+                ty: array_f32,
+                init: None,
+                layout: None,
+            });
+        }
+
+        // 1 storage-read_write output
+        module.global_variables.append(GlobalVariable {
+            name: Some("output".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 3,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+
+        // Uniform params
+        module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 4,
+            }),
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Build function with Exp, Sqrt, and optionally Division + causal If
+        let mut func = Function::new("main");
+
+        // Exp expression
+        let arg_exp = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        func.expressions.append(Expression::Math {
+            fun: MathFunction::Exp,
+            arg: arg_exp,
+            arg1: None,
+            arg2: None,
+            arg3: None,
+        });
+
+        // Sqrt expression
+        let arg_sqrt = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(1.0)));
+        func.expressions.append(Expression::Math {
+            fun: MathFunction::Sqrt,
+            arg: arg_sqrt,
+            arg1: None,
+            arg2: None,
+            arg3: None,
+        });
+
+        // Optional: division by literal (e.g. d_model / num_heads)
+        if let Some(n) = divide_by {
+            let dividend = func
+                .expressions
+                .append(Expression::Literal(Literal::U32(64)));
+            let divisor = func
+                .expressions
+                .append(Expression::Literal(Literal::U32(n)));
+            func.expressions.append(Expression::Binary {
+                op: BinaryOp::Divide,
+                left: dividend,
+                right: divisor,
+            });
+        }
+
+        // Build loop body contents
+        let mut loop_inner: Vec<Statement> = Vec::new();
+
+        if causal {
+            // Causal mask pattern: If(j > i) { score = -1e30; }
+            // First, add a comparison expression: Greater(j, i)
+            let j_expr = func
+                .expressions
+                .append(Expression::Literal(Literal::U32(0)));
+            let i_expr = func
+                .expressions
+                .append(Expression::Literal(Literal::U32(0)));
+            let cmp = func.expressions.append(Expression::Binary {
+                op: BinaryOp::Greater,
+                left: j_expr,
+                right: i_expr,
+            });
+
+            // Store of large negative literal
+            let neg_val = func
+                .expressions
+                .append(Expression::Literal(Literal::F32(-1e30)));
+            let ptr = func
+                .expressions
+                .append(Expression::Literal(Literal::F32(0.0)));
+
+            // The for-loop break guard (first If in naga loop)
+            let break_cond = func
+                .expressions
+                .append(Expression::Literal(Literal::Bool(true)));
+            loop_inner.push(Statement::If {
+                condition: break_cond,
+                accept: vec![],
+                reject: vec![Statement::Break],
+            });
+
+            // The causal If guard (second If in the loop)
+            loop_inner.push(Statement::If {
+                condition: cmp,
+                accept: vec![Statement::Store {
+                    pointer: ptr,
+                    value: neg_val,
+                }],
+                reject: vec![],
+            });
+        }
+
+        loop_inner.push(Statement::Break);
+
+        func.body.push(Statement::Loop {
+            body: loop_inner,
+            continuing: vec![],
+            break_if: None,
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [16, 16, 1],
+            function: func,
+        });
+
+        module
+    }
+
+    #[test]
+    fn classify_multihead_4_heads() {
+        let module = make_attention_module(&["seq_len", "d_model", "num_heads"], Some(4), false);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Attention {
+                num_heads,
+                num_kv_heads,
+                causal,
+                seq_len,
+                ..
+            } => {
+                assert_eq!(*num_heads, 4, "expected 4 heads from division literal");
+                assert_eq!(
+                    *num_kv_heads, 4,
+                    "num_kv_heads should equal num_heads for MHA"
+                );
+                assert!(!causal, "should not detect causal mask");
+                assert_eq!(seq_len, "seq_len");
+            }
+            _ => panic!("expected Attention pattern, got {pattern:?}"),
+        }
+        // Display should include heads=4 and no causal marker
+        let display = format!("{pattern}");
+        assert!(
+            display.contains("heads=4"),
+            "display should show heads=4: {display}"
+        );
+        assert!(
+            !display.contains("causal"),
+            "display should not mention causal: {display}"
+        );
+    }
+
+    #[test]
+    fn classify_causal_attention() {
+        let module = make_attention_module(&["seq_len", "d_k"], None, true);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Attention {
+                num_heads,
+                causal,
+                d_k,
+                ..
+            } => {
+                assert_eq!(*num_heads, 1, "no num_heads param → default 1");
+                assert!(*causal, "should detect causal mask from If + Store(-1e30)");
+                assert_eq!(d_k, "d_k");
+            }
+            _ => panic!("expected Attention pattern, got {pattern:?}"),
+        }
+        // Display should include causal marker
+        let display = format!("{pattern}");
+        assert!(
+            display.contains("causal"),
+            "display should mention causal: {display}"
+        );
+        assert!(
+            display.contains("heads=1"),
+            "display should show heads=1: {display}"
+        );
+    }
+
+    #[test]
+    fn classify_gqa_defaults_to_mha() {
+        // GQA detection is not yet implemented; num_kv_heads always equals num_heads.
+        let module = make_attention_module(&["seq_len", "d_model", "num_heads"], Some(4), false);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Attention {
+                num_heads,
+                num_kv_heads,
+                ..
+            } => {
+                assert_eq!(*num_heads, 4);
+                assert_eq!(
+                    *num_kv_heads, *num_heads,
+                    "GQA not implemented: kv_heads defaults to num_heads"
+                );
+            }
+            _ => panic!("expected Attention pattern, got {pattern:?}"),
+        }
     }
 }

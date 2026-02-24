@@ -5,8 +5,8 @@
 
 use crate::proto::*;
 use nxpu_analysis::analyze::{
-    ActivationOp, Conv2DShape, ElementWiseOp, EmbeddedWeight, KernelPattern, MatMulShape, PoolKind,
-    PoolShape, ReduceOp, TensorBinding,
+    ActivationOp, Conv2DShape, ElementWiseOp, EmbeddedWeight, KernelPattern, MatMulShape, NormType,
+    PoolKind, PoolShape, ReduceOp, TensorBinding, normalize_axis,
 };
 use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
 use nxpu_backend_core::BackendError;
@@ -64,8 +64,9 @@ pub fn build_model(
             scale,
             bias,
             output,
+            norm_type,
             ..
-        } => build_normalization_graph(input, scale, bias, output, ep_name),
+        } => build_normalization_graph(input, scale, bias, output, *norm_type, ep_name),
         KernelPattern::Concat {
             inputs,
             output,
@@ -83,7 +84,25 @@ pub fn build_model(
             output,
             d_k,
             seq_len,
-        } => build_attention_graph(query, key, value, output, seq_len, d_k, ep_name),
+            num_heads,
+            causal,
+            ..
+        } => build_attention_graph(
+            query, key, value, output, seq_len, d_k, *num_heads, *causal, ep_name,
+        ),
+        KernelPattern::Gather {
+            data,
+            indices,
+            output,
+            axis,
+        } => build_gather_graph(data, indices, output, *axis, ep_name),
+        KernelPattern::Scatter {
+            data,
+            indices,
+            updates,
+            output,
+            axis,
+        } => build_scatter_graph(data, indices, updates, output, *axis, ep_name),
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
                 "cannot lower Unknown pattern to ONNX: {reason}"
@@ -432,6 +451,7 @@ pub fn make_weight_initializer(name: &str, dims: &[i64], data: &[f32]) -> Tensor
         data_type: data_type::FLOAT,
         name: name.into(),
         float_data: vec![],
+        int32_data: vec![],
         int64_data: vec![],
         raw_data,
     }
@@ -553,6 +573,15 @@ fn build_conv2d_graph(
                 "pads",
                 vec![shape.pad_h, shape.pad_w, shape.pad_h, shape.pad_w],
             ));
+            if shape.groups != 1 {
+                attrs.push(AttributeProto::int("group", shape.groups));
+            }
+            if shape.dilation_h != 1 || shape.dilation_w != 1 {
+                attrs.push(AttributeProto::ints(
+                    "dilations",
+                    vec![shape.dilation_h, shape.dilation_w],
+                ));
+            }
             NodeProto::with_attrs(
                 "Conv",
                 "conv_0",
@@ -646,15 +675,207 @@ fn build_activation_graph(
     dim_name: &str,
     ep_name: &str,
 ) -> GraphProto {
+    match op {
+        ActivationOp::Gelu => build_gelu_graph(input, output, dim_name, ep_name),
+        ActivationOp::Silu => build_silu_graph(input, output, dim_name, ep_name),
+        ActivationOp::Mish => build_mish_graph(input, output, dim_name, ep_name),
+        _ => GraphProto {
+            name: ep_name.into(),
+            initializer: vec![],
+            node: vec![NodeProto::simple(
+                op.op_name(),
+                format!("{}_0", op.op_name().to_lowercase()),
+                vec![input.name.clone()],
+                vec![output.name.clone()],
+            )],
+            input: vec![ValueInfoProto::tensor(
+                &input.name,
+                input.elem_type,
+                vec![TensorShapeDimension::symbolic(dim_name)],
+            )],
+            output: vec![ValueInfoProto::tensor(
+                &output.name,
+                output.elem_type,
+                vec![TensorShapeDimension::symbolic(dim_name)],
+            )],
+        },
+    }
+}
+
+/// Build GELU graph: x * 0.5 * (1 + Erf(x / sqrt(2)))
+fn build_gelu_graph(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    dim_name: &str,
+    ep_name: &str,
+) -> GraphProto {
+    // Decompose: x * 0.5 * (1 + Erf(x / sqrt(2)))
+    let sqrt2_name = "gelu_sqrt2";
+    let div_name = "gelu_div";
+    let erf_name = "gelu_erf";
+    let one_name = "gelu_one";
+    let add_name = "gelu_add";
+    let half_name = "gelu_half";
+    let mul1_name = "gelu_mul1";
+
+    GraphProto {
+        name: ep_name.into(),
+        initializer: vec![
+            TensorProto {
+                dims: vec![],
+                data_type: data_type::FLOAT,
+                name: sqrt2_name.into(),
+                float_data: vec![std::f32::consts::SQRT_2],
+                int32_data: vec![],
+                int64_data: vec![],
+                raw_data: vec![],
+            },
+            TensorProto {
+                dims: vec![],
+                data_type: data_type::FLOAT,
+                name: one_name.into(),
+                float_data: vec![1.0],
+                int32_data: vec![],
+                int64_data: vec![],
+                raw_data: vec![],
+            },
+            TensorProto {
+                dims: vec![],
+                data_type: data_type::FLOAT,
+                name: half_name.into(),
+                float_data: vec![0.5],
+                int32_data: vec![],
+                int64_data: vec![],
+                raw_data: vec![],
+            },
+        ],
+        node: vec![
+            // x / sqrt(2)
+            NodeProto::simple(
+                "Div",
+                "gelu_div_0",
+                vec![input.name.clone(), sqrt2_name.into()],
+                vec![div_name.into()],
+            ),
+            // Erf(x / sqrt(2))
+            NodeProto::simple(
+                "Erf",
+                "gelu_erf_0",
+                vec![div_name.into()],
+                vec![erf_name.into()],
+            ),
+            // 1 + Erf(...)
+            NodeProto::simple(
+                "Add",
+                "gelu_add_0",
+                vec![erf_name.into(), one_name.into()],
+                vec![add_name.into()],
+            ),
+            // x * (1 + Erf(...))
+            NodeProto::simple(
+                "Mul",
+                "gelu_mul_0",
+                vec![input.name.clone(), add_name.into()],
+                vec![mul1_name.into()],
+            ),
+            // result * 0.5
+            NodeProto::simple(
+                "Mul",
+                "gelu_mul_1",
+                vec![mul1_name.into(), half_name.into()],
+                vec![output.name.clone()],
+            ),
+        ],
+        input: vec![
+            ValueInfoProto::tensor(
+                &input.name,
+                input.elem_type,
+                vec![TensorShapeDimension::symbolic(dim_name)],
+            ),
+            ValueInfoProto::tensor(sqrt2_name, data_type::FLOAT, vec![]),
+            ValueInfoProto::tensor(one_name, data_type::FLOAT, vec![]),
+            ValueInfoProto::tensor(half_name, data_type::FLOAT, vec![]),
+        ],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic(dim_name)],
+        )],
+    }
+}
+
+/// Build SiLU graph: x * sigmoid(x) = x * (1 / (1 + exp(-x)))
+fn build_silu_graph(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    dim_name: &str,
+    ep_name: &str,
+) -> GraphProto {
+    let sigmoid_name = "silu_sigmoid";
+
     GraphProto {
         name: ep_name.into(),
         initializer: vec![],
-        node: vec![NodeProto::simple(
-            op.op_name(),
-            format!("{}_0", op.op_name().to_lowercase()),
-            vec![input.name.clone()],
-            vec![output.name.clone()],
+        node: vec![
+            NodeProto::simple(
+                "Sigmoid",
+                "silu_sigmoid_0",
+                vec![input.name.clone()],
+                vec![sigmoid_name.into()],
+            ),
+            NodeProto::simple(
+                "Mul",
+                "silu_mul_0",
+                vec![input.name.clone(), sigmoid_name.into()],
+                vec![output.name.clone()],
+            ),
+        ],
+        input: vec![ValueInfoProto::tensor(
+            &input.name,
+            input.elem_type,
+            vec![TensorShapeDimension::symbolic(dim_name)],
         )],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic(dim_name)],
+        )],
+    }
+}
+
+/// Build Mish graph: x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+fn build_mish_graph(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    dim_name: &str,
+    ep_name: &str,
+) -> GraphProto {
+    let softplus_name = "mish_softplus";
+    let tanh_name = "mish_tanh";
+
+    GraphProto {
+        name: ep_name.into(),
+        initializer: vec![],
+        node: vec![
+            NodeProto::simple(
+                "Softplus",
+                "mish_softplus_0",
+                vec![input.name.clone()],
+                vec![softplus_name.into()],
+            ),
+            NodeProto::simple(
+                "Tanh",
+                "mish_tanh_0",
+                vec![softplus_name.into()],
+                vec![tanh_name.into()],
+            ),
+            NodeProto::simple(
+                "Mul",
+                "mish_mul_0",
+                vec![input.name.clone(), tanh_name.into()],
+                vec![output.name.clone()],
+            ),
+        ],
         input: vec![ValueInfoProto::tensor(
             &input.name,
             input.elem_type,
@@ -754,6 +975,7 @@ fn build_reshape_graph(input: &TensorBinding, output: &TensorBinding, ep_name: &
             data_type: data_type::INT64,
             name: shape_name.clone(),
             float_data: vec![],
+            int32_data: vec![],
             int64_data: vec![-1],
             raw_data: vec![],
         }],
@@ -788,57 +1010,190 @@ fn build_normalization_graph(
     scale: &TensorBinding,
     bias: &TensorBinding,
     output: &TensorBinding,
+    norm_type: NormType,
     ep_name: &str,
 ) -> GraphProto {
-    // mean → empty string (runtime computed)
-    // var → empty string (runtime computed)
+    match norm_type {
+        NormType::Batch => {
+            // mean -> empty string (runtime computed)
+            // var -> empty string (runtime computed)
+            GraphProto {
+                name: ep_name.into(),
+                initializer: vec![],
+                node: vec![NodeProto::with_attrs(
+                    "BatchNormalization",
+                    "batchnorm_0",
+                    vec![
+                        input.name.clone(),
+                        scale.name.clone(),
+                        bias.name.clone(),
+                        "running_mean".into(),
+                        "running_var".into(),
+                    ],
+                    vec![output.name.clone()],
+                    vec![AttributeProto::float("epsilon", 1e-5)],
+                )],
+                input: vec![
+                    ValueInfoProto::tensor(
+                        &input.name,
+                        input.elem_type,
+                        vec![
+                            TensorShapeDimension::symbolic("N"),
+                            TensorShapeDimension::symbolic("C"),
+                            TensorShapeDimension::symbolic("H"),
+                            TensorShapeDimension::symbolic("W"),
+                        ],
+                    ),
+                    ValueInfoProto::tensor(
+                        &scale.name,
+                        scale.elem_type,
+                        vec![TensorShapeDimension::symbolic("C")],
+                    ),
+                    ValueInfoProto::tensor(
+                        &bias.name,
+                        bias.elem_type,
+                        vec![TensorShapeDimension::symbolic("C")],
+                    ),
+                ],
+                output: vec![ValueInfoProto::tensor(
+                    &output.name,
+                    output.elem_type,
+                    vec![
+                        TensorShapeDimension::symbolic("N"),
+                        TensorShapeDimension::symbolic("C"),
+                        TensorShapeDimension::symbolic("H"),
+                        TensorShapeDimension::symbolic("W"),
+                    ],
+                )],
+            }
+        }
+        NormType::Layer => {
+            // ONNX LayerNormalization (opset 17+)
+            GraphProto {
+                name: ep_name.into(),
+                initializer: vec![],
+                node: vec![NodeProto::with_attrs(
+                    "LayerNormalization",
+                    "layernorm_0",
+                    vec![input.name.clone(), scale.name.clone(), bias.name.clone()],
+                    vec![output.name.clone()],
+                    vec![
+                        AttributeProto::float("epsilon", 1e-5),
+                        AttributeProto::int("axis", -1),
+                    ],
+                )],
+                input: vec![
+                    ValueInfoProto::tensor(
+                        &input.name,
+                        input.elem_type,
+                        vec![
+                            TensorShapeDimension::symbolic("N"),
+                            TensorShapeDimension::symbolic("C"),
+                        ],
+                    ),
+                    ValueInfoProto::tensor(
+                        &scale.name,
+                        scale.elem_type,
+                        vec![TensorShapeDimension::symbolic("C")],
+                    ),
+                    ValueInfoProto::tensor(
+                        &bias.name,
+                        bias.elem_type,
+                        vec![TensorShapeDimension::symbolic("C")],
+                    ),
+                ],
+                output: vec![ValueInfoProto::tensor(
+                    &output.name,
+                    output.elem_type,
+                    vec![
+                        TensorShapeDimension::symbolic("N"),
+                        TensorShapeDimension::symbolic("C"),
+                    ],
+                )],
+            }
+        }
+    }
+}
+
+fn build_gather_graph(
+    data: &TensorBinding,
+    indices: &TensorBinding,
+    output: &TensorBinding,
+    axis: i64,
+    ep_name: &str,
+) -> GraphProto {
     GraphProto {
         name: ep_name.into(),
         initializer: vec![],
         node: vec![NodeProto::with_attrs(
-            "BatchNormalization",
-            "batchnorm_0",
-            vec![
-                input.name.clone(),
-                scale.name.clone(),
-                bias.name.clone(),
-                "running_mean".into(),
-                "running_var".into(),
-            ],
+            "Gather",
+            "gather_0",
+            vec![data.name.clone(), indices.name.clone()],
             vec![output.name.clone()],
-            vec![AttributeProto::float("epsilon", 1e-5)], // IEEE float bit pattern for 1e-5 stored as int (convention)
+            vec![AttributeProto::int("axis", axis)],
         )],
         input: vec![
             ValueInfoProto::tensor(
-                &input.name,
-                input.elem_type,
-                vec![
-                    TensorShapeDimension::symbolic("N"),
-                    TensorShapeDimension::symbolic("C"),
-                    TensorShapeDimension::symbolic("H"),
-                    TensorShapeDimension::symbolic("W"),
-                ],
+                &data.name,
+                data.elem_type,
+                vec![TensorShapeDimension::symbolic("N")],
             ),
             ValueInfoProto::tensor(
-                &scale.name,
-                scale.elem_type,
-                vec![TensorShapeDimension::symbolic("C")],
-            ),
-            ValueInfoProto::tensor(
-                &bias.name,
-                bias.elem_type,
-                vec![TensorShapeDimension::symbolic("C")],
+                &indices.name,
+                indices.elem_type,
+                vec![TensorShapeDimension::symbolic("M")],
             ),
         ],
         output: vec![ValueInfoProto::tensor(
             &output.name,
             output.elem_type,
+            vec![TensorShapeDimension::symbolic("M")],
+        )],
+    }
+}
+
+fn build_scatter_graph(
+    data: &TensorBinding,
+    indices: &TensorBinding,
+    updates: &TensorBinding,
+    output: &TensorBinding,
+    _axis: i64,
+    ep_name: &str,
+) -> GraphProto {
+    GraphProto {
+        name: ep_name.into(),
+        initializer: vec![],
+        node: vec![NodeProto::simple(
+            "ScatterND",
+            "scatter_0",
             vec![
-                TensorShapeDimension::symbolic("N"),
-                TensorShapeDimension::symbolic("C"),
-                TensorShapeDimension::symbolic("H"),
-                TensorShapeDimension::symbolic("W"),
+                data.name.clone(),
+                indices.name.clone(),
+                updates.name.clone(),
             ],
+            vec![output.name.clone()],
+        )],
+        input: vec![
+            ValueInfoProto::tensor(
+                &data.name,
+                data.elem_type,
+                vec![TensorShapeDimension::symbolic("N")],
+            ),
+            ValueInfoProto::tensor(
+                &indices.name,
+                indices.elem_type,
+                vec![TensorShapeDimension::symbolic("M")],
+            ),
+            ValueInfoProto::tensor(
+                &updates.name,
+                updates.elem_type,
+                vec![TensorShapeDimension::symbolic("M")],
+            ),
+        ],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic("N")],
         )],
     }
 }
@@ -849,6 +1204,12 @@ fn build_concat_graph(
     axis: i64,
     ep_name: &str,
 ) -> GraphProto {
+    // Normalize potentially negative axis values. Use axis+1 as minimum rank
+    // so non-negative values pass through unchanged. For true negative-axis
+    // support the caller should supply the real tensor rank.
+    let ndim = (axis.unsigned_abs() as usize + 1).max(1);
+    let axis = normalize_axis(axis, ndim);
+
     let input_names: Vec<String> = inputs.iter().map(|i| i.name.clone()).collect();
     GraphProto {
         name: ep_name.into(),
@@ -884,6 +1245,10 @@ fn build_split_graph(
     axis: i64,
     ep_name: &str,
 ) -> GraphProto {
+    // Normalize potentially negative axis values (see build_concat_graph).
+    let ndim = (axis.unsigned_abs() as usize + 1).max(1);
+    let axis = normalize_axis(axis, ndim);
+
     let output_names: Vec<String> = outputs.iter().map(|o| o.name.clone()).collect();
     GraphProto {
         name: ep_name.into(),
@@ -913,6 +1278,7 @@ fn build_split_graph(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_attention_graph(
     query: &TensorBinding,
     key: &TensorBinding,
@@ -920,9 +1286,13 @@ fn build_attention_graph(
     output: &TensorBinding,
     seq_len: &str,
     d_k: &str,
+    num_heads: u32,
+    causal: bool,
     ep_name: &str,
 ) -> GraphProto {
     // Emit a subgraph: Transpose(K) → MatMul(Q,K^T) → Div(sqrt_dk) → Softmax → MatMul(attn,V)
+    // For multi-head: prepend Reshape+Transpose for Q/K/V, and append Reshape after.
+    // For causal: insert a Where node with a triangular mask before Softmax.
     let kt_name = "key_transposed";
     let scores_name = "scores";
     let scaled_name = "scaled_scores";
@@ -935,92 +1305,208 @@ fn build_attention_graph(
     let k_shape = q_shape.clone();
     let v_shape = q_shape.clone();
     let out_shape = q_shape.clone();
-    // Dynamic sqrt(d_k): extract d_k from query tensor's last dimension at runtime.
-    // Shape(Q) → Gather(shape, 1) → Cast(to FLOAT) → Sqrt → Div(scores, sqrt_dk)
+
+    let mut nodes = Vec::new();
+    let mut initializers = vec![TensorProto {
+        dims: vec![],
+        data_type: data_type::INT64,
+        name: "dk_axis".into(),
+        float_data: vec![],
+        int32_data: vec![],
+        int64_data: vec![1],
+        raw_data: vec![],
+    }];
+
+    // Source names for Q/K/V (may be overwritten by multi-head reshape)
+    let mut q_src = query.name.clone();
+    let mut k_src = key.name.clone();
+    let mut v_src = value.name.clone();
+    let final_output_name;
+
+    if num_heads > 1 {
+        // Multi-head: Reshape Q/K/V from [batch, seq, d_model] → [batch, num_heads, seq, head_dim]
+        // Then Transpose to [batch, num_heads, seq, head_dim] (perm [0,2,1,3])
+        for (src_name, reshaped, transposed) in [
+            (&query.name, "q_reshaped", "q_mh"),
+            (&key.name, "k_reshaped", "k_mh"),
+            (&value.name, "v_reshaped", "v_mh"),
+        ] {
+            nodes.push(NodeProto::with_attrs(
+                "Reshape",
+                format!("reshape_{reshaped}"),
+                vec![src_name.clone(), "mh_shape".into()],
+                vec![reshaped.into()],
+                vec![],
+            ));
+            nodes.push(NodeProto::with_attrs(
+                "Transpose",
+                format!("transpose_{transposed}"),
+                vec![reshaped.into()],
+                vec![transposed.into()],
+                vec![AttributeProto::ints("perm", vec![0, 2, 1, 3])],
+            ));
+        }
+        q_src = "q_mh".into();
+        k_src = "k_mh".into();
+        v_src = "v_mh".into();
+        final_output_name = "attn_mh_out".to_string();
+
+        // mh_shape initializer: symbolic reshape target
+        initializers.push(TensorProto {
+            dims: vec![4],
+            data_type: data_type::INT64,
+            name: "mh_shape".into(),
+            float_data: vec![],
+            int32_data: vec![],
+            int64_data: vec![0, -1, num_heads as i64, -1],
+            raw_data: vec![],
+        });
+    } else {
+        final_output_name = output.name.clone();
+    }
+
+    // Transpose K
+    nodes.push(NodeProto::with_attrs(
+        "Transpose",
+        "transpose_k",
+        vec![k_src.clone()],
+        vec![kt_name.into()],
+        vec![AttributeProto::ints("perm", vec![1, 0])],
+    ));
+    // MatMul(Q, K^T) → scores
+    nodes.push(NodeProto::simple(
+        "MatMul",
+        "matmul_qk",
+        vec![q_src, kt_name.into()],
+        vec![scores_name.into()],
+    ));
+    // Shape(Q) → [seq_len, d_k]
+    nodes.push(NodeProto::simple(
+        "Shape",
+        "shape_q",
+        vec![query.name.clone()],
+        vec!["query_shape".into()],
+    ));
+    // Gather(query_shape, 1) → d_k dimension (scalar)
+    nodes.push(NodeProto::simple(
+        "Gather",
+        "gather_dk",
+        vec!["query_shape".into(), "dk_axis".into()],
+        vec!["dk_dim".into()],
+    ));
+    // Cast(dk_dim, to=FLOAT) → scalar f32
+    nodes.push(NodeProto::with_attrs(
+        "Cast",
+        "cast_dk",
+        vec!["dk_dim".into()],
+        vec!["dk_float".into()],
+        vec![AttributeProto::int("to", data_type::FLOAT as i64)],
+    ));
+    // Sqrt(dk_float) → sqrt(d_k)
+    nodes.push(NodeProto::simple(
+        "Sqrt",
+        "sqrt_dk",
+        vec!["dk_float".into()],
+        vec!["sqrt_dk_val".into()],
+    ));
+    // Div(scores, sqrt_dk_val) → scaled_scores
+    nodes.push(NodeProto::simple(
+        "Div",
+        "scale_scores",
+        vec![scores_name.into(), "sqrt_dk_val".into()],
+        vec![scaled_name.into()],
+    ));
+
+    // Causal mask: Where(tri_mask, scaled_scores, -1e9)
+    let softmax_input = if causal {
+        let neg_inf_bytes: Vec<u8> = (-1e9_f32).to_le_bytes().to_vec();
+        initializers.push(TensorProto {
+            dims: vec![],
+            data_type: data_type::FLOAT,
+            name: "neg_inf".into(),
+            float_data: vec![],
+            int32_data: vec![],
+            int64_data: vec![],
+            raw_data: neg_inf_bytes,
+        });
+        // tri_mask is a boolean constant that must be provided at runtime or as an initializer.
+        // We add a placeholder input for it.
+        nodes.push(NodeProto::simple(
+            "Where",
+            "causal_mask",
+            vec!["tri_mask".into(), scaled_name.into(), "neg_inf".into()],
+            vec!["masked_scores".into()],
+        ));
+        "masked_scores"
+    } else {
+        scaled_name
+    };
+
+    // Softmax
+    nodes.push(NodeProto::simple(
+        "Softmax",
+        "softmax_0",
+        vec![softmax_input.into()],
+        vec![attn_name.into()],
+    ));
+    // MatMul(attn, V) → output
+    nodes.push(NodeProto::simple(
+        "MatMul",
+        "matmul_av",
+        vec![attn_name.into(), v_src],
+        vec![final_output_name.clone()],
+    ));
+
+    if num_heads > 1 {
+        // Reshape back: [batch, num_heads, seq, head_dim] → [batch, seq, d_model]
+        nodes.push(NodeProto::with_attrs(
+            "Transpose",
+            "transpose_mh_out",
+            vec![final_output_name],
+            vec!["attn_transposed".into()],
+            vec![AttributeProto::ints("perm", vec![0, 2, 1, 3])],
+        ));
+        nodes.push(NodeProto::with_attrs(
+            "Reshape",
+            "reshape_mh_out",
+            vec!["attn_transposed".into(), "out_shape".into()],
+            vec![output.name.clone()],
+            vec![],
+        ));
+        initializers.push(TensorProto {
+            dims: vec![3],
+            data_type: data_type::INT64,
+            name: "out_shape".into(),
+            float_data: vec![],
+            int32_data: vec![],
+            int64_data: vec![0, -1, -1],
+            raw_data: vec![],
+        });
+    }
+
+    let mut inputs = vec![
+        ValueInfoProto::tensor(&query.name, query.elem_type, q_shape),
+        ValueInfoProto::tensor(&key.name, key.elem_type, k_shape),
+        ValueInfoProto::tensor(&value.name, value.elem_type, v_shape),
+        // dk_axis is an initializer with default value; listed as input for ONNX compliance.
+        ValueInfoProto::tensor("dk_axis", data_type::INT64, vec![]),
+    ];
+    if causal {
+        inputs.push(ValueInfoProto::tensor(
+            "tri_mask",
+            data_type::BOOL,
+            vec![
+                TensorShapeDimension::symbolic(seq_len),
+                TensorShapeDimension::symbolic(seq_len),
+            ],
+        ));
+    }
+
     GraphProto {
         name: ep_name.into(),
-        initializer: vec![TensorProto {
-            dims: vec![],
-            data_type: data_type::INT64,
-            name: "dk_axis".into(),
-            float_data: vec![],
-            int64_data: vec![1],
-            raw_data: vec![],
-        }],
-        node: vec![
-            // Transpose K
-            NodeProto::with_attrs(
-                "Transpose",
-                "transpose_k",
-                vec![key.name.clone()],
-                vec![kt_name.into()],
-                vec![AttributeProto::ints("perm", vec![1, 0])],
-            ),
-            // MatMul(Q, K^T) → scores
-            NodeProto::simple(
-                "MatMul",
-                "matmul_qk",
-                vec![query.name.clone(), kt_name.into()],
-                vec![scores_name.into()],
-            ),
-            // Shape(Q) → [seq_len, d_k]
-            NodeProto::simple(
-                "Shape",
-                "shape_q",
-                vec![query.name.clone()],
-                vec!["query_shape".into()],
-            ),
-            // Gather(query_shape, 1) → d_k dimension (scalar)
-            NodeProto::simple(
-                "Gather",
-                "gather_dk",
-                vec!["query_shape".into(), "dk_axis".into()],
-                vec!["dk_dim".into()],
-            ),
-            // Cast(dk_dim, to=FLOAT) → scalar f32
-            NodeProto::with_attrs(
-                "Cast",
-                "cast_dk",
-                vec!["dk_dim".into()],
-                vec!["dk_float".into()],
-                vec![AttributeProto::int("to", data_type::FLOAT as i64)],
-            ),
-            // Sqrt(dk_float) → sqrt(d_k)
-            NodeProto::simple(
-                "Sqrt",
-                "sqrt_dk",
-                vec!["dk_float".into()],
-                vec!["sqrt_dk_val".into()],
-            ),
-            // Div(scores, sqrt_dk_val) → scaled_scores
-            NodeProto::simple(
-                "Div",
-                "scale_scores",
-                vec![scores_name.into(), "sqrt_dk_val".into()],
-                vec![scaled_name.into()],
-            ),
-            // Softmax
-            NodeProto::simple(
-                "Softmax",
-                "softmax_0",
-                vec![scaled_name.into()],
-                vec![attn_name.into()],
-            ),
-            // MatMul(attn, V) → output
-            NodeProto::simple(
-                "MatMul",
-                "matmul_av",
-                vec![attn_name.into(), value.name.clone()],
-                vec![output.name.clone()],
-            ),
-        ],
-        input: vec![
-            ValueInfoProto::tensor(&query.name, query.elem_type, q_shape),
-            ValueInfoProto::tensor(&key.name, key.elem_type, k_shape),
-            ValueInfoProto::tensor(&value.name, value.elem_type, v_shape),
-            // dk_axis is an initializer with default value; listed as input for ONNX compliance.
-            ValueInfoProto::tensor("dk_axis", data_type::INT64, vec![]),
-        ],
+        initializer: initializers,
+        node: nodes,
+        input: inputs,
         output: vec![ValueInfoProto::tensor(
             &output.name,
             output.elem_type,
@@ -1029,11 +1515,116 @@ fn build_attention_graph(
     }
 }
 
+/// Inject QDQ (QuantizeLinear -> DequantizeLinear) nodes for per-channel
+/// quantized weight tensors.
+///
+/// For each [`PerChannelParam`], this function:
+/// 1. Adds scale and zero_point initializer tensors to the graph.
+/// 2. Inserts QuantizeLinear and DequantizeLinear nodes at the beginning.
+/// 3. Rewrites downstream node inputs to reference the dequantized output.
+pub fn inject_per_channel_qdq(
+    graph: &mut GraphProto,
+    per_channel_params: &[nxpu_backend_core::PerChannelParam],
+) {
+    for pcp in per_channel_params {
+        let original_name = &pcp.name;
+        let quant_name = format!("{}_quantized", original_name);
+        let dequant_name = format!("{}_dequantized", original_name);
+        let scale_name = format!("{}_scale", original_name);
+        let zp_name = format!("{}_zero_point", original_name);
+
+        // Add scale as a FLOAT initializer tensor.
+        graph.initializer.push(TensorProto {
+            name: scale_name.clone(),
+            data_type: data_type::FLOAT,
+            dims: vec![pcp.scales.len() as i64],
+            float_data: pcp.scales.clone(),
+            int32_data: vec![],
+            int64_data: vec![],
+            raw_data: vec![],
+        });
+
+        // Add zero_point as an INT8 initializer tensor.
+        graph.initializer.push(TensorProto {
+            name: zp_name.clone(),
+            data_type: data_type::INT8,
+            dims: vec![pcp.zero_points.len() as i64],
+            float_data: vec![],
+            int32_data: pcp.zero_points.clone(),
+            int64_data: vec![],
+            raw_data: vec![],
+        });
+
+        // QuantizeLinear: original -> quantized
+        let quant_node = NodeProto::with_attrs(
+            "QuantizeLinear",
+            format!("quantize_{}", original_name),
+            vec![original_name.clone(), scale_name.clone(), zp_name.clone()],
+            vec![quant_name.clone()],
+            vec![AttributeProto::int("axis", pcp.channel_axis as i64)],
+        );
+
+        // DequantizeLinear: quantized -> dequantized
+        let dequant_node = NodeProto::with_attrs(
+            "DequantizeLinear",
+            format!("dequantize_{}", original_name),
+            vec![quant_name, scale_name, zp_name],
+            vec![dequant_name.clone()],
+            vec![AttributeProto::int("axis", pcp.channel_axis as i64)],
+        );
+
+        // Insert QDQ nodes at the beginning of the graph.
+        graph.node.insert(0, dequant_node);
+        graph.node.insert(0, quant_node);
+
+        // Update all subsequent nodes that reference the original weight
+        // to use the dequantized output instead.
+        for node in &mut graph.node[2..] {
+            for input in &mut node.input {
+                if *input == *original_name {
+                    *input = dequant_name.clone();
+                }
+            }
+        }
+    }
+}
+
+/// Inserts a Transpose node into an ONNX graph for layout conversion.
+///
+/// If `perm` is a non-identity permutation, this adds a Transpose node that
+/// reads from `input_name` and writes to `output_name`.  The caller is
+/// responsible for wiring the surrounding graph so that the right tensors
+/// flow through the transpose.
+///
+/// This is used by the ONNX backend when the source IR has a different
+/// memory layout (e.g. NHWC) than the ONNX-expected layout (NCHW).
+#[allow(dead_code)] // Infrastructure for layout conversion; wired in by backends as needed.
+pub fn maybe_add_layout_transpose(
+    graph: &mut GraphProto,
+    perm: &[i64],
+    input_name: &str,
+    output_name: &str,
+) {
+    // Identity check: if perm is [0, 1, 2, ...] there is nothing to do.
+    let is_identity = perm.iter().enumerate().all(|(i, &p)| p as usize == i);
+    if is_identity || perm.is_empty() {
+        return;
+    }
+
+    graph.node.push(NodeProto::with_attrs(
+        "Transpose",
+        format!("layout_transpose_{output_name}"),
+        vec![input_name.into()],
+        vec![output_name.into()],
+        vec![AttributeProto::ints("perm", perm.to_vec())],
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proto::{data_type, tensor_shape_dimension, type_proto};
-    use nxpu_analysis::analyze::TensorRole;
+    use nxpu_analysis::analyze::{NormType, TensorRole};
     use nxpu_ir::Handle;
 
     fn dummy_handle() -> Handle<nxpu_ir::GlobalVariable> {
@@ -1202,6 +1793,9 @@ mod tests {
                 stride_w: 1,
                 pad_h: 0,
                 pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
             },
         };
         let model = build_model(&pattern, "conv2d", &[]).unwrap();
@@ -1287,6 +1881,7 @@ mod tests {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor("y", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
         let model = build_model(&pattern, "batchnorm", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
@@ -1321,6 +1916,9 @@ mod tests {
             output: make_tensor("out", TensorRole::Output),
             d_k: "d_k".into(),
             seq_len: "seq_len".into(),
+            num_heads: 1,
+            num_kv_heads: 1,
+            causal: false,
         };
         let model = build_model(&pattern, "attention", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
@@ -1356,6 +1954,9 @@ mod tests {
             stride_w: 1,
             pad_h: 0,
             pad_w: 0,
+            groups: 1,
+            dilation_h: 1,
+            dilation_w: 1,
         }
     }
 
@@ -1416,6 +2017,7 @@ mod tests {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor("bn_out", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
         let fused = FusedPattern::ConvBatchNorm {
             conv,
@@ -1733,6 +2335,7 @@ mod tests {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor("bn_out", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
         let conv_bn = FusedPattern::ConvBatchNorm {
             conv,
@@ -1898,6 +2501,7 @@ mod tests {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor("bn_out", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
         let fused = FusedPattern::ConvBatchNorm {
             conv,
@@ -2032,5 +2636,226 @@ mod tests {
         assert_eq!(graph.initializer[0].data_type, data_type::FLOAT);
         // raw_data = 4 floats * 4 bytes = 16 bytes
         assert_eq!(graph.initializer[0].raw_data.len(), 16);
+    }
+
+    #[test]
+    fn inject_per_channel_qdq_adds_nodes_and_initializers() {
+        // Build a minimal graph with a Conv node referencing "weight".
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![NodeProto::simple(
+                "Conv",
+                "conv_0",
+                vec!["input".into(), "weight".into()],
+                vec!["output".into()],
+            )],
+            input: vec![ValueInfoProto::tensor(
+                "input",
+                data_type::FLOAT,
+                vec![
+                    TensorShapeDimension::fixed(1),
+                    TensorShapeDimension::fixed(3),
+                    TensorShapeDimension::fixed(224),
+                    TensorShapeDimension::fixed(224),
+                ],
+            )],
+            output: vec![ValueInfoProto::tensor(
+                "output",
+                data_type::FLOAT,
+                vec![
+                    TensorShapeDimension::fixed(1),
+                    TensorShapeDimension::fixed(16),
+                    TensorShapeDimension::fixed(222),
+                    TensorShapeDimension::fixed(222),
+                ],
+            )],
+        };
+
+        let params = vec![nxpu_backend_core::PerChannelParam {
+            name: "weight".into(),
+            scales: vec![0.1, 0.2, 0.3],
+            zero_points: vec![0, 0, 0],
+            channel_axis: 0,
+        }];
+
+        inject_per_channel_qdq(&mut graph, &params);
+
+        // Should have 3 nodes: QuantizeLinear, DequantizeLinear, Conv
+        assert_eq!(graph.node.len(), 3);
+        assert_eq!(graph.node[0].op_type, "QuantizeLinear");
+        assert_eq!(graph.node[0].name, "quantize_weight");
+        assert_eq!(graph.node[1].op_type, "DequantizeLinear");
+        assert_eq!(graph.node[1].name, "dequantize_weight");
+        assert_eq!(graph.node[2].op_type, "Conv");
+
+        // Conv node should now reference the dequantized weight.
+        assert_eq!(graph.node[2].input[0], "input");
+        assert_eq!(graph.node[2].input[1], "weight_dequantized");
+
+        // Check initializers: scale and zero_point tensors.
+        assert_eq!(graph.initializer.len(), 2);
+        assert_eq!(graph.initializer[0].name, "weight_scale");
+        assert_eq!(graph.initializer[0].data_type, data_type::FLOAT);
+        assert_eq!(graph.initializer[0].float_data, vec![0.1, 0.2, 0.3]);
+        assert_eq!(graph.initializer[1].name, "weight_zero_point");
+        assert_eq!(graph.initializer[1].data_type, data_type::INT8);
+        assert_eq!(graph.initializer[1].int32_data, vec![0, 0, 0]);
+
+        // Check axis attribute on QuantizeLinear.
+        assert_eq!(graph.node[0].attribute.len(), 1);
+        assert_eq!(graph.node[0].attribute[0].name, "axis");
+        assert_eq!(graph.node[0].attribute[0].i, 0);
+    }
+
+    #[test]
+    fn inject_per_channel_qdq_empty_params_is_noop() {
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![NodeProto::simple(
+                "Conv",
+                "conv_0",
+                vec!["input".into(), "weight".into()],
+                vec!["output".into()],
+            )],
+            input: vec![],
+            output: vec![],
+        };
+
+        inject_per_channel_qdq(&mut graph, &[]);
+
+        // Graph should be unchanged.
+        assert_eq!(graph.node.len(), 1);
+        assert_eq!(graph.node[0].op_type, "Conv");
+        assert!(graph.initializer.is_empty());
+    }
+
+    #[test]
+    fn layout_transpose_adds_node() {
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![],
+            input: vec![],
+            output: vec![],
+        };
+        maybe_add_layout_transpose(&mut graph, &[0, 3, 1, 2], "input_nhwc", "input_nchw");
+        assert_eq!(graph.node.len(), 1);
+        assert_eq!(graph.node[0].op_type, "Transpose");
+        assert_eq!(graph.node[0].input, vec!["input_nhwc"]);
+        assert_eq!(graph.node[0].output, vec!["input_nchw"]);
+        let perm_attr = graph.node[0]
+            .attribute
+            .iter()
+            .find(|a| a.name == "perm")
+            .expect("expected perm attribute");
+        assert_eq!(perm_attr.ints, vec![0, 3, 1, 2]);
+    }
+
+    #[test]
+    fn layout_transpose_identity_is_noop() {
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![],
+            input: vec![],
+            output: vec![],
+        };
+        maybe_add_layout_transpose(&mut graph, &[0, 1, 2, 3], "x", "y");
+        assert!(graph.node.is_empty());
+    }
+
+    #[test]
+    fn layout_transpose_empty_perm_is_noop() {
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![],
+            input: vec![],
+            output: vec![],
+        };
+        maybe_add_layout_transpose(&mut graph, &[], "x", "y");
+        assert!(graph.node.is_empty());
+    }
+
+    #[test]
+    fn attention_multihead_has_reshape_and_transpose_nodes() {
+        let pattern = KernelPattern::Attention {
+            query: make_tensor("Q", TensorRole::Input),
+            key: make_tensor("K", TensorRole::Input),
+            value: make_tensor("V", TensorRole::Input),
+            output: make_tensor("out", TensorRole::Output),
+            d_k: "64".into(),
+            seq_len: "seq_len".into(),
+            num_heads: 4,
+            num_kv_heads: 4,
+            causal: false,
+        };
+        let model = build_model(&pattern, "multihead_attn", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
+        assert!(
+            op_types.contains(&"Reshape"),
+            "multi-head attention should have Reshape nodes, got: {op_types:?}"
+        );
+        assert!(
+            op_types.contains(&"Transpose"),
+            "multi-head attention should have Transpose nodes, got: {op_types:?}"
+        );
+        assert!(
+            op_types.contains(&"MatMul"),
+            "attention should have MatMul nodes, got: {op_types:?}"
+        );
+
+        // Verify the reshape target shape initializer includes num_heads dimension.
+        let mh_shape_init = graph
+            .initializer
+            .iter()
+            .find(|i| i.name == "mh_shape")
+            .expect("expected mh_shape initializer for multi-head reshape");
+        assert!(
+            mh_shape_init.int64_data.contains(&4),
+            "mh_shape should contain num_heads=4, got: {:?}",
+            mh_shape_init.int64_data
+        );
+    }
+
+    #[test]
+    fn attention_causal_has_where_node() {
+        let pattern = KernelPattern::Attention {
+            query: make_tensor("Q", TensorRole::Input),
+            key: make_tensor("K", TensorRole::Input),
+            value: make_tensor("V", TensorRole::Input),
+            output: make_tensor("out", TensorRole::Output),
+            d_k: "64".into(),
+            seq_len: "seq_len".into(),
+            num_heads: 1,
+            num_kv_heads: 1,
+            causal: true,
+        };
+        let model = build_model(&pattern, "causal_attn", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
+        assert!(
+            op_types.contains(&"Where"),
+            "causal attention should have a Where node for masking, got: {op_types:?}"
+        );
+
+        // Verify there is a neg_inf initializer for the mask fill value.
+        let neg_inf = graph
+            .initializer
+            .iter()
+            .find(|i| i.name == "neg_inf")
+            .expect("expected neg_inf initializer for causal mask");
+        assert_eq!(neg_inf.data_type, data_type::FLOAT);
+
+        // Verify tri_mask input exists.
+        assert!(
+            graph.input.iter().any(|i| i.name == "tri_mask"),
+            "causal attention should have tri_mask input"
+        );
     }
 }

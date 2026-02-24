@@ -65,6 +65,9 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<Model, Back
                 ActivationOp::Sigmoid => "sigmoid",
                 ActivationOp::Tanh => "tanh",
                 ActivationOp::Softmax => "softmax",
+                ActivationOp::Gelu => "gelu",
+                ActivationOp::Silu => "silu",
+                ActivationOp::Mish => "tanh", // Mish approximated via custom ops
             };
             let attributes = match op {
                 ActivationOp::Softmax => vec![MlAttribute {
@@ -127,7 +130,11 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<Model, Back
                 value: Some(ml_attribute::Value::Int(*axis)),
             }],
         ),
-        KernelPattern::Split { input, outputs, .. } => build_split(input, outputs),
+        KernelPattern::Split {
+            input,
+            outputs,
+            axis,
+        } => build_split(input, outputs, *axis),
         KernelPattern::Attention {
             query,
             key,
@@ -135,6 +142,43 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<Model, Back
             output,
             ..
         } => build_attention(query, key, value, output),
+        KernelPattern::Gather {
+            data,
+            indices,
+            output,
+            ..
+        } => build_binary_op("gather", data, indices, output, vec![]),
+        KernelPattern::Scatter {
+            data,
+            indices,
+            updates,
+            output,
+            ..
+        } => {
+            // Use scatter as ternary: data, indices, updates -> output
+            let inputs: Vec<&TensorBinding> = vec![data, indices, updates];
+            let outputs: Vec<&TensorBinding> = vec![output];
+            let operations = vec![MlOperation {
+                name: "scatter_0".into(),
+                r#type: "scatter".into(),
+                inputs: vec![
+                    MlOperand {
+                        name: data.name.clone(),
+                    },
+                    MlOperand {
+                        name: indices.name.clone(),
+                    },
+                    MlOperand {
+                        name: updates.name.clone(),
+                    },
+                ],
+                outputs: vec![MlOperand {
+                    name: output.name.clone(),
+                }],
+                attributes: vec![],
+            }];
+            (inputs, outputs, operations)
+        }
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
                 "cannot lower Unknown pattern to CoreML: {reason}"
@@ -379,6 +423,7 @@ fn build_nary_op<'a>(
 fn build_split<'a>(
     input: &'a TensorBinding,
     outputs: &'a [TensorBinding],
+    axis: i64,
 ) -> (
     Vec<&'a TensorBinding>,
     Vec<&'a TensorBinding>,
@@ -396,7 +441,10 @@ fn build_split<'a>(
                 name: o.name.clone(),
             })
             .collect(),
-        attributes: vec![],
+        attributes: vec![MlAttribute {
+            name: "axis".into(),
+            value: Some(ml_attribute::Value::Int(axis)),
+        }],
     };
     let out_refs: Vec<&TensorBinding> = outputs.iter().collect();
     (vec![input], out_refs, vec![op])

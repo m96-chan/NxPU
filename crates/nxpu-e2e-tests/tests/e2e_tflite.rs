@@ -87,11 +87,11 @@ fn transpose_tflite_unknown() {
 }
 
 #[test]
-fn batchnorm_tflite_unknown() {
-    // BatchNorm is now classified as Unknown (no silent fallback — #64).
+fn batchnorm_tflite_compiles() {
     let source = common::load_example("batchnorm");
-    let result = common::try_compile_wgsl(&source, &TfLiteBackend, 1);
-    assert!(result.is_err(), "expected Unsupported error for batchnorm");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert_eq!(&bytes[4..8], b"TFL3");
 }
 
 #[test]
@@ -123,5 +123,86 @@ fn attention_tflite_magic() {
     let source = common::load_example("attention");
     let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
     let bytes = common::first_binary(&output);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
+
+// --- GELU ---
+
+#[test]
+fn gelu_tflite_magic() {
+    let source = common::load_example("gelu");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert!(bytes.len() > 8);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
+
+// --- LayerNorm ---
+
+#[test]
+fn layernorm_tflite_magic() {
+    let source = common::load_example("layernorm");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert!(bytes.len() > 8);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
+
+// --- Gather ---
+
+#[test]
+fn gather_tflite_magic() {
+    let source = common::load_example("gather");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert!(bytes.len() > 8);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
+
+// --- Scatter ---
+
+#[test]
+fn scatter_tflite_magic() {
+    let source = common::load_example("scatter");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert!(bytes.len() > 8);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
+
+// --- Depthwise Conv ---
+
+#[test]
+fn depthwise_conv_tflite_magic() {
+    let source = common::load_example("depthwise_conv");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert!(bytes.len() > 8);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
+
+// --- Multi-head Attention ---
+// TFLite backend does not yet support multi-head splitting (num_heads is ignored),
+// but compilation should succeed producing single-head SDPA output.
+
+#[test]
+fn multihead_attention_tflite_compiles() {
+    let source = common::load_example("multihead_attention");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert!(bytes.len() > 8);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
+
+// --- Causal Attention ---
+// TFLite backend does not yet support causal masking (causal flag is ignored),
+// but compilation should succeed producing unmasked SDPA output.
+
+#[test]
+fn causal_attention_tflite_compiles() {
+    let source = common::load_example("causal_attention");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert!(bytes.len() > 8);
     assert_eq!(&bytes[4..8], b"TFL3");
 }
