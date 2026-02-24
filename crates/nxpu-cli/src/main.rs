@@ -210,6 +210,7 @@ fn run() -> miette::Result<()> {
 
     // 6b. Resolve precision and run quantization pass.
     let mut quantization_params: Vec<nxpu_backend_core::QuantParam> = Vec::new();
+    let mut per_channel_params: Vec<nxpu_backend_core::PerChannelParam> = Vec::new();
     let resolved_precision = match cli.precision {
         PrecisionPolicy::Keep => None,
         PrecisionPolicy::Explicit(p) => Some(p),
@@ -272,6 +273,16 @@ fn run() -> miette::Result<()> {
                         });
                     }
 
+                    // Wire per-channel weight params.
+                    for (name, pcp) in &cal_result.weight_params {
+                        per_channel_params.push(nxpu_backend_core::PerChannelParam {
+                            name: name.clone(),
+                            scales: pcp.scales.clone(),
+                            zero_points: pcp.zero_points.clone(),
+                            channel_axis: pcp.channel_axis,
+                        });
+                    }
+
                     nxpu_opt::F32ToInt8::with_calibration_result(cal_result).run(&mut module);
                 } else {
                     nxpu_opt::F32ToInt8::default().run(&mut module);
@@ -290,6 +301,7 @@ fn run() -> miette::Result<()> {
         precision: cli.precision,
         memory_plan: Some(memory_plan),
         quantization_params,
+        per_channel_params,
     };
 
     let output = backend

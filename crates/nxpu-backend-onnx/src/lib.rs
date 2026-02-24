@@ -94,6 +94,14 @@ impl Backend for OnnxBackend {
 
             let mut model = lower::build_fused_model(fp, ep_name, &weights)?;
 
+            // Inject per-channel QDQ nodes for weight tensors.
+            #[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
+            if !opts.per_channel_params.is_empty() {
+                if let Some(graph) = model.graph.as_mut() {
+                    lower::inject_per_channel_qdq(graph, &opts.per_channel_params);
+                }
+            }
+
             // Embed quantization parameters in ONNX metadata_props.
             for qp in &opts.quantization_params {
                 model.metadata_props.push(proto::StringStringEntryProto {
@@ -309,5 +317,60 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(graph.node[0].op_type, "Add");
         assert_eq!(graph.input.len(), 2);
         assert_eq!(graph.output.len(), 1);
+    }
+
+    #[test]
+    fn compile_with_per_channel_params_injects_qdq() {
+        let source = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+struct Params { N: u32 }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.N) { return; }
+  c[idx] = a[idx] + b[idx];
+}
+"#;
+
+        let module = nxpu_parser::parse(source).unwrap();
+        let backend = OnnxBackend;
+        let opts = BackendOptions {
+            per_channel_params: vec![nxpu_backend_core::PerChannelParam {
+                name: "a".into(),
+                scales: vec![0.1, 0.2],
+                zero_points: vec![0, 0],
+                channel_axis: 0,
+            }],
+            ..Default::default()
+        };
+        let output = backend.compile(&module, &opts).unwrap();
+
+        assert_eq!(output.files.len(), 1);
+        let bytes = match &output.files[0].content {
+            OutputContent::Binary(b) => b,
+            _ => panic!("expected binary output"),
+        };
+
+        let model = proto::ModelProto::decode(bytes.as_slice()).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        // Should have 3 nodes: QuantizeLinear, DequantizeLinear, Add
+        assert_eq!(graph.node.len(), 3);
+        assert_eq!(graph.node[0].op_type, "QuantizeLinear");
+        assert_eq!(graph.node[1].op_type, "DequantizeLinear");
+        assert_eq!(graph.node[2].op_type, "Add");
+
+        // Scale initializer should be present.
+        let scale_init = graph
+            .initializer
+            .iter()
+            .find(|i| i.name == "a_scale")
+            .expect("expected a_scale initializer");
+        assert_eq!(scale_init.float_data, vec![0.1, 0.2]);
     }
 }

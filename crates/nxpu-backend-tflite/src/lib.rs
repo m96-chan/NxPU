@@ -101,18 +101,48 @@ impl Backend for TfLiteBackend {
         }
 
         // 4. Emit quantization parameters as a companion JSON file.
-        if !opts.quantization_params.is_empty() {
-            let mut json = String::from("{\n  \"quantization_params\": [\n");
-            for (i, qp) in opts.quantization_params.iter().enumerate() {
-                if i > 0 {
-                    json.push_str(",\n");
+        if !opts.quantization_params.is_empty() || !opts.per_channel_params.is_empty() {
+            let mut json = String::from("{\n");
+
+            if !opts.quantization_params.is_empty() {
+                json.push_str("  \"quantization_params\": [\n");
+                for (i, qp) in opts.quantization_params.iter().enumerate() {
+                    if i > 0 {
+                        json.push_str(",\n");
+                    }
+                    json.push_str(&format!(
+                        "    {{\"name\": \"{}\", \"scale\": {}, \"zero_point\": {}}}",
+                        qp.name, qp.scale, qp.zero_point
+                    ));
                 }
-                json.push_str(&format!(
-                    "    {{\"name\": \"{}\", \"scale\": {}, \"zero_point\": {}}}",
-                    qp.name, qp.scale, qp.zero_point
-                ));
+                json.push_str("\n  ]");
+                if !opts.per_channel_params.is_empty() {
+                    json.push(',');
+                }
+                json.push('\n');
             }
-            json.push_str("\n  ]\n}\n");
+
+            if !opts.per_channel_params.is_empty() {
+                json.push_str("  \"per_channel_params\": [\n");
+                for (i, pcp) in opts.per_channel_params.iter().enumerate() {
+                    if i > 0 {
+                        json.push_str(",\n");
+                    }
+                    let scales: Vec<String> = pcp.scales.iter().map(|s| format!("{s}")).collect();
+                    let zero_points: Vec<String> =
+                        pcp.zero_points.iter().map(|z| format!("{z}")).collect();
+                    json.push_str(&format!(
+                        "    {{\"name\": \"{}\", \"scales\": [{}], \"zero_points\": [{}], \"channel_axis\": {}}}",
+                        pcp.name,
+                        scales.join(", "),
+                        zero_points.join(", "),
+                        pcp.channel_axis
+                    ));
+                }
+                json.push_str("\n  ]\n");
+            }
+
+            json.push_str("}\n");
             files.push(OutputFile {
                 name: "quant_params.json".into(),
                 content: OutputContent::Text(json),
@@ -707,5 +737,108 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             epsilon: 1e-5,
         };
         assert_eq!(pattern_summary(&norm), "BatchNormalization");
+    }
+
+    #[test]
+    fn compile_with_per_channel_params_emits_json() {
+        let source = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+struct Params { N: u32 }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.N) { return; }
+  c[idx] = a[idx] + b[idx];
+}
+"#;
+
+        let module = nxpu_parser::parse(source).unwrap();
+        let backend = TfLiteBackend;
+        let opts = BackendOptions {
+            per_channel_params: vec![nxpu_backend_core::PerChannelParam {
+                name: "conv_weight".into(),
+                scales: vec![0.1, 0.2, 0.3],
+                zero_points: vec![0, 0, 0],
+                channel_axis: 0,
+            }],
+            ..Default::default()
+        };
+        let output = backend.compile(&module, &opts).unwrap();
+
+        let json_file = output
+            .files
+            .iter()
+            .find(|f| f.name == "quant_params.json")
+            .expect("expected quant_params.json file");
+
+        let json_text = match &json_file.content {
+            OutputContent::Text(t) => t,
+            _ => panic!("expected text content for quant_params.json"),
+        };
+
+        assert!(json_text.contains("\"per_channel_params\""));
+        assert!(json_text.contains("\"name\": \"conv_weight\""));
+        assert!(json_text.contains("\"scales\": [0.1, 0.2, 0.3]"));
+        assert!(json_text.contains("\"zero_points\": [0, 0, 0]"));
+        assert!(json_text.contains("\"channel_axis\": 0"));
+    }
+
+    #[test]
+    fn compile_with_both_quant_and_per_channel_params() {
+        let source = r#"
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+struct Params { N: u32 }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.N) { return; }
+  c[idx] = a[idx] + b[idx];
+}
+"#;
+
+        let module = nxpu_parser::parse(source).unwrap();
+        let backend = TfLiteBackend;
+        let opts = BackendOptions {
+            quantization_params: vec![nxpu_backend_core::QuantParam {
+                name: "x".into(),
+                scale: 0.5,
+                zero_point: 0,
+            }],
+            per_channel_params: vec![nxpu_backend_core::PerChannelParam {
+                name: "weight".into(),
+                scales: vec![0.1, 0.2],
+                zero_points: vec![0, 1],
+                channel_axis: 0,
+            }],
+            ..Default::default()
+        };
+        let output = backend.compile(&module, &opts).unwrap();
+
+        let json_file = output
+            .files
+            .iter()
+            .find(|f| f.name == "quant_params.json")
+            .expect("expected quant_params.json file");
+
+        let json_text = match &json_file.content {
+            OutputContent::Text(t) => t,
+            _ => panic!("expected text content for quant_params.json"),
+        };
+
+        // Both sections should be present.
+        assert!(json_text.contains("\"quantization_params\""));
+        assert!(json_text.contains("\"per_channel_params\""));
+        assert!(json_text.contains("\"name\": \"x\""));
+        assert!(json_text.contains("\"name\": \"weight\""));
     }
 }
