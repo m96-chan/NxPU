@@ -432,6 +432,7 @@ pub fn make_weight_initializer(name: &str, dims: &[i64], data: &[f32]) -> Tensor
         data_type: data_type::FLOAT,
         name: name.into(),
         float_data: vec![],
+        int32_data: vec![],
         int64_data: vec![],
         raw_data,
     }
@@ -754,6 +755,7 @@ fn build_reshape_graph(input: &TensorBinding, output: &TensorBinding, ep_name: &
             data_type: data_type::INT64,
             name: shape_name.clone(),
             float_data: vec![],
+            int32_data: vec![],
             int64_data: vec![-1],
             raw_data: vec![],
         }],
@@ -944,6 +946,7 @@ fn build_attention_graph(
             data_type: data_type::INT64,
             name: "dk_axis".into(),
             float_data: vec![],
+            int32_data: vec![],
             int64_data: vec![1],
             raw_data: vec![],
         }],
@@ -1026,6 +1029,80 @@ fn build_attention_graph(
             output.elem_type,
             out_shape,
         )],
+    }
+}
+
+/// Inject QDQ (QuantizeLinear -> DequantizeLinear) nodes for per-channel
+/// quantized weight tensors.
+///
+/// For each [`PerChannelParam`], this function:
+/// 1. Adds scale and zero_point initializer tensors to the graph.
+/// 2. Inserts QuantizeLinear and DequantizeLinear nodes at the beginning.
+/// 3. Rewrites downstream node inputs to reference the dequantized output.
+pub fn inject_per_channel_qdq(
+    graph: &mut GraphProto,
+    per_channel_params: &[nxpu_backend_core::PerChannelParam],
+) {
+    for pcp in per_channel_params {
+        let original_name = &pcp.name;
+        let quant_name = format!("{}_quantized", original_name);
+        let dequant_name = format!("{}_dequantized", original_name);
+        let scale_name = format!("{}_scale", original_name);
+        let zp_name = format!("{}_zero_point", original_name);
+
+        // Add scale as a FLOAT initializer tensor.
+        graph.initializer.push(TensorProto {
+            name: scale_name.clone(),
+            data_type: data_type::FLOAT,
+            dims: vec![pcp.scales.len() as i64],
+            float_data: pcp.scales.clone(),
+            int32_data: vec![],
+            int64_data: vec![],
+            raw_data: vec![],
+        });
+
+        // Add zero_point as an INT8 initializer tensor.
+        graph.initializer.push(TensorProto {
+            name: zp_name.clone(),
+            data_type: data_type::INT8,
+            dims: vec![pcp.zero_points.len() as i64],
+            float_data: vec![],
+            int32_data: pcp.zero_points.clone(),
+            int64_data: vec![],
+            raw_data: vec![],
+        });
+
+        // QuantizeLinear: original -> quantized
+        let quant_node = NodeProto::with_attrs(
+            "QuantizeLinear",
+            format!("quantize_{}", original_name),
+            vec![original_name.clone(), scale_name.clone(), zp_name.clone()],
+            vec![quant_name.clone()],
+            vec![AttributeProto::int("axis", pcp.channel_axis as i64)],
+        );
+
+        // DequantizeLinear: quantized -> dequantized
+        let dequant_node = NodeProto::with_attrs(
+            "DequantizeLinear",
+            format!("dequantize_{}", original_name),
+            vec![quant_name, scale_name, zp_name],
+            vec![dequant_name.clone()],
+            vec![AttributeProto::int("axis", pcp.channel_axis as i64)],
+        );
+
+        // Insert QDQ nodes at the beginning of the graph.
+        graph.node.insert(0, dequant_node);
+        graph.node.insert(0, quant_node);
+
+        // Update all subsequent nodes that reference the original weight
+        // to use the dequantized output instead.
+        for node in &mut graph.node[2..] {
+            for input in &mut node.input {
+                if *input == *original_name {
+                    *input = dequant_name.clone();
+                }
+            }
+        }
     }
 }
 
@@ -2032,5 +2109,98 @@ mod tests {
         assert_eq!(graph.initializer[0].data_type, data_type::FLOAT);
         // raw_data = 4 floats * 4 bytes = 16 bytes
         assert_eq!(graph.initializer[0].raw_data.len(), 16);
+    }
+
+    #[test]
+    fn inject_per_channel_qdq_adds_nodes_and_initializers() {
+        // Build a minimal graph with a Conv node referencing "weight".
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![NodeProto::simple(
+                "Conv",
+                "conv_0",
+                vec!["input".into(), "weight".into()],
+                vec!["output".into()],
+            )],
+            input: vec![ValueInfoProto::tensor(
+                "input",
+                data_type::FLOAT,
+                vec![
+                    TensorShapeDimension::fixed(1),
+                    TensorShapeDimension::fixed(3),
+                    TensorShapeDimension::fixed(224),
+                    TensorShapeDimension::fixed(224),
+                ],
+            )],
+            output: vec![ValueInfoProto::tensor(
+                "output",
+                data_type::FLOAT,
+                vec![
+                    TensorShapeDimension::fixed(1),
+                    TensorShapeDimension::fixed(16),
+                    TensorShapeDimension::fixed(222),
+                    TensorShapeDimension::fixed(222),
+                ],
+            )],
+        };
+
+        let params = vec![nxpu_backend_core::PerChannelParam {
+            name: "weight".into(),
+            scales: vec![0.1, 0.2, 0.3],
+            zero_points: vec![0, 0, 0],
+            channel_axis: 0,
+        }];
+
+        inject_per_channel_qdq(&mut graph, &params);
+
+        // Should have 3 nodes: QuantizeLinear, DequantizeLinear, Conv
+        assert_eq!(graph.node.len(), 3);
+        assert_eq!(graph.node[0].op_type, "QuantizeLinear");
+        assert_eq!(graph.node[0].name, "quantize_weight");
+        assert_eq!(graph.node[1].op_type, "DequantizeLinear");
+        assert_eq!(graph.node[1].name, "dequantize_weight");
+        assert_eq!(graph.node[2].op_type, "Conv");
+
+        // Conv node should now reference the dequantized weight.
+        assert_eq!(graph.node[2].input[0], "input");
+        assert_eq!(graph.node[2].input[1], "weight_dequantized");
+
+        // Check initializers: scale and zero_point tensors.
+        assert_eq!(graph.initializer.len(), 2);
+        assert_eq!(graph.initializer[0].name, "weight_scale");
+        assert_eq!(graph.initializer[0].data_type, data_type::FLOAT);
+        assert_eq!(graph.initializer[0].float_data, vec![0.1, 0.2, 0.3]);
+        assert_eq!(graph.initializer[1].name, "weight_zero_point");
+        assert_eq!(graph.initializer[1].data_type, data_type::INT8);
+        assert_eq!(graph.initializer[1].int32_data, vec![0, 0, 0]);
+
+        // Check axis attribute on QuantizeLinear.
+        assert_eq!(graph.node[0].attribute.len(), 1);
+        assert_eq!(graph.node[0].attribute[0].name, "axis");
+        assert_eq!(graph.node[0].attribute[0].i, 0);
+    }
+
+    #[test]
+    fn inject_per_channel_qdq_empty_params_is_noop() {
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![NodeProto::simple(
+                "Conv",
+                "conv_0",
+                vec!["input".into(), "weight".into()],
+                vec!["output".into()],
+            )],
+            input: vec![],
+            output: vec![],
+        };
+
+        inject_per_channel_qdq(&mut graph, &[]);
+
+        // Graph should be unchanged.
+        assert_eq!(graph.node.len(), 1);
+        assert_eq!(graph.node[0].op_type, "Conv");
+        assert!(graph.initializer.is_empty());
     }
 }

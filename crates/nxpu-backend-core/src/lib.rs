@@ -107,6 +107,12 @@ pub struct BackendOptions {
     /// (e.g. ONNX `metadata_props`, TFLite companion JSON) so downstream
     /// tools can correctly dequantize tensors.
     pub quantization_params: Vec<QuantParam>,
+    /// Per-channel quantization parameters for weight tensors.
+    ///
+    /// When present, backends emit per-channel quantization metadata:
+    /// ONNX backends inject QuantizeLinear/DequantizeLinear (QDQ) nodes,
+    /// TFLite backends include them in the companion JSON.
+    pub per_channel_params: Vec<PerChannelParam>,
 }
 
 /// A per-tensor quantization parameter entry.
@@ -118,6 +124,19 @@ pub struct QuantParam {
     pub scale: f32,
     /// Quantization zero point.
     pub zero_point: i32,
+}
+
+/// Per-channel quantization parameters for a weight tensor.
+#[derive(Clone, Debug)]
+pub struct PerChannelParam {
+    /// Tensor name (e.g., weight variable name).
+    pub name: String,
+    /// Per-channel scale factors.
+    pub scales: Vec<f32>,
+    /// Per-channel zero points.
+    pub zero_points: Vec<i32>,
+    /// The axis along which channels are quantized (typically 0 for output channels).
+    pub channel_axis: u32,
 }
 
 impl fmt::Display for BackendOptions {
@@ -132,10 +151,15 @@ impl fmt::Display for BackendOptions {
         } else {
             format!(", quant_params: {}", self.quantization_params.len())
         };
+        let per_ch = if self.per_channel_params.is_empty() {
+            String::new()
+        } else {
+            format!(", per_channel: {}", self.per_channel_params.len())
+        };
         write!(
             f,
-            "BackendOptions {{ opt_level: {}, precision: {}{}{} }}",
-            self.opt_level, self.precision, mem, quant
+            "BackendOptions {{ opt_level: {}, precision: {}{}{}{} }}",
+            self.opt_level, self.precision, mem, quant, per_ch
         )
     }
 }
@@ -739,5 +763,28 @@ mod tests {
         };
         let s = format!("{opts}");
         assert!(!s.contains("memory_plan"));
+    }
+
+    #[test]
+    fn per_channel_param_display() {
+        let opts = BackendOptions {
+            per_channel_params: vec![PerChannelParam {
+                name: "conv_weight".into(),
+                scales: vec![0.1, 0.2, 0.3],
+                zero_points: vec![0, 0, 0],
+                channel_axis: 0,
+            }],
+            ..Default::default()
+        };
+        let s = format!("{opts}");
+        assert!(s.contains("per_channel: 1"));
+    }
+
+    #[test]
+    fn per_channel_param_default_empty() {
+        let opts = BackendOptions::default();
+        assert!(opts.per_channel_params.is_empty());
+        let s = format!("{opts}");
+        assert!(!s.contains("per_channel"));
     }
 }
