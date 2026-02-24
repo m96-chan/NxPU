@@ -11,6 +11,7 @@ publish = false
 [dev-dependencies]
 nxpu-parser = { path = "../nxpu-parser" }
 nxpu-ir = { path = "../nxpu-ir" }
+nxpu-analysis = { path = "../nxpu-analysis" }
 nxpu-opt = { path = "../nxpu-opt" }
 nxpu-backend-core = { path = "../nxpu-backend-core" }
 nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }

@@ -1074,6 +1074,7 @@ name = "nxpu-e2e-tests"
 version = "0.2.0"
 dependencies = [
  "ndarray",
+ "nxpu-analysis",
  "nxpu-backend-amd",
  "nxpu-backend-arm-ethos",
  "nxpu-backend-ceva",

@@ -5,14 +5,18 @@
 
 use crate::proto::*;
 use nxpu_analysis::analyze::{
-    ActivationOp, Conv2DShape, ElementWiseOp, KernelPattern, MatMulShape, PoolKind, PoolShape,
-    ReduceOp, TensorBinding,
+    ActivationOp, Conv2DShape, ElementWiseOp, EmbeddedWeight, KernelPattern, MatMulShape, PoolKind,
+    PoolShape, ReduceOp, TensorBinding,
 };
 use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
 use nxpu_backend_core::BackendError;
 
 /// Build an ONNX model from a classified kernel pattern.
-pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<ModelProto, BackendError> {
+pub fn build_model(
+    pattern: &KernelPattern,
+    ep_name: &str,
+    weights: &[EmbeddedWeight],
+) -> Result<ModelProto, BackendError> {
     let graph = match pattern {
         KernelPattern::MatMul {
             inputs,
@@ -87,6 +91,9 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<ModelProto,
         }
     };
 
+    let mut graph = graph;
+    inject_weights(&mut graph, weights);
+
     Ok(ModelProto {
         ir_version: 7,
         producer_name: "nxpu".into(),
@@ -103,9 +110,13 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<ModelProto,
 /// Build an ONNX model from a fused pattern.
 ///
 /// Handles single patterns, Conv+BatchNorm fusion, and activation fusion.
-pub fn build_fused_model(fp: &FusedPattern, ep_name: &str) -> Result<ModelProto, BackendError> {
+pub fn build_fused_model(
+    fp: &FusedPattern,
+    ep_name: &str,
+    weights: &[EmbeddedWeight],
+) -> Result<ModelProto, BackendError> {
     match fp {
-        FusedPattern::Single(p) => build_model(p, ep_name),
+        FusedPattern::Single(p) => build_model(p, ep_name, weights),
         FusedPattern::ConvBatchNorm { conv, norm } => {
             let (input, weight, shape) = match conv {
                 KernelPattern::Conv2D {
@@ -219,6 +230,9 @@ pub fn build_fused_model(fp: &FusedPattern, ep_name: &str) -> Result<ModelProto,
                 )],
             };
 
+            let mut graph = graph;
+            inject_weights(&mut graph, weights);
+
             Ok(ModelProto {
                 ir_version: 7,
                 producer_name: "nxpu".into(),
@@ -234,7 +248,7 @@ pub fn build_fused_model(fp: &FusedPattern, ep_name: &str) -> Result<ModelProto,
         FusedPattern::WithActivation {
             base, activation, ..
         } => {
-            let mut model = build_fused_model(base, ep_name)?;
+            let mut model = build_fused_model(base, ep_name, weights)?;
             if let (Some(graph), FusedActivation::Relu) = (model.graph.as_mut(), activation) {
                 // Rename the last output to an intermediate and add a Relu node.
                 if let Some(last_output) = graph.output.last_mut() {
@@ -269,6 +283,38 @@ pub fn build_fused_model(fp: &FusedPattern, ep_name: &str) -> Result<ModelProto,
             }
             Ok(model)
         }
+    }
+}
+
+/// Inject embedded weight initializers into the graph.
+///
+/// For each weight whose name appears as an input to any graph node,
+/// a `TensorProto` initializer is added to `graph.initializer`.
+fn inject_weights(graph: &mut GraphProto, weights: &[EmbeddedWeight]) {
+    for w in weights {
+        let is_referenced = graph.node.iter().any(|n| n.input.contains(&w.name));
+        if is_referenced {
+            graph
+                .initializer
+                .push(make_weight_initializer(&w.name, &w.dims, &w.data));
+        }
+    }
+}
+
+/// Create a weight initializer from raw float data.
+///
+/// Used when constant weight values are available at compile time
+/// (e.g., from `GlobalVariable.init`). The data is stored in `raw_data`
+/// as little-endian bytes for efficiency.
+pub fn make_weight_initializer(name: &str, dims: &[i64], data: &[f32]) -> TensorProto {
+    let raw_data: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+    TensorProto {
+        dims: dims.to_vec(),
+        data_type: data_type::FLOAT,
+        name: name.into(),
+        float_data: vec![],
+        int64_data: vec![],
+        raw_data,
     }
 }
 
@@ -370,26 +416,32 @@ fn build_conv2d_graph(
     GraphProto {
         name: ep_name.into(),
         initializer: vec![],
-        node: vec![NodeProto::with_attrs(
-            "Conv",
-            "conv_0",
-            vec![input.name.clone(), weight.name.clone()],
-            vec![output.name.clone()],
-            vec![
-                AttributeProto::ints(
+        node: vec![{
+            let mut attrs = Vec::new();
+            // Only emit kernel_shape when concrete values are known (> 0).
+            // When unknown (0), ONNX infers kernel_shape from the weight tensor.
+            if shape.kernel_h_val > 0 && shape.kernel_w_val > 0 {
+                attrs.push(AttributeProto::ints(
                     "kernel_shape",
-                    vec![shape.kernel_h_val.max(1), shape.kernel_w_val.max(1)],
-                ),
-                AttributeProto::ints(
-                    "strides",
-                    vec![shape.stride_h.max(1), shape.stride_w.max(1)],
-                ),
-                AttributeProto::ints(
-                    "pads",
-                    vec![shape.pad_h, shape.pad_w, shape.pad_h, shape.pad_w],
-                ),
-            ],
-        )],
+                    vec![shape.kernel_h_val, shape.kernel_w_val],
+                ));
+            }
+            attrs.push(AttributeProto::ints(
+                "strides",
+                vec![shape.stride_h.max(1), shape.stride_w.max(1)],
+            ));
+            attrs.push(AttributeProto::ints(
+                "pads",
+                vec![shape.pad_h, shape.pad_w, shape.pad_h, shape.pad_w],
+            ));
+            NodeProto::with_attrs(
+                "Conv",
+                "conv_0",
+                vec![input.name.clone(), weight.name.clone()],
+                vec![output.name.clone()],
+                attrs,
+            )
+        }],
         input: vec![
             ValueInfoProto::tensor(
                 &input.name,
@@ -584,6 +636,7 @@ fn build_reshape_graph(input: &TensorBinding, output: &TensorBinding, ep_name: &
             name: shape_name.clone(),
             float_data: vec![],
             int64_data: vec![-1],
+            raw_data: vec![],
         }],
         node: vec![NodeProto::simple(
             "Reshape",
@@ -763,14 +816,17 @@ fn build_attention_graph(
     let k_shape = q_shape.clone();
     let v_shape = q_shape.clone();
     let out_shape = q_shape.clone();
+    // Dynamic sqrt(d_k): extract d_k from query tensor's last dimension at runtime.
+    // Shape(Q) → Gather(shape, 1) → Cast(to FLOAT) → Sqrt → Div(scores, sqrt_dk)
     GraphProto {
         name: ep_name.into(),
         initializer: vec![TensorProto {
-            dims: vec![1],
-            data_type: data_type::FLOAT,
-            name: "sqrt_dk".into(),
-            float_data: vec![(d_k.parse::<f32>().unwrap_or(64.0)).sqrt()],
-            int64_data: vec![],
+            dims: vec![],
+            data_type: data_type::INT64,
+            name: "dk_axis".into(),
+            float_data: vec![],
+            int64_data: vec![1],
+            raw_data: vec![],
         }],
         node: vec![
             // Transpose K
@@ -788,11 +844,40 @@ fn build_attention_graph(
                 vec![query.name.clone(), kt_name.into()],
                 vec![scores_name.into()],
             ),
-            // Div by sqrt(d_k)
+            // Shape(Q) → [seq_len, d_k]
+            NodeProto::simple(
+                "Shape",
+                "shape_q",
+                vec![query.name.clone()],
+                vec!["query_shape".into()],
+            ),
+            // Gather(query_shape, 1) → d_k dimension (scalar)
+            NodeProto::simple(
+                "Gather",
+                "gather_dk",
+                vec!["query_shape".into(), "dk_axis".into()],
+                vec!["dk_dim".into()],
+            ),
+            // Cast(dk_dim, to=FLOAT) → scalar f32
+            NodeProto::with_attrs(
+                "Cast",
+                "cast_dk",
+                vec!["dk_dim".into()],
+                vec!["dk_float".into()],
+                vec![AttributeProto::int("to", data_type::FLOAT as i64)],
+            ),
+            // Sqrt(dk_float) → sqrt(d_k)
+            NodeProto::simple(
+                "Sqrt",
+                "sqrt_dk",
+                vec!["dk_float".into()],
+                vec!["sqrt_dk_val".into()],
+            ),
+            // Div(scores, sqrt_dk_val) → scaled_scores
             NodeProto::simple(
                 "Div",
                 "scale_scores",
-                vec![scores_name.into(), "sqrt_dk".into()],
+                vec![scores_name.into(), "sqrt_dk_val".into()],
                 vec![scaled_name.into()],
             ),
             // Softmax
@@ -814,11 +899,8 @@ fn build_attention_graph(
             ValueInfoProto::tensor(&query.name, query.elem_type, q_shape),
             ValueInfoProto::tensor(&key.name, key.elem_type, k_shape),
             ValueInfoProto::tensor(&value.name, value.elem_type, v_shape),
-            ValueInfoProto::tensor(
-                "sqrt_dk",
-                query.elem_type,
-                vec![TensorShapeDimension::fixed(1)],
-            ),
+            // dk_axis is an initializer with default value; listed as input for ONNX compliance.
+            ValueInfoProto::tensor("dk_axis", data_type::INT64, vec![]),
         ],
         output: vec![ValueInfoProto::tensor(
             &output.name,
@@ -878,7 +960,7 @@ mod tests {
             },
         };
 
-        let model = build_model(&pattern, "matmul_kernel").unwrap();
+        let model = build_model(&pattern, "matmul_kernel", &[]).unwrap();
 
         assert_eq!(model.ir_version, 7);
         assert_eq!(model.producer_name, "nxpu");
@@ -937,7 +1019,7 @@ mod tests {
             dim_name: "N".into(),
         };
 
-        let model = build_model(&pattern, "vecadd").unwrap();
+        let model = build_model(&pattern, "vecadd", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
 
         assert_eq!(graph.node.len(), 1);
@@ -975,7 +1057,7 @@ mod tests {
                 output: make_tensor("c", TensorRole::Output),
                 dim_name: "N".into(),
             };
-            let model = build_model(&pattern, "test").unwrap();
+            let model = build_model(&pattern, "test", &[]).unwrap();
             let graph = model.graph.as_ref().unwrap();
             assert_eq!(graph.node[0].op_type, expected);
         }
@@ -1003,7 +1085,7 @@ mod tests {
                 pad_w: 0,
             },
         };
-        let model = build_model(&pattern, "conv2d").unwrap();
+        let model = build_model(&pattern, "conv2d", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "Conv");
 
@@ -1029,7 +1111,7 @@ mod tests {
                 stride_w: 2,
             },
         };
-        let model = build_model(&pattern, "maxpool").unwrap();
+        let model = build_model(&pattern, "maxpool", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "MaxPool");
     }
@@ -1047,7 +1129,7 @@ mod tests {
                 output: make_tensor("y", TensorRole::Output),
                 dim_name: "N".into(),
             };
-            let model = build_model(&pattern, "test").unwrap();
+            let model = build_model(&pattern, "test", &[]).unwrap();
             let graph = model.graph.as_ref().unwrap();
             assert_eq!(graph.node[0].op_type, expected);
         }
@@ -1061,7 +1143,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             axis: 1,
         };
-        let model = build_model(&pattern, "reduce").unwrap();
+        let model = build_model(&pattern, "reduce", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "ReduceSum");
     }
@@ -1073,7 +1155,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             perm: vec![1, 0],
         };
-        let model = build_model(&pattern, "transpose").unwrap();
+        let model = build_model(&pattern, "transpose", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "Transpose");
     }
@@ -1087,8 +1169,106 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             epsilon: 1e-5,
         };
-        let model = build_model(&pattern, "batchnorm").unwrap();
+        let model = build_model(&pattern, "batchnorm", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
         assert_eq!(graph.node[0].op_type, "BatchNormalization");
+    }
+
+    #[test]
+    fn weight_initializer_roundtrip() {
+        let data = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let init = make_weight_initializer("weights", &[2, 3], &data);
+        assert_eq!(init.dims, vec![2, 3]);
+        assert_eq!(init.data_type, data_type::FLOAT);
+        assert_eq!(init.name, "weights");
+        assert!(init.float_data.is_empty());
+        assert_eq!(init.raw_data.len(), 24); // 6 * 4 bytes
+
+        // Verify raw_data decodes back to original floats
+        let decoded: Vec<f32> = init
+            .raw_data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn attention_model_has_dynamic_sqrt_dk() {
+        let pattern = KernelPattern::Attention {
+            query: make_tensor("Q", TensorRole::Input),
+            key: make_tensor("K", TensorRole::Input),
+            value: make_tensor("V", TensorRole::Input),
+            output: make_tensor("out", TensorRole::Output),
+            d_k: "d_k".into(),
+            seq_len: "seq_len".into(),
+        };
+        let model = build_model(&pattern, "attention", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
+        assert!(op_types.contains(&"Shape"), "should have Shape node");
+        assert!(op_types.contains(&"Gather"), "should have Gather node");
+        assert!(op_types.contains(&"Cast"), "should have Cast node");
+        assert!(op_types.contains(&"Sqrt"), "should have Sqrt node");
+
+        // The initializer should be dk_axis (int64 scalar), not a hardcoded sqrt_dk float
+        assert_eq!(graph.initializer.len(), 1);
+        assert_eq!(graph.initializer[0].name, "dk_axis");
+        assert_eq!(graph.initializer[0].data_type, data_type::INT64);
+    }
+
+    #[test]
+    fn inject_weights_adds_initializer() {
+        let mut graph = GraphProto {
+            name: "test".into(),
+            initializer: vec![],
+            node: vec![NodeProto::simple(
+                "Add",
+                "add_0",
+                vec!["input".into(), "bias".into()],
+                vec!["output".into()],
+            )],
+            input: vec![
+                ValueInfoProto::tensor(
+                    "input",
+                    data_type::FLOAT,
+                    vec![TensorShapeDimension::symbolic("N")],
+                ),
+                ValueInfoProto::tensor(
+                    "bias",
+                    data_type::FLOAT,
+                    vec![TensorShapeDimension::symbolic("N")],
+                ),
+            ],
+            output: vec![ValueInfoProto::tensor(
+                "output",
+                data_type::FLOAT,
+                vec![TensorShapeDimension::symbolic("N")],
+            )],
+        };
+
+        let weights = vec![
+            EmbeddedWeight {
+                name: "bias".into(),
+                dims: vec![4],
+                data: vec![0.1, 0.2, 0.3, 0.4],
+            },
+            EmbeddedWeight {
+                name: "unreferenced".into(),
+                dims: vec![2],
+                data: vec![1.0, 2.0],
+            },
+        ];
+
+        inject_weights(&mut graph, &weights);
+
+        // Only "bias" should be added (referenced by the Add node).
+        assert_eq!(graph.initializer.len(), 1);
+        assert_eq!(graph.initializer[0].name, "bias");
+        assert_eq!(graph.initializer[0].dims, vec![4]);
+        assert_eq!(graph.initializer[0].data_type, data_type::FLOAT);
+        // raw_data = 4 floats * 4 bytes = 16 bytes
+        assert_eq!(graph.initializer[0].raw_data.len(), 16);
     }
 }

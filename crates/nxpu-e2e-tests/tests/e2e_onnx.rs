@@ -190,6 +190,24 @@ fn split_produces_split_node() {
     assert_eq!(graph.node[0].op_type, "Split");
 }
 
+// --- Embedded weights ---
+
+#[test]
+fn vecadd_const_has_embedded_weights() {
+    let source = common::load_example("vecadd_const");
+    let module = common::parse_wgsl(&source);
+    let weights = nxpu_analysis::extract_embedded_weights(&module);
+    assert!(!weights.is_empty(), "expected at least one embedded weight");
+    let bias = weights
+        .iter()
+        .find(|w| w.name == "bias")
+        .expect("expected 'bias' weight");
+    assert_eq!(bias.dims, vec![4]);
+    assert_eq!(bias.data.len(), 4);
+    assert!((bias.data[0] - 0.1).abs() < 1e-6);
+    assert!((bias.data[3] - 0.4).abs() < 1e-6);
+}
+
 // --- Attention ---
 
 #[test]
@@ -198,11 +216,13 @@ fn attention_produces_attention_subgraph() {
     let output = common::compile_wgsl(&source, &OnnxBackend, 1);
     let model = decode_onnx(&output);
     let graph = model.graph.unwrap();
-    // Attention subgraph: Transpose + MatMul + Div + Softmax + MatMul = 5 nodes
-    assert_eq!(graph.node.len(), 5);
+    // Attention subgraph: Transpose + MatMul + Shape + Gather + Cast + Sqrt + Div + Softmax + MatMul = 9 nodes
+    assert_eq!(graph.node.len(), 9);
     let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
     assert!(op_types.contains(&"Transpose"));
     assert!(op_types.contains(&"MatMul"));
+    assert!(op_types.contains(&"Shape"));
+    assert!(op_types.contains(&"Sqrt"));
     assert!(op_types.contains(&"Div"));
     assert!(op_types.contains(&"Softmax"));
 }

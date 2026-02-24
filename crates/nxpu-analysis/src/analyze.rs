@@ -6,8 +6,9 @@
 use std::fmt;
 
 use nxpu_ir::{
-    AddressSpace, Arena, BinaryOp, Expression, GlobalVariable, Handle, MathFunction, Module,
-    Scalar, ScalarKind, Statement, StorageAccess, TypeInner,
+    AddressSpace, Arena, ArraySize, BinaryOp, Expression, GlobalVariable, Handle, Literal,
+    MathFunction, Module, Scalar, ScalarKind, Statement, StorageAccess, Type, TypeInner,
+    UniqueArena,
 };
 
 /// ONNX-compatible data type constants (matches TensorProto.DataType).
@@ -374,6 +375,81 @@ impl fmt::Display for KernelPattern {
     }
 }
 
+/// Embedded constant weight data extracted from GlobalVariable initializers.
+#[derive(Debug, Clone)]
+pub struct EmbeddedWeight {
+    /// Tensor name (from the global variable name).
+    pub name: String,
+    /// Tensor dimensions (e.g. `[4]` for `array<f32, 4>`).
+    pub dims: Vec<i64>,
+    /// Flattened f32 data.
+    pub data: Vec<f32>,
+}
+
+/// Extract constant weight data from module globals with initializers.
+///
+/// Scans all global variables with `init: Some(...)` and evaluates
+/// Compose/Literal/ZeroValue expressions into flat f32 arrays.
+pub fn extract_embedded_weights(module: &Module) -> Vec<EmbeddedWeight> {
+    let mut weights = Vec::new();
+    for (handle, gv) in module.global_variables.iter() {
+        let Some(init_handle) = gv.init else {
+            continue;
+        };
+        let name = gv
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("weight_{}", handle.index()));
+        let dims = type_dims(gv.ty, &module.types);
+        let Some(data) =
+            eval_const_expr_f32(init_handle, &module.global_expressions, &module.types)
+        else {
+            continue;
+        };
+        weights.push(EmbeddedWeight { name, dims, data });
+    }
+    weights
+}
+
+/// Recursively evaluate a constant expression to flat f32 values.
+fn eval_const_expr_f32(
+    handle: Handle<Expression>,
+    exprs: &Arena<Expression>,
+    types: &UniqueArena<Type>,
+) -> Option<Vec<f32>> {
+    match exprs.try_get(handle)? {
+        Expression::Literal(Literal::F32(v)) => Some(vec![*v]),
+        Expression::Literal(Literal::I32(v)) => Some(vec![*v as f32]),
+        Expression::Literal(Literal::U32(v)) => Some(vec![*v as f32]),
+        Expression::Compose { components, .. } => {
+            let mut result = Vec::new();
+            for &comp in components {
+                result.extend(eval_const_expr_f32(comp, exprs, types)?);
+            }
+            Some(result)
+        }
+        Expression::ZeroValue(ty) => {
+            let dims = type_dims(*ty, types);
+            let count = dims.iter().product::<i64>().max(1) as usize;
+            Some(vec![0.0; count])
+        }
+        _ => None,
+    }
+}
+
+/// Compute flattened dimensions from a Type (Array, Scalar, Vector).
+fn type_dims(ty_handle: Handle<Type>, types: &UniqueArena<Type>) -> Vec<i64> {
+    match &types[ty_handle].inner {
+        TypeInner::Scalar(_) => vec![],
+        TypeInner::Vector { size, .. } => vec![*size as i64],
+        TypeInner::Array {
+            size: ArraySize::Constant(n),
+            ..
+        } => vec![*n as i64],
+        _ => vec![],
+    }
+}
+
 /// Classify an entry point into a known ONNX-mappable pattern.
 pub fn classify_entry_point(
     module: &Module,
@@ -476,11 +552,21 @@ pub fn classify_entry_point(
             } else {
                 PoolKind::Avg
             };
+            let bounds = extract_loop_bound_literals(&ep.function.body, &ep.function.expressions);
+            let strides = extract_multiply_literals(&ep.function.expressions);
+            let kh_u = bounds.first().copied().unwrap_or(2);
+            let kw_u = bounds.get(1).copied().unwrap_or(kh_u);
+            let sh_u = strides.first().copied().unwrap_or(kh_u);
+            let sw_u = strides.get(1).copied().unwrap_or(sh_u);
+            let kh = kh_u as i64;
+            let kw = kw_u as i64;
+            let sh = sh_u as i64;
+            let sw = sw_u as i64;
             let pool_shape = PoolShape {
-                kernel_h: 2,
-                kernel_w: 2,
-                stride_h: 2,
-                stride_w: 2,
+                kernel_h: kh,
+                kernel_w: kw,
+                stride_h: sh,
+                stride_w: sw,
             };
             return Ok(KernelPattern::Pool {
                 kind: pool_kind,
@@ -579,7 +665,11 @@ pub fn classify_entry_point(
 
     // 2 inputs + loop: Conv2D (many params) vs MatMul (3 params)
     if shape_names.len() > 3 {
-        let conv_shape = extract_conv2d_shape(&shape_names);
+        let conv_shape = extract_conv2d_shape(
+            &shape_names,
+            Some(&ep.function.body),
+            Some(&ep.function.expressions),
+        );
         return Ok(KernelPattern::Conv2D {
             input: input_a,
             weight: input_b,
@@ -610,15 +700,151 @@ pub fn classify_entry_point(
     })
 }
 
-/// Extract Conv2D shape from param names.
-fn extract_conv2d_shape(shape_names: &[String]) -> Conv2DShape {
-    // Convention: params struct has N, IC, IH, IW, OC, OH, OW, KH, KW, ...
+/// Extract literal U32 values from loop break conditions.
+///
+/// For `for (kh = 0; kh < N; ...)`, naga generates `break_if: kh >= N`.
+/// When N is `Literal(U32(n))`, we collect n as a loop bound.
+fn extract_loop_bound_literals(body: &[Statement], exprs: &Arena<Expression>) -> Vec<u32> {
+    let mut bounds = Vec::new();
+    for stmt in body {
+        match stmt {
+            Statement::Loop {
+                body,
+                continuing,
+                break_if,
+            } => {
+                // Check this loop's break condition for a literal bound.
+                // Pattern: break_if is `Binary { GreaterEqual|Greater, _, Literal(U32(n)) }`.
+                if let Some(n) = break_if.and_then(|bi| {
+                    let Expression::Binary {
+                        op: BinaryOp::GreaterEqual | BinaryOp::Greater,
+                        right,
+                        ..
+                    } = exprs.try_get(bi)?
+                    else {
+                        return None;
+                    };
+                    match exprs.try_get(*right)? {
+                        Expression::Literal(Literal::U32(n)) => Some(*n),
+                        _ => None,
+                    }
+                }) {
+                    bounds.push(n);
+                }
+                // Recurse into nested loops.
+                bounds.extend(extract_loop_bound_literals(body, exprs));
+                bounds.extend(extract_loop_bound_literals(continuing, exprs));
+            }
+            Statement::If { accept, reject, .. } => {
+                bounds.extend(extract_loop_bound_literals(accept, exprs));
+                bounds.extend(extract_loop_bound_literals(reject, exprs));
+            }
+            _ => {}
+        }
+    }
+    bounds
+}
+
+/// Scan the expression arena for `Binary(Multiply, _, Literal(U32(n)))` where n > 1.
+/// These represent stride factors in index computations like `oh * 2u + kh`.
+fn extract_multiply_literals(exprs: &Arena<Expression>) -> Vec<u32> {
+    let mut strides = Vec::new();
+    for (_, expr) in exprs.iter() {
+        let Expression::Binary {
+            op: BinaryOp::Multiply,
+            left,
+            right,
+        } = expr
+        else {
+            continue;
+        };
+        if let Some(&Expression::Literal(Literal::U32(n))) = exprs.try_get(*right)
+            && n > 1
+        {
+            strides.push(n);
+        } else if let Some(&Expression::Literal(Literal::U32(n))) = exprs.try_get(*left)
+            && n > 1
+        {
+            strides.push(n);
+        }
+    }
+    strides.sort_unstable();
+    strides.dedup();
+    strides
+}
+
+/// Scan the expression arena for `Binary(Subtract, _, Literal(U32(n)))` where n > 0.
+/// These represent padding offsets in index computations like `oh * 2u + kh - 1u`.
+fn extract_subtract_literals(exprs: &Arena<Expression>) -> Vec<u32> {
+    let mut pads = Vec::new();
+    for (_, expr) in exprs.iter() {
+        let Expression::Binary {
+            op: BinaryOp::Subtract,
+            right,
+            ..
+        } = expr
+        else {
+            continue;
+        };
+        if let Some(&Expression::Literal(Literal::U32(n))) = exprs.try_get(*right)
+            && n > 0
+        {
+            pads.push(n);
+        }
+    }
+    pads.sort_unstable();
+    pads.dedup();
+    pads
+}
+
+/// Extract Conv2D shape from param names and (optionally) the function body/expressions.
+///
+/// When body and expressions are provided, attempts to extract kernel size from
+/// loop bound literals, stride from multiplication factors, and padding from
+/// subtraction offsets. Falls back to 0 (unknown) for values that cannot be
+/// determined at compile time.
+fn extract_conv2d_shape(
+    shape_names: &[String],
+    body: Option<&[Statement]>,
+    exprs: Option<&Arena<Expression>>,
+) -> Conv2DShape {
+    // Convention: params struct has N, IC, IH, IW, OC, KH, KW, ...
     let get = |i: usize| {
         shape_names
             .get(i)
             .cloned()
             .unwrap_or_else(|| format!("d{i}"))
     };
+
+    let (kernel_h_val, kernel_w_val, stride_h, stride_w, pad_h, pad_w) =
+        if let (Some(body), Some(exprs)) = (body, exprs) {
+            let bounds = extract_loop_bound_literals(body, exprs);
+            let strides = extract_multiply_literals(exprs);
+            let pads = extract_subtract_literals(exprs);
+
+            // Innermost loop bounds are kernel sizes (e.g., kh < 5u → kernel_h = 5).
+            let kh = bounds.first().copied().unwrap_or(0) as i64;
+            let kw = bounds.get(1).copied().unwrap_or(0) as i64;
+            // If only one bound found, assume square kernel.
+            let kw = if kw == 0 && kh > 0 { kh } else { kw };
+
+            // Stride from multiplication factors (e.g., oh * 2u → stride = 2).
+            let sh_u = strides.first().copied().unwrap_or(1);
+            let sw_u = strides.get(1).copied().unwrap_or(sh_u);
+            let sh = sh_u as i64;
+            let sw = sw_u as i64;
+
+            // Padding from subtraction offsets (e.g., ih - 1u → pad = 1).
+            let ph_u = pads.first().copied().unwrap_or(0);
+            let pw_u = pads.get(1).copied().unwrap_or(ph_u);
+            let ph = ph_u as i64;
+            let pw = pw_u as i64;
+
+            (kh, kw, sh, sw, ph, pw)
+        } else {
+            (0, 0, 1, 1, 0, 0)
+        };
+
     Conv2DShape {
         batch: get(0),
         channels_in: get(1),
@@ -627,12 +853,12 @@ fn extract_conv2d_shape(shape_names: &[String]) -> Conv2DShape {
         channels_out: get(4),
         kernel_h: get(5),
         kernel_w: get(6),
-        kernel_h_val: 3,
-        kernel_w_val: 3,
-        stride_h: 1,
-        stride_w: 1,
-        pad_h: 0,
-        pad_w: 0,
+        kernel_h_val,
+        kernel_w_val,
+        stride_h,
+        stride_w,
+        pad_h,
+        pad_w,
     }
 }
 
@@ -655,7 +881,7 @@ fn make_binding(
 }
 
 /// Resolve an array or tensor type to its element's ONNX data type.
-fn resolve_array_elem_type(module: &Module, ty: Handle<nxpu_ir::Type>) -> Option<i32> {
+fn resolve_array_elem_type(module: &Module, ty: Handle<Type>) -> Option<i32> {
     match &module.types[ty].inner {
         TypeInner::Array { base, .. } => match &module.types[*base].inner {
             TypeInner::Scalar(s) => Some(scalar_to_onnx_data_type(s)),
@@ -1693,5 +1919,585 @@ mod tests {
             }
             _ => panic!("expected MatMul pattern"),
         }
+    }
+
+    #[test]
+    fn extract_loop_bounds_literal_u32() {
+        let mut func = Function::new("test");
+        let local = func.local_variables.append(LocalVariable {
+            name: Some("kh".into()),
+            ty: {
+                let mut types = UniqueArena::new();
+                types.insert(Type {
+                    name: None,
+                    inner: TypeInner::Scalar(Scalar::U32),
+                })
+            },
+            init: None,
+        });
+        let load = func.expressions.append(Expression::LocalVariable(local));
+        let lit = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(5)));
+        let cmp = func.expressions.append(Expression::Binary {
+            op: BinaryOp::GreaterEqual,
+            left: load,
+            right: lit,
+        });
+        let body = vec![Statement::Loop {
+            body: vec![Statement::Break],
+            continuing: vec![],
+            break_if: Some(cmp),
+        }];
+        let bounds = extract_loop_bound_literals(&body, &func.expressions);
+        assert_eq!(bounds, vec![5]);
+    }
+
+    #[test]
+    fn extract_loop_bounds_nested() {
+        let mut func = Function::new("test");
+        // Inner loop: kh < 3
+        let local_kh = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let lit3 = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(3)));
+        let cmp_inner = func.expressions.append(Expression::Binary {
+            op: BinaryOp::GreaterEqual,
+            left: local_kh,
+            right: lit3,
+        });
+        // Outer loop: kw < 5
+        let local_kw = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let lit5 = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(5)));
+        let cmp_outer = func.expressions.append(Expression::Binary {
+            op: BinaryOp::GreaterEqual,
+            left: local_kw,
+            right: lit5,
+        });
+        let body = vec![Statement::Loop {
+            body: vec![Statement::Loop {
+                body: vec![Statement::Break],
+                continuing: vec![],
+                break_if: Some(cmp_inner),
+            }],
+            continuing: vec![],
+            break_if: Some(cmp_outer),
+        }];
+        let bounds = extract_loop_bound_literals(&body, &func.expressions);
+        assert_eq!(bounds, vec![5, 3]);
+    }
+
+    #[test]
+    fn extract_loop_bounds_no_literal() {
+        let func = Function::new("test");
+        let body = vec![Statement::Loop {
+            body: vec![Statement::Break],
+            continuing: vec![],
+            break_if: None,
+        }];
+        let bounds = extract_loop_bound_literals(&body, &func.expressions);
+        assert!(bounds.is_empty());
+    }
+
+    #[test]
+    fn extract_multiply_literals_stride() {
+        let mut func = Function::new("test");
+        let oh = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let two = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(2)));
+        func.expressions.append(Expression::Binary {
+            op: BinaryOp::Multiply,
+            left: oh,
+            right: two,
+        });
+        let strides = extract_multiply_literals(&func.expressions);
+        assert_eq!(strides, vec![2]);
+    }
+
+    #[test]
+    fn extract_multiply_literals_ignores_one() {
+        let mut func = Function::new("test");
+        let oh = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let one = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(1)));
+        func.expressions.append(Expression::Binary {
+            op: BinaryOp::Multiply,
+            left: oh,
+            right: one,
+        });
+        let strides = extract_multiply_literals(&func.expressions);
+        assert!(strides.is_empty());
+    }
+
+    #[test]
+    fn extract_subtract_literals_padding() {
+        let mut func = Function::new("test");
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(10)));
+        let pad = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(1)));
+        func.expressions.append(Expression::Binary {
+            op: BinaryOp::Subtract,
+            left: idx,
+            right: pad,
+        });
+        let pads = extract_subtract_literals(&func.expressions);
+        assert_eq!(pads, vec![1]);
+    }
+
+    #[test]
+    fn conv2d_shape_no_body_defaults_to_unknown() {
+        let names: Vec<String> = ["N", "IC", "IH", "IW", "OC", "KH", "KW"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let shape = extract_conv2d_shape(&names, None, None);
+        assert_eq!(shape.batch, "N");
+        assert_eq!(shape.kernel_h, "KH");
+        assert_eq!(shape.kernel_w, "KW");
+        assert_eq!(shape.kernel_h_val, 0);
+        assert_eq!(shape.kernel_w_val, 0);
+        assert_eq!(shape.stride_h, 1);
+        assert_eq!(shape.stride_w, 1);
+        assert_eq!(shape.pad_h, 0);
+        assert_eq!(shape.pad_w, 0);
+    }
+
+    #[test]
+    fn conv2d_shape_with_literal_kernel() {
+        let names: Vec<String> = ["N", "IC", "IH", "IW", "OC", "KH", "KW"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Build a function body with loops: kh < 5, kw < 5
+        let mut func = Function::new("test");
+        let kh_var = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let lit5a = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(5)));
+        let cmp_h = func.expressions.append(Expression::Binary {
+            op: BinaryOp::GreaterEqual,
+            left: kh_var,
+            right: lit5a,
+        });
+        let kw_var = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let lit5b = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(5)));
+        let cmp_w = func.expressions.append(Expression::Binary {
+            op: BinaryOp::GreaterEqual,
+            left: kw_var,
+            right: lit5b,
+        });
+        // Also add stride: oh * 2u
+        let oh = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let two = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(2)));
+        func.expressions.append(Expression::Binary {
+            op: BinaryOp::Multiply,
+            left: oh,
+            right: two,
+        });
+        // Also add padding: ih - 1u
+        let ih = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(10)));
+        let one = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(1)));
+        func.expressions.append(Expression::Binary {
+            op: BinaryOp::Subtract,
+            left: ih,
+            right: one,
+        });
+
+        let body = vec![Statement::Loop {
+            body: vec![Statement::Loop {
+                body: vec![Statement::Break],
+                continuing: vec![],
+                break_if: Some(cmp_w),
+            }],
+            continuing: vec![],
+            break_if: Some(cmp_h),
+        }];
+
+        let shape = extract_conv2d_shape(&names, Some(&body), Some(&func.expressions));
+        assert_eq!(shape.kernel_h_val, 5);
+        assert_eq!(shape.kernel_w_val, 5);
+        assert_eq!(shape.stride_h, 2);
+        assert_eq!(shape.stride_w, 2);
+        assert_eq!(shape.pad_h, 1);
+        assert_eq!(shape.pad_w, 1);
+    }
+
+    /// Build a pool-like module with literal kernel and stride.
+    fn make_pool_module(kernel: u32, stride: u32) -> Module {
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let array_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members: vec![
+                    StructMember {
+                        name: Some("C".into()),
+                        ty: u32_ty,
+                        offset: 0,
+                    },
+                    StructMember {
+                        name: Some("IH".into()),
+                        ty: u32_ty,
+                        offset: 4,
+                    },
+                    StructMember {
+                        name: Some("IW".into()),
+                        ty: u32_ty,
+                        offset: 8,
+                    },
+                    StructMember {
+                        name: Some("OH".into()),
+                        ty: u32_ty,
+                        offset: 12,
+                    },
+                ],
+                span: 16,
+            },
+        });
+
+        module.global_variables.append(GlobalVariable {
+            name: Some("input".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        module.global_variables.append(GlobalVariable {
+            name: Some("output".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 1,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 2,
+            }),
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        let mut func = Function::new("main");
+
+        // Loop bounds: kh < kernel, kw < kernel
+        let kh_var = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let lit_k1 = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(kernel)));
+        let cmp_h = func.expressions.append(Expression::Binary {
+            op: BinaryOp::GreaterEqual,
+            left: kh_var,
+            right: lit_k1,
+        });
+        let kw_var = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let lit_k2 = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(kernel)));
+        let cmp_w = func.expressions.append(Expression::Binary {
+            op: BinaryOp::GreaterEqual,
+            left: kw_var,
+            right: lit_k2,
+        });
+
+        // Stride: oh * stride
+        if stride > 1 {
+            let oh = func
+                .expressions
+                .append(Expression::Literal(Literal::U32(0)));
+            let lit_s = func
+                .expressions
+                .append(Expression::Literal(Literal::U32(stride)));
+            func.expressions.append(Expression::Binary {
+                op: BinaryOp::Multiply,
+                left: oh,
+                right: lit_s,
+            });
+        }
+
+        // Max function for MaxPool detection
+        let arg = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        let arg1 = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        let max_expr = func.expressions.append(Expression::Math {
+            fun: MathFunction::Max,
+            arg,
+            arg1: Some(arg1),
+            arg2: None,
+            arg3: None,
+        });
+        let ptr = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        func.body.push(Statement::Loop {
+            body: vec![
+                Statement::Loop {
+                    body: vec![
+                        Statement::Store {
+                            pointer: ptr,
+                            value: max_expr,
+                        },
+                        Statement::Break,
+                    ],
+                    continuing: vec![],
+                    break_if: Some(cmp_w),
+                },
+                Statement::Break,
+            ],
+            continuing: vec![],
+            break_if: Some(cmp_h),
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [16, 16, 1],
+            function: func,
+        });
+
+        module
+    }
+
+    #[test]
+    fn classify_pool_extracts_2x2_stride2() {
+        let module = make_pool_module(2, 2);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Pool { kind, shape, .. } => {
+                assert_eq!(*kind, PoolKind::Max);
+                assert_eq!(shape.kernel_h, 2);
+                assert_eq!(shape.kernel_w, 2);
+                assert_eq!(shape.stride_h, 2);
+                assert_eq!(shape.stride_w, 2);
+            }
+            _ => panic!("expected Pool pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_pool_extracts_3x3_stride1() {
+        let module = make_pool_module(3, 1);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Pool { kind, shape, .. } => {
+                assert_eq!(*kind, PoolKind::Max);
+                assert_eq!(shape.kernel_h, 3);
+                assert_eq!(shape.kernel_w, 3);
+                // stride=1: no multiply literals, default to kernel size
+                assert_eq!(shape.stride_h, 3);
+                assert_eq!(shape.stride_w, 3);
+            }
+            _ => panic!("expected Pool pattern, got {pattern:?}"),
+        }
+    }
+
+    // --- EmbeddedWeight extraction tests ---
+
+    #[test]
+    fn eval_const_expr_f32_literal() {
+        let mut exprs = Arena::new();
+        let types = UniqueArena::new();
+        let h = exprs.append(Expression::Literal(Literal::F32(3.14)));
+        assert_eq!(eval_const_expr_f32(h, &exprs, &types), Some(vec![3.14]));
+    }
+
+    #[test]
+    fn eval_const_expr_f32_compose() {
+        let mut exprs = Arena::new();
+        let types = UniqueArena::new();
+        let a = exprs.append(Expression::Literal(Literal::F32(0.1)));
+        let b = exprs.append(Expression::Literal(Literal::F32(0.2)));
+        let c = exprs.append(Expression::Literal(Literal::F32(0.3)));
+        let f32_ty = {
+            let mut t = UniqueArena::new();
+            t.insert(Type {
+                name: None,
+                inner: TypeInner::Scalar(Scalar::F32),
+            })
+        };
+        let compose = exprs.append(Expression::Compose {
+            ty: f32_ty,
+            components: vec![a, b, c],
+        });
+        let result = eval_const_expr_f32(compose, &exprs, &types).unwrap();
+        assert_eq!(result.len(), 3);
+        assert!((result[0] - 0.1).abs() < 1e-6);
+        assert!((result[1] - 0.2).abs() < 1e-6);
+        assert!((result[2] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn eval_const_expr_f32_zero_value() {
+        let mut exprs = Arena::new();
+        let mut types = UniqueArena::new();
+        let f32_ty = types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let arr_ty = types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Constant(3),
+                stride: 4,
+            },
+        });
+        let h = exprs.append(Expression::ZeroValue(arr_ty));
+        let result = eval_const_expr_f32(h, &exprs, &types).unwrap();
+        assert_eq!(result, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn extract_embedded_weights_private_global() {
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let array_f32_4 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Constant(4),
+                stride: 4,
+            },
+        });
+
+        // Build init expression: Compose([0.1, 0.2, 0.3, 0.4])
+        let lit0 = module
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(0.1)));
+        let lit1 = module
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(0.2)));
+        let lit2 = module
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(0.3)));
+        let lit3 = module
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(0.4)));
+        let compose = module.global_expressions.append(Expression::Compose {
+            ty: array_f32_4,
+            components: vec![lit0, lit1, lit2, lit3],
+        });
+
+        module.global_variables.append(GlobalVariable {
+            name: Some("bias".into()),
+            space: AddressSpace::Private,
+            binding: None,
+            ty: array_f32_4,
+            init: Some(compose),
+            layout: None,
+        });
+
+        let weights = extract_embedded_weights(&module);
+        assert_eq!(weights.len(), 1);
+        assert_eq!(weights[0].name, "bias");
+        assert_eq!(weights[0].dims, vec![4]);
+        assert_eq!(weights[0].data.len(), 4);
+        assert!((weights[0].data[0] - 0.1).abs() < 1e-6);
+        assert!((weights[0].data[3] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extract_embedded_weights_no_init() {
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let array_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+
+        module.global_variables.append(GlobalVariable {
+            name: Some("a".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+
+        let weights = extract_embedded_weights(&module);
+        assert!(weights.is_empty());
     }
 }

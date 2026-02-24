@@ -45,8 +45,8 @@ pub fn lower_module(naga: &naga::Module) -> Result<nxpu_ir::Module, ParseError> 
     };
 
     ctx.lower_types()?;
-    ctx.lower_global_variables()?;
     ctx.lower_global_expressions()?;
+    ctx.lower_global_variables()?;
     ctx.lower_functions()?;
     ctx.lower_entry_points()?;
 
