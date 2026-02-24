@@ -17,6 +17,9 @@ Thumbs.db
 fuzz/target/
 fuzz/artifacts/
 
+# AI assistant
+Claude.md
+
 # Build artifacts
 *.o
 *.so
