@@ -1319,23 +1319,26 @@ fn find_if_comparison_axis(
     for stmt in body {
         match stmt {
             Statement::If { condition, .. } => {
+                // Split into nested ifs to avoid let-chains (unstable in MSRV 1.87).
+                #[allow(clippy::collapsible_if)]
                 if let Some(Expression::Binary {
                     op, left, right, ..
                 }) = exprs.try_get(*condition)
-                    && matches!(
+                {
+                    if matches!(
                         op,
                         BinaryOp::Less
                             | BinaryOp::LessEqual
                             | BinaryOp::Greater
                             | BinaryOp::GreaterEqual
-                    )
-                {
-                    // Check right operand first (most common: `idx < params.C1`)
-                    if let Some(idx) = extract_uniform_member_index(exprs, *right) {
-                        return Some(idx as i64);
-                    }
-                    if let Some(idx) = extract_uniform_member_index(exprs, *left) {
-                        return Some(idx as i64);
+                    ) {
+                        // Check right operand first (most common: `idx < params.C1`)
+                        if let Some(idx) = extract_uniform_member_index(exprs, *right) {
+                            return Some(idx as i64);
+                        }
+                        if let Some(idx) = extract_uniform_member_index(exprs, *left) {
+                            return Some(idx as i64);
+                        }
                     }
                 }
             }
