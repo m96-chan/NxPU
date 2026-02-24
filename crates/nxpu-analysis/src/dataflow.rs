@@ -669,7 +669,7 @@ impl fmt::Display for DataflowGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nxpu_ir::{Arena, BinaryOp, Expression, Function, Handle, Literal, Range, Statement};
+    use nxpu_ir::{Expression, Function, Literal, Statement};
 
     // Helper: build a simple function with two stores to different locations
     // that share a common value (creating a RAW dependency).

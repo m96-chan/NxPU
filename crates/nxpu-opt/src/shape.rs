@@ -580,12 +580,12 @@ mod tests {
             name: None,
             inner: TypeInner::Tensor {
                 scalar: Scalar::F32,
-                shape: nxpu_ir::TensorShape {
+                shape: TensorShape {
                     dims: vec![
-                        nxpu_ir::Dimension::Symbolic("batch".into()),
-                        nxpu_ir::Dimension::Fixed(224),
-                        nxpu_ir::Dimension::Fixed(224),
-                        nxpu_ir::Dimension::Fixed(3),
+                        Dimension::Symbolic("batch".into()),
+                        Dimension::Fixed(224),
+                        Dimension::Fixed(224),
+                        Dimension::Fixed(3),
                     ],
                 },
             },

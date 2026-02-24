@@ -81,7 +81,7 @@ fn type_size_bytes(module: &Module, ty: Handle<nxpu_ir::Type>) -> usize {
                     .iter()
                     .map(|d| match d {
                         nxpu_ir::Dimension::Fixed(n) => *n as usize,
-                        nxpu_ir::Dimension::Dynamic(_) => 0,
+                        nxpu_ir::Dimension::Dynamic(_) | nxpu_ir::Dimension::Symbolic(_) => 0,
                     })
                     .product();
                 elem_count * (scalar.width as usize)

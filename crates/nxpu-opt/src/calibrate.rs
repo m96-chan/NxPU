@@ -976,7 +976,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // Write 5 bytes (not a multiple of 4).
-        std::fs::write(dir.join("bad.bin"), &[0u8; 5]).unwrap();
+        std::fs::write(dir.join("bad.bin"), [0u8; 5]).unwrap();
 
         let result = CalibrationDataset::load_from_dir(&dir);
         assert!(result.is_err());
