@@ -1109,6 +1109,7 @@ dependencies = [
  "log",
  "nxpu-backend-core",
  "nxpu-ir",
+ "thiserror",
 ]
 
 [[package]]

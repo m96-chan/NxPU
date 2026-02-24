@@ -9,6 +9,7 @@
 use nxpu_ir::{Handle, Module, Scalar, Type, TypeInner};
 
 use crate::Pass;
+use crate::calibrate::CalibrationResult;
 
 /// Parameters describing how floating-point values were quantized to integers.
 ///
@@ -477,7 +478,9 @@ impl Pass for F32ToBf16 {
 /// Converts `array<f32>` global variables to `array<i8>`.
 ///
 /// When calibration data is provided, computes proper scale/zero_point
-/// per tensor from observed min/max ranges.
+/// per tensor from observed min/max ranges. When a `CalibrationResult`
+/// is attached, calibrated parameters are available for downstream
+/// backends to emit quantization metadata (QDQ nodes, TFLite quant params).
 #[derive(Debug)]
 pub struct F32ToInt8 {
     /// Per-tensor quantization parameters.
@@ -486,6 +489,8 @@ pub struct F32ToInt8 {
     pub calibration: Option<CalibrationData>,
     /// Per-tensor computed parameters (populated after run).
     pub tensor_params: Vec<(u32, u32, QuantizationParams)>,
+    /// Optional calibration result from the calibration pipeline.
+    pub calibration_result: Option<CalibrationResult>,
 }
 
 impl Default for F32ToInt8 {
@@ -497,6 +502,7 @@ impl Default for F32ToInt8 {
             },
             calibration: None,
             tensor_params: Vec::new(),
+            calibration_result: None,
         }
     }
 }
@@ -511,6 +517,20 @@ impl F32ToInt8 {
             },
             calibration: Some(calibration),
             tensor_params: Vec::new(),
+            calibration_result: None,
+        }
+    }
+
+    /// Create with a calibration result from the calibration pipeline.
+    pub fn with_calibration_result(result: CalibrationResult) -> Self {
+        Self {
+            params: QuantizationParams {
+                scale: 1.0,
+                zero_point: 0,
+            },
+            calibration: None,
+            tensor_params: Vec::new(),
+            calibration_result: Some(result),
         }
     }
 }
@@ -521,6 +541,10 @@ impl Pass for F32ToInt8 {
     }
 
     fn run(&self, module: &mut Module) -> bool {
+        // Log calibration info if available.
+        if let Some(result) = &self.calibration_result {
+            result.log_summary();
+        }
         // Note: calibration data is used by downstream ONNX QDQ emission
         // and TFLite quantization metadata, not during type rewriting.
         rewrite_elem_precision(module, Scalar::I8)

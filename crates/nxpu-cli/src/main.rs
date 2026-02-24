@@ -49,9 +49,27 @@ struct Cli {
     #[arg(long)]
     dynamic_batch: bool,
 
+    /// Directory containing calibration data (.bin files with f32 values)
+    #[arg(long)]
+    calibration_data: Option<PathBuf>,
+
+    /// Calibration method: minmax, percentile, kl-divergence (default: minmax)
+    #[arg(long, default_value = "minmax", value_parser = parse_calibration_method)]
+    calibration_method: nxpu_opt::CalibrationMethod,
+
+    /// Verbose output (print calibration statistics, etc.)
+    #[arg(short, long)]
+    verbose: bool,
+
     /// List all available target backends and exit
     #[arg(long)]
     list_targets: bool,
+}
+
+fn parse_calibration_method(s: &str) -> Result<nxpu_opt::CalibrationMethod, String> {
+    nxpu_opt::CalibrationMethod::from_str_name(s).ok_or_else(|| {
+        format!("invalid calibration method '{s}', expected minmax, percentile, or kl-divergence")
+    })
 }
 
 fn parse_precision(s: &str) -> Result<PrecisionPolicy, String> {
@@ -202,7 +220,40 @@ fn run() -> miette::Result<()> {
                 nxpu_opt::F32ToBf16.run(&mut module);
             }
             Precision::Int8 => {
-                nxpu_opt::F32ToInt8::default().run(&mut module);
+                // If calibration data directory is provided, run the calibration pipeline.
+                if let Some(cal_dir) = &cli.calibration_data {
+                    let dataset = nxpu_opt::CalibrationDataset::load_from_dir(cal_dir)
+                        .map_err(|e| miette::miette!("calibration failed: {e}"))?;
+
+                    if cli.verbose {
+                        eprintln!(
+                            "Loaded {} calibration samples from {}",
+                            dataset.num_samples(),
+                            cal_dir.display()
+                        );
+                    }
+
+                    let cal_result = nxpu_opt::run_calibration(
+                        &dataset,
+                        &cli.calibration_method,
+                        true, // symmetric for INT8
+                    )
+                    .map_err(|e| miette::miette!("calibration failed: {e}"))?;
+
+                    if cli.verbose {
+                        eprintln!("Calibration results:");
+                        for (name, params) in &cal_result.tensor_params {
+                            eprintln!(
+                                "  {}: scale={:.6}, zero_point={}",
+                                name, params.scale, params.zero_point
+                            );
+                        }
+                    }
+
+                    nxpu_opt::F32ToInt8::with_calibration_result(cal_result).run(&mut module);
+                } else {
+                    nxpu_opt::F32ToInt8::default().run(&mut module);
+                }
             }
             Precision::F32 => {}
         }
@@ -363,6 +414,9 @@ mod tests {
         assert!(!cli.dry_run);
         assert!(!cli.dynamic_batch);
         assert_eq!(cli.precision, PrecisionPolicy::Auto);
+        assert!(cli.calibration_data.is_none());
+        assert_eq!(cli.calibration_method, nxpu_opt::CalibrationMethod::MinMax);
+        assert!(!cli.verbose);
         assert!(!cli.list_targets);
     }
 
@@ -676,5 +730,101 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("input file is required"));
         assert!(msg.contains("--list-targets"));
+    }
+
+    // ---- Calibration CLI flags ----
+
+    #[test]
+    fn cli_calibration_defaults() {
+        let cli = Cli::try_parse_from(["nxpu", "input.wgsl"]).unwrap();
+        assert!(cli.calibration_data.is_none());
+        assert_eq!(cli.calibration_method, nxpu_opt::CalibrationMethod::MinMax);
+        assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn cli_calibration_data_flag() {
+        let cli =
+            Cli::try_parse_from(["nxpu", "input.wgsl", "--calibration-data", "/tmp/cal_data"])
+                .unwrap();
+        assert_eq!(
+            cli.calibration_data.unwrap(),
+            PathBuf::from("/tmp/cal_data")
+        );
+    }
+
+    #[test]
+    fn cli_calibration_method_minmax() {
+        let cli =
+            Cli::try_parse_from(["nxpu", "input.wgsl", "--calibration-method", "minmax"]).unwrap();
+        assert_eq!(cli.calibration_method, nxpu_opt::CalibrationMethod::MinMax);
+    }
+
+    #[test]
+    fn cli_calibration_method_percentile() {
+        let cli = Cli::try_parse_from(["nxpu", "input.wgsl", "--calibration-method", "percentile"])
+            .unwrap();
+        assert_eq!(
+            cli.calibration_method,
+            nxpu_opt::CalibrationMethod::Percentile(99.99)
+        );
+    }
+
+    #[test]
+    fn cli_calibration_method_kl() {
+        let cli = Cli::try_parse_from([
+            "nxpu",
+            "input.wgsl",
+            "--calibration-method",
+            "kl-divergence",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.calibration_method,
+            nxpu_opt::CalibrationMethod::KlDivergence
+        );
+    }
+
+    #[test]
+    fn cli_calibration_method_invalid() {
+        let result = Cli::try_parse_from(["nxpu", "input.wgsl", "--calibration-method", "invalid"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_verbose_flag() {
+        let cli = Cli::try_parse_from(["nxpu", "input.wgsl", "--verbose"]).unwrap();
+        assert!(cli.verbose);
+    }
+
+    #[test]
+    fn cli_verbose_short_flag() {
+        let cli = Cli::try_parse_from(["nxpu", "input.wgsl", "-v"]).unwrap();
+        assert!(cli.verbose);
+    }
+
+    // ---- parse_calibration_method ----
+
+    #[test]
+    fn calibration_method_valid_values() {
+        assert_eq!(
+            parse_calibration_method("minmax").unwrap(),
+            nxpu_opt::CalibrationMethod::MinMax
+        );
+        assert_eq!(
+            parse_calibration_method("percentile").unwrap(),
+            nxpu_opt::CalibrationMethod::Percentile(99.99)
+        );
+        assert_eq!(
+            parse_calibration_method("kl-divergence").unwrap(),
+            nxpu_opt::CalibrationMethod::KlDivergence
+        );
+    }
+
+    #[test]
+    fn calibration_method_invalid_value() {
+        let err = parse_calibration_method("bogus").unwrap_err();
+        assert!(err.contains("invalid calibration method"));
+        assert!(err.contains("bogus"));
     }
 }
