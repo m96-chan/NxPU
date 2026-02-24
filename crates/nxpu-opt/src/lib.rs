@@ -8,6 +8,7 @@ mod const_fold;
 mod dce;
 mod fma_fusion;
 pub mod layout;
+pub mod memory;
 pub mod quantize;
 pub mod shape;
 mod validation;
@@ -16,6 +17,9 @@ pub use const_fold::ConstantFolding;
 pub use dce::DeadCodeElimination;
 pub use fma_fusion::FmaFusion;
 pub use layout::LayoutTransform;
+pub use memory::{LiveInterval, MemoryPlanning, plan_memory};
+// Re-export canonical memory plan types from nxpu-backend-core (via memory module).
+pub use memory::{BufferAllocation, MemoryPlan, TensorId};
 pub use quantize::{
     CalibrationData, F32ToBf16, F32ToF16, F32ToInt8, MixedPrecisionPass, MixedPrecisionPolicy,
     QuantizationParams,
