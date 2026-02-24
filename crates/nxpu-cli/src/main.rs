@@ -12,6 +12,7 @@ use nxpu_opt::{OptLevel, PassManager};
 /// NxPU — WGSL to NPU transpiler
 #[derive(Parser)]
 #[command(version, about)]
+#[allow(clippy::struct_excessive_bools)]
 struct Cli {
     /// Input WGSL file
     input: Option<PathBuf>,
@@ -31,6 +32,10 @@ struct Cli {
     /// Dump IR to stderr before backend compilation
     #[arg(long)]
     emit_ir: bool,
+
+    /// Print memory plan to stderr (peak memory, buffer count, reuse ratio)
+    #[arg(long)]
+    emit_memory_plan: bool,
 
     /// Validate and optimize without producing output
     #[arg(long)]
@@ -145,6 +150,12 @@ fn run() -> miette::Result<()> {
         eprintln!("{}", nxpu_ir::dump_module(&module));
     }
 
+    // 4b. Memory planning (always computed; optionally printed).
+    let memory_plan = nxpu_opt::plan_memory(&module);
+    if cli.emit_memory_plan {
+        eprint!("{memory_plan}");
+    }
+
     // 5. Dry-run: stop here.
     if cli.dry_run {
         return Ok(());
@@ -194,6 +205,7 @@ fn run() -> miette::Result<()> {
             OptLevel::O2 => 2,
         },
         precision: cli.precision,
+        memory_plan: Some(memory_plan),
     };
 
     let output = backend
@@ -265,6 +277,7 @@ mod tests {
         assert!(cli.output.is_none());
         assert_eq!(cli.opt_level, OptLevel::O1);
         assert!(!cli.emit_ir);
+        assert!(!cli.emit_memory_plan);
         assert!(!cli.dry_run);
         assert_eq!(cli.precision, PrecisionPolicy::Auto);
         assert!(!cli.list_targets);
@@ -282,6 +295,7 @@ mod tests {
             "--opt-level",
             "2",
             "--emit-ir",
+            "--emit-memory-plan",
             "--precision",
             "f16",
         ])
@@ -291,6 +305,7 @@ mod tests {
         assert_eq!(cli.output.unwrap(), PathBuf::from("out.onnx"));
         assert_eq!(cli.opt_level, OptLevel::O2);
         assert!(cli.emit_ir);
+        assert!(cli.emit_memory_plan);
         assert_eq!(cli.precision, PrecisionPolicy::Explicit(Precision::F16));
     }
 
