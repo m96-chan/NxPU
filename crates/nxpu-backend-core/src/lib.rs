@@ -193,6 +193,84 @@ impl fmt::Display for DiagnosticLevel {
     }
 }
 
+/// Performance tier for an operator on a specific NPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerformanceTier {
+    /// Operator runs natively on the NPU hardware.
+    Native,
+    /// Operator is emulated (e.g. decomposed or run on CPU fallback).
+    Emulated,
+    /// Operator is not supported at all.
+    Unsupported,
+}
+
+impl fmt::Display for PerformanceTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Native => "native",
+            Self::Emulated => "emulated",
+            Self::Unsupported => "unsupported",
+        })
+    }
+}
+
+/// Trait describing which operators an NPU supports and at what performance tier.
+///
+/// Uses string-based op names (matching ONNX operator names) to avoid
+/// circular dependencies with `nxpu-analysis`.
+pub trait OperatorSupport {
+    /// Query the support tier for a given operator at a given precision.
+    fn op_support(&self, op_name: &str, precision: Precision) -> PerformanceTier;
+
+    /// Human-readable hardware name.
+    fn hardware_name(&self) -> &str;
+
+    /// Operators that run natively on this hardware.
+    fn native_ops(&self) -> &[&str];
+
+    /// Operators that are emulated (decomposed or CPU fallback).
+    fn emulated_ops(&self) -> &[&str];
+}
+
+/// Validate a set of operator patterns against an [`OperatorSupport`] implementation.
+///
+/// Returns diagnostics for any emulated or unsupported operators.
+pub fn validate_patterns(
+    support: &dyn OperatorSupport,
+    patterns: &[&str],
+    precision: Precision,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for &op in patterns {
+        match support.op_support(op, precision) {
+            PerformanceTier::Native => {}
+            PerformanceTier::Emulated => {
+                diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Warning,
+                    message: format!(
+                        "{}: '{}' at {} will be emulated (may be slower)",
+                        support.hardware_name(),
+                        op,
+                        precision,
+                    ),
+                });
+            }
+            PerformanceTier::Unsupported => {
+                diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Warning,
+                    message: format!(
+                        "{}: '{}' at {} is unsupported",
+                        support.hardware_name(),
+                        op,
+                        precision,
+                    ),
+                });
+            }
+        }
+    }
+    diagnostics
+}
+
 /// Errors that can occur during backend compilation.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
@@ -458,6 +536,41 @@ mod tests {
     fn preferred_precision_default() {
         let backend = IrDumpBackend;
         assert_eq!(backend.preferred_precision(), Precision::F32);
+    }
+
+    #[test]
+    fn display_performance_tier() {
+        assert_eq!(format!("{}", PerformanceTier::Native), "native");
+        assert_eq!(format!("{}", PerformanceTier::Emulated), "emulated");
+        assert_eq!(format!("{}", PerformanceTier::Unsupported), "unsupported");
+    }
+
+    #[test]
+    fn validate_patterns_generates_diagnostics() {
+        struct TestSupport;
+        impl OperatorSupport for TestSupport {
+            fn op_support(&self, op_name: &str, _precision: Precision) -> PerformanceTier {
+                match op_name {
+                    "MatMul" => PerformanceTier::Native,
+                    "Conv" => PerformanceTier::Emulated,
+                    _ => PerformanceTier::Unsupported,
+                }
+            }
+            fn hardware_name(&self) -> &str {
+                "TestNPU"
+            }
+            fn native_ops(&self) -> &[&str] {
+                &["MatMul"]
+            }
+            fn emulated_ops(&self) -> &[&str] {
+                &["Conv"]
+            }
+        }
+
+        let diags = validate_patterns(&TestSupport, &["MatMul", "Conv", "Softmax"], Precision::F16);
+        assert_eq!(diags.len(), 2);
+        assert!(diags[0].message.contains("emulated"));
+        assert!(diags[1].message.contains("unsupported"));
     }
 
     #[test]

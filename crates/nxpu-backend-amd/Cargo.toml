@@ -8,8 +8,10 @@ repository.workspace = true
 
 [dependencies]
 nxpu-ir = { path = "../nxpu-ir" }
+nxpu-analysis = { path = "../nxpu-analysis" }
 nxpu-backend-core = { path = "../nxpu-backend-core" }
 nxpu-backend-onnx = { path = "../nxpu-backend-onnx" }
+prost.workspace = true
 
 [dev-dependencies]
 nxpu-parser = { path = "../nxpu-parser" }

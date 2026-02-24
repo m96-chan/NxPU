@@ -96,6 +96,7 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<ModelProto,
             domain: String::new(),
             version: 13,
         }],
+        metadata_props: vec![],
     })
 }
 
@@ -227,6 +228,7 @@ pub fn build_fused_model(fp: &FusedPattern, ep_name: &str) -> Result<ModelProto,
                     domain: String::new(),
                     version: 13,
                 }],
+                metadata_props: vec![],
             })
         }
         FusedPattern::WithActivation {

@@ -2,26 +2,34 @@
 //!
 //! Compiles NxPU IR via the TFLite backend, then optionally invokes the
 //! Arm Vela compiler to produce Ethos-U optimized `.tflite` binaries.
+//! Validates operator patterns against the Ethos-U55/U65 support matrix
+//! and emits Vela accelerator configuration hints.
 //!
 //! When `vela` is not found on `$PATH`, the backend falls back to emitting
 //! a standard `.tflite` file with a diagnostic hint.
 
 use std::process::Command;
 
+use nxpu_analysis::analyze;
 use nxpu_backend_core::{
     Backend, BackendError, BackendOptions, BackendOutput, Diagnostic, DiagnosticLevel,
-    OutputContent, OutputFile, Precision,
+    OutputContent, OutputFile, Precision, PrecisionPolicy, validate_patterns,
 };
 use nxpu_backend_tflite::TfLiteBackend;
 use nxpu_ir::Module;
 
+pub mod support;
+
+use support::EthosU55Support;
+
 /// Arm Ethos NPU backend.
 ///
 /// Compilation pipeline:
-/// 1. Lower IR → TFLite FlatBuffer via [`TfLiteBackend`].
-/// 2. If `vela` is available, invoke it on the TFLite file to produce
+/// 1. Classify and validate patterns against Ethos-U support matrix.
+/// 2. Lower IR → TFLite FlatBuffer via [`TfLiteBackend`].
+/// 3. If `vela` is available, invoke it on the TFLite file to produce
 ///    an Ethos-U optimized binary.
-/// 3. Otherwise, emit the unoptimized TFLite with a diagnostic.
+/// 4. Otherwise, emit the unoptimized TFLite with a diagnostic.
 #[derive(Debug)]
 pub struct ArmEthosBackend;
 
@@ -93,10 +101,30 @@ impl Backend for ArmEthosBackend {
         module: &Module,
         opts: &BackendOptions,
     ) -> Result<BackendOutput, BackendError> {
-        // Step 1: Generate TFLite model
-        let tflite_output = TfLiteBackend.compile(module, opts)?;
+        // 1. Classify entry points and validate against Ethos-U support matrix.
+        let mut op_names = Vec::new();
+        for (i, ep) in module.entry_points.iter().enumerate() {
+            match analyze::classify_entry_point(module, i) {
+                Ok(pattern) => {
+                    op_names.push(pattern_op_name(&pattern));
+                }
+                Err(e) => {
+                    return Err(BackendError::Unsupported(format!(
+                        "entry point '{}': {e}",
+                        ep.name
+                    )));
+                }
+            }
+        }
 
-        let mut diagnostics = tflite_output.diagnostics;
+        let precision = resolve_precision(opts, self.preferred_precision());
+        let op_refs: Vec<&str> = op_names.iter().map(|s| s.as_str()).collect();
+        let mut diagnostics = validate_patterns(&EthosU55Support, &op_refs, precision);
+
+        // 2. Generate TFLite model
+        let tflite_output = TfLiteBackend.compile(module, opts)?;
+        diagnostics.extend(tflite_output.diagnostics);
+
         let mut files = Vec::new();
 
         // Check Vela availability once, not per file.
@@ -111,7 +139,7 @@ impl Backend for ArmEthosBackend {
                 }
             };
 
-            // Step 2: Try to invoke Vela
+            // 3. Try to invoke Vela
             if has_vela {
                 match run_vela(tflite_bytes) {
                     Ok(optimized) => {
@@ -150,13 +178,57 @@ impl Backend for ArmEthosBackend {
                 });
                 diagnostics.push(Diagnostic {
                     level: DiagnosticLevel::Info,
-                    message: format!("To optimize manually: vela {}", file.name),
+                    message: format!(
+                        "To optimize for Ethos-U55: vela {} --accelerator-config ethos-u55-128",
+                        file.name
+                    ),
+                });
+                diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!(
+                        "To optimize for Ethos-U65: vela {} --accelerator-config ethos-u65-512",
+                        file.name
+                    ),
                 });
                 files.push(file.clone());
             }
         }
 
+        // Quantization calibration hint
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Info,
+            message: "For Int8 quantization: use TFLite post-training quantization with \
+                      representative dataset"
+                .into(),
+        });
+
         Ok(BackendOutput { files, diagnostics })
+    }
+}
+
+fn pattern_op_name(pattern: &analyze::KernelPattern) -> String {
+    match pattern {
+        analyze::KernelPattern::MatMul { .. } => "MatMul".into(),
+        analyze::KernelPattern::ElementWise { op, .. } => op.op_name().into(),
+        analyze::KernelPattern::Conv2D { .. } => "Conv".into(),
+        analyze::KernelPattern::Pool { kind, .. } => kind.op_name().into(),
+        analyze::KernelPattern::Activation { op, .. } => op.op_name().into(),
+        analyze::KernelPattern::Reduce { op, .. } => op.op_name().into(),
+        analyze::KernelPattern::Transpose { .. } => "Transpose".into(),
+        analyze::KernelPattern::Reshape { .. } => "Reshape".into(),
+        analyze::KernelPattern::Normalization { .. } => "BatchNormalization".into(),
+        analyze::KernelPattern::Concat { .. } => "Concat".into(),
+        analyze::KernelPattern::Split { .. } => "Split".into(),
+        analyze::KernelPattern::Attention { .. } => "Attention".into(),
+        analyze::KernelPattern::Unknown { .. } => "Unknown".into(),
+    }
+}
+
+fn resolve_precision(opts: &BackendOptions, preferred: Precision) -> Precision {
+    match opts.precision {
+        PrecisionPolicy::Explicit(p) => p,
+        PrecisionPolicy::Auto => preferred,
+        PrecisionPolicy::Keep => Precision::F32,
     }
 }
 
@@ -175,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_produces_tflite() {
+    fn compile_produces_tflite_with_validation() {
         let source = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../examples/matmul.wgsl"
@@ -194,8 +266,18 @@ mod tests {
         let has_tflite = output.files.iter().any(|f| f.name.ends_with(".tflite"));
         assert!(has_tflite);
 
-        // Should have diagnostics about vela status
+        // Should have diagnostics about Ethos-U and vela
         assert!(!output.diagnostics.is_empty());
+        let messages: Vec<&str> = output
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("ethos-u") || m.contains("Ethos"))
+        );
     }
 
     #[test]
@@ -203,5 +285,56 @@ mod tests {
         // This test just verifies the function doesn't panic.
         // On most CI systems vela won't be installed.
         let _available = vela_available();
+    }
+
+    fn load_and_compile(example: &str, opts: &BackendOptions) -> BackendOutput {
+        let source = std::fs::read_to_string(format!(
+            "{}/../../examples/{example}.wgsl",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let module = nxpu_parser::parse(&source).unwrap();
+        ArmEthosBackend.compile(&module, opts).unwrap()
+    }
+
+    #[test]
+    fn compile_conv2d() {
+        let output = load_and_compile("conv2d", &BackendOptions::default());
+        assert!(!output.files.is_empty());
+        let has_tflite = output.files.iter().any(|f| f.name.ends_with(".tflite"));
+        assert!(has_tflite);
+    }
+
+    #[test]
+    fn compile_relu() {
+        let output = load_and_compile("relu", &BackendOptions::default());
+        assert!(!output.files.is_empty());
+    }
+
+    #[test]
+    fn compile_attention() {
+        let output = load_and_compile("attention", &BackendOptions::default());
+        assert!(!output.files.is_empty());
+    }
+
+    #[test]
+    fn resolve_precision_explicit_and_keep() {
+        let explicit_opts = BackendOptions {
+            precision: PrecisionPolicy::Explicit(Precision::F16),
+            ..BackendOptions::default()
+        };
+        assert_eq!(
+            resolve_precision(&explicit_opts, Precision::Int8),
+            Precision::F16
+        );
+
+        let keep_opts = BackendOptions {
+            precision: PrecisionPolicy::Keep,
+            ..BackendOptions::default()
+        };
+        assert_eq!(
+            resolve_precision(&keep_opts, Precision::Int8),
+            Precision::F32
+        );
     }
 }

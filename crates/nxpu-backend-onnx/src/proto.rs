@@ -24,6 +24,17 @@ pub struct ModelProto {
     pub graph: Option<GraphProto>,
     #[prost(message, repeated, tag = "8")]
     pub opset_import: Vec<OperatorSetIdProto>,
+    #[prost(message, repeated, tag = "14")]
+    pub metadata_props: Vec<StringStringEntryProto>,
+}
+
+/// A key-value string pair for model metadata.
+#[derive(Clone, PartialEq, Message)]
+pub struct StringStringEntryProto {
+    #[prost(string, tag = "1")]
+    pub key: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
 }
 
 /// Operator set version declaration.
@@ -309,6 +320,7 @@ mod tests {
                 domain: String::new(),
                 version: 13,
             }],
+            metadata_props: vec![],
         };
 
         let bytes = model.encode_to_vec();
