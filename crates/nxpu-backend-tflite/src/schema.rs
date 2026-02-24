@@ -88,7 +88,9 @@ pub mod vt {
 pub mod builtin_options_type {
     pub const NONE: u8 = 0;
     pub const CONV_2D: u8 = 1;
+    pub const CONCATENATION: u8 = 2;
     pub const SOFTMAX: u8 = 9;
+    pub const SPLIT: u8 = 13;
     pub const POOL_2D: u8 = 22;
 }
 
@@ -118,4 +120,17 @@ pub mod pool2d_options {
     pub const FILTER_W: u16 = 10;
     pub const FILTER_H: u16 = 12;
     pub const ACTIVATION: u16 = 14;
+}
+
+/// VTable field offsets for `ConcatenationOptions`.
+#[allow(dead_code)]
+pub mod concatenation_options {
+    pub const AXIS: u16 = 4;
+    pub const FUSED_ACTIVATION_FUNCTION: u16 = 6;
+}
+
+/// VTable field offsets for `SplitOptions`.
+#[allow(dead_code)]
+pub mod split_options {
+    pub const NUM_SPLITS: u16 = 4;
 }

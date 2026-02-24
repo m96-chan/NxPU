@@ -180,3 +180,29 @@ fn depthwise_conv_tflite_magic() {
     assert!(bytes.len() > 8);
     assert_eq!(&bytes[4..8], b"TFL3");
 }
+
+// --- Multi-head Attention ---
+// TFLite backend does not yet support multi-head splitting (num_heads is ignored),
+// but compilation should succeed producing single-head SDPA output.
+
+#[test]
+fn multihead_attention_tflite_compiles() {
+    let source = common::load_example("multihead_attention");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert!(bytes.len() > 8);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}
+
+// --- Causal Attention ---
+// TFLite backend does not yet support causal masking (causal flag is ignored),
+// but compilation should succeed producing unmasked SDPA output.
+
+#[test]
+fn causal_attention_tflite_compiles() {
+    let source = common::load_example("causal_attention");
+    let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+    let bytes = common::first_binary(&output);
+    assert!(bytes.len() > 8);
+    assert_eq!(&bytes[4..8], b"TFL3");
+}

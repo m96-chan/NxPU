@@ -192,3 +192,29 @@ fn depthwise_conv_stablehlo_compiles() {
         "expected stablehlo in MLIR output"
     );
 }
+
+// --- Multi-head Attention ---
+
+#[test]
+fn multihead_attention_stablehlo_compiles() {
+    let source = common::load_example("multihead_attention");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(
+        mlir.contains("stablehlo"),
+        "expected stablehlo in MLIR output for multihead attention"
+    );
+}
+
+// --- Causal Attention ---
+
+#[test]
+fn causal_attention_stablehlo_compiles() {
+    let source = common::load_example("causal_attention");
+    let output = common::compile_wgsl(&source, &StableHloBackend, 1);
+    let mlir = common::first_text(&output);
+    assert!(
+        mlir.contains("stablehlo"),
+        "expected stablehlo in MLIR output for causal attention"
+    );
+}

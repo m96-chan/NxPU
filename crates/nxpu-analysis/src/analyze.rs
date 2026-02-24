@@ -3580,6 +3580,19 @@ mod tests {
     }
 
     #[test]
+    fn classify_concat_axis_3_inferred() {
+        // Concat with boundary at index 3 → axis = 3 (4D shape: N, C, H, W).
+        let module = make_concat_module(3, &["N", "C", "H", "W1", "W2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Concat { axis, .. } => {
+                assert_eq!(*axis, 3, "expected axis 3 for boundary at index 3");
+            }
+            _ => panic!("expected Concat pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
     fn classify_split_axis_0_default() {
         // Split with boundary at index 0 → axis = 0.
         let module = make_split_module(0, &["N_a", "N_b"]);
@@ -3622,6 +3635,19 @@ mod tests {
         match &pattern {
             KernelPattern::Split { axis, .. } => {
                 assert_eq!(*axis, 2, "expected axis 2 for boundary at index 2");
+            }
+            _ => panic!("expected Split pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_split_axis_3_inferred() {
+        // Split with boundary at index 3 → axis = 3 (4D shape: N, C, H, W).
+        let module = make_split_module(3, &["N", "C", "H", "W1", "W2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Split { axis, .. } => {
+                assert_eq!(*axis, 3, "expected axis 3 for boundary at index 3");
             }
             _ => panic!("expected Split pattern, got {pattern:?}"),
         }

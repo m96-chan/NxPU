@@ -209,3 +209,31 @@ fn depthwise_conv_coreml_conv_op() {
     let ops = get_mil_ops(&model);
     assert_eq!(ops[0].r#type, "conv");
 }
+
+// --- Multi-head Attention ---
+
+#[test]
+fn multihead_attention_coreml_compiles() {
+    let source = common::load_example("multihead_attention");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert!(
+        !ops.is_empty(),
+        "expected at least one MIL operation for multihead attention"
+    );
+}
+
+// --- Causal Attention ---
+
+#[test]
+fn causal_attention_coreml_compiles() {
+    let source = common::load_example("causal_attention");
+    let output = common::compile_wgsl(&source, &CoreMlBackend, 1);
+    let model = decode_coreml(&output);
+    let ops = get_mil_ops(&model);
+    assert!(
+        !ops.is_empty(),
+        "expected at least one MIL operation for causal attention"
+    );
+}

@@ -312,3 +312,55 @@ fn depthwise_conv_produces_conv_node() {
         "expected Conv node in ONNX graph for depthwise convolution"
     );
 }
+
+// --- Multi-head Attention ---
+// The multihead_attention.wgsl example divides by a runtime param (not a literal),
+// so the classifier detects it as attention with num_heads=1. The ONNX graph
+// still contains the standard SDPA subgraph (Transpose, MatMul, Softmax, etc.).
+
+#[test]
+fn multihead_attention_produces_attention_subgraph() {
+    let source = common::load_example("multihead_attention");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.as_ref().unwrap();
+    let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
+    assert!(
+        op_types.contains(&"Transpose"),
+        "expected Transpose node in attention subgraph, got: {op_types:?}"
+    );
+    assert!(
+        op_types.contains(&"MatMul"),
+        "expected MatMul node in attention subgraph, got: {op_types:?}"
+    );
+    assert!(
+        op_types.contains(&"Softmax"),
+        "expected Softmax node in attention subgraph, got: {op_types:?}"
+    );
+}
+
+// --- Causal Attention ---
+// The causal_attention.wgsl example places the causal mask outside the inner loop,
+// so the classifier detects it as attention with causal=false. The ONNX graph
+// still contains the standard SDPA subgraph without a Where node.
+
+#[test]
+fn causal_attention_produces_attention_subgraph() {
+    let source = common::load_example("causal_attention");
+    let output = common::compile_wgsl(&source, &OnnxBackend, 1);
+    let model = decode_onnx(&output);
+    let graph = model.graph.as_ref().unwrap();
+    let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
+    assert!(
+        op_types.contains(&"Transpose"),
+        "expected Transpose node in attention subgraph, got: {op_types:?}"
+    );
+    assert!(
+        op_types.contains(&"MatMul"),
+        "expected MatMul node in attention subgraph, got: {op_types:?}"
+    );
+    assert!(
+        op_types.contains(&"Softmax"),
+        "expected Softmax node in attention subgraph, got: {op_types:?}"
+    );
+}

@@ -86,6 +86,9 @@ impl Backend for TfLiteBackend {
                 message: format!("entry point '{ep_name}': classified as {summary}"),
             });
 
+            // Emit warnings for unsupported attention features in the TFLite backend.
+            emit_attention_diagnostics(fp, ep_name, &mut diagnostics);
+
             let bytes = lower::build_fused_model(fp)?;
 
             let filename = if fused.len() == 1 {
@@ -150,6 +153,48 @@ impl Backend for TfLiteBackend {
         }
 
         Ok(BackendOutput { files, diagnostics })
+    }
+}
+
+/// Emit diagnostic warnings when the TFLite backend encounters attention patterns
+/// with features it does not yet support (multi-head splitting, causal masking).
+fn emit_attention_diagnostics(
+    fp: &fusion::FusedPattern,
+    ep_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // Extract the inner KernelPattern from the fused pattern.
+    let inner = match fp {
+        fusion::FusedPattern::Single(p) => Some(p),
+        fusion::FusedPattern::WithActivation { base, .. } => match base.as_ref() {
+            fusion::FusedPattern::Single(p) => Some(p),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    if let Some(analyze::KernelPattern::Attention {
+        num_heads, causal, ..
+    }) = inner
+    {
+        if *num_heads > 1 {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                message: format!(
+                    "entry point '{ep_name}': TFLite backend does not support multi-head attention \
+                     (num_heads={num_heads}); output will be single-head SDPA"
+                ),
+            });
+        }
+        if *causal {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                message: format!(
+                    "entry point '{ep_name}': TFLite backend does not support causal masking; \
+                     output will be unmasked SDPA"
+                ),
+            });
+        }
     }
 }
 

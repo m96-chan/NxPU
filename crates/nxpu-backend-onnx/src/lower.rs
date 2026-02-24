@@ -6,7 +6,7 @@
 use crate::proto::*;
 use nxpu_analysis::analyze::{
     ActivationOp, Conv2DShape, ElementWiseOp, EmbeddedWeight, KernelPattern, MatMulShape, NormType,
-    PoolKind, PoolShape, ReduceOp, TensorBinding,
+    PoolKind, PoolShape, ReduceOp, TensorBinding, normalize_axis,
 };
 use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
 use nxpu_backend_core::BackendError;
@@ -1204,6 +1204,12 @@ fn build_concat_graph(
     axis: i64,
     ep_name: &str,
 ) -> GraphProto {
+    // Normalize potentially negative axis values. Use axis+1 as minimum rank
+    // so non-negative values pass through unchanged. For true negative-axis
+    // support the caller should supply the real tensor rank.
+    let ndim = (axis.unsigned_abs() as usize + 1).max(1);
+    let axis = normalize_axis(axis, ndim);
+
     let input_names: Vec<String> = inputs.iter().map(|i| i.name.clone()).collect();
     GraphProto {
         name: ep_name.into(),
@@ -1239,6 +1245,10 @@ fn build_split_graph(
     axis: i64,
     ep_name: &str,
 ) -> GraphProto {
+    // Normalize potentially negative axis values (see build_concat_graph).
+    let ndim = (axis.unsigned_abs() as usize + 1).max(1);
+    let axis = normalize_axis(axis, ndim);
+
     let output_names: Vec<String> = outputs.iter().map(|o| o.name.clone()).collect();
     GraphProto {
         name: ep_name.into(),
@@ -2767,5 +2777,85 @@ mod tests {
         };
         maybe_add_layout_transpose(&mut graph, &[], "x", "y");
         assert!(graph.node.is_empty());
+    }
+
+    #[test]
+    fn attention_multihead_has_reshape_and_transpose_nodes() {
+        let pattern = KernelPattern::Attention {
+            query: make_tensor("Q", TensorRole::Input),
+            key: make_tensor("K", TensorRole::Input),
+            value: make_tensor("V", TensorRole::Input),
+            output: make_tensor("out", TensorRole::Output),
+            d_k: "64".into(),
+            seq_len: "seq_len".into(),
+            num_heads: 4,
+            num_kv_heads: 4,
+            causal: false,
+        };
+        let model = build_model(&pattern, "multihead_attn", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
+        assert!(
+            op_types.contains(&"Reshape"),
+            "multi-head attention should have Reshape nodes, got: {op_types:?}"
+        );
+        assert!(
+            op_types.contains(&"Transpose"),
+            "multi-head attention should have Transpose nodes, got: {op_types:?}"
+        );
+        assert!(
+            op_types.contains(&"MatMul"),
+            "attention should have MatMul nodes, got: {op_types:?}"
+        );
+
+        // Verify the reshape target shape initializer includes num_heads dimension.
+        let mh_shape_init = graph
+            .initializer
+            .iter()
+            .find(|i| i.name == "mh_shape")
+            .expect("expected mh_shape initializer for multi-head reshape");
+        assert!(
+            mh_shape_init.int64_data.contains(&4),
+            "mh_shape should contain num_heads=4, got: {:?}",
+            mh_shape_init.int64_data
+        );
+    }
+
+    #[test]
+    fn attention_causal_has_where_node() {
+        let pattern = KernelPattern::Attention {
+            query: make_tensor("Q", TensorRole::Input),
+            key: make_tensor("K", TensorRole::Input),
+            value: make_tensor("V", TensorRole::Input),
+            output: make_tensor("out", TensorRole::Output),
+            d_k: "64".into(),
+            seq_len: "seq_len".into(),
+            num_heads: 1,
+            num_kv_heads: 1,
+            causal: true,
+        };
+        let model = build_model(&pattern, "causal_attn", &[]).unwrap();
+        let graph = model.graph.as_ref().unwrap();
+
+        let op_types: Vec<&str> = graph.node.iter().map(|n| n.op_type.as_str()).collect();
+        assert!(
+            op_types.contains(&"Where"),
+            "causal attention should have a Where node for masking, got: {op_types:?}"
+        );
+
+        // Verify there is a neg_inf initializer for the mask fill value.
+        let neg_inf = graph
+            .initializer
+            .iter()
+            .find(|i| i.name == "neg_inf")
+            .expect("expected neg_inf initializer for causal mask");
+        assert_eq!(neg_inf.data_type, data_type::FLOAT);
+
+        // Verify tri_mask input exists.
+        assert!(
+            graph.input.iter().any(|i| i.name == "tri_mask"),
+            "causal attention should have tri_mask input"
+        );
     }
 }
