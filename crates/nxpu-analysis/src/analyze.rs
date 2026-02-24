@@ -760,32 +760,26 @@ fn extract_loop_bound_literals(body: &[Statement], exprs: &Arena<Expression>) ->
                     reject,
                 }) = body.iter().find(|s| !matches!(s, Statement::Emit(_)))
                 {
-                    if accept.is_empty() && matches!(reject.as_slice(), [Statement::Break]) {
-                        if let Some(&Expression::Binary {
+                    if accept.is_empty()
+                        && matches!(reject.as_slice(), [Statement::Break])
+                        && let Some(&Expression::Binary {
                             op: BinaryOp::Less | BinaryOp::LessEqual,
                             right,
                             ..
                         }) = exprs.try_get(*condition)
-                        {
-                            if let Some(&Expression::Literal(Literal::U32(n))) =
-                                exprs.try_get(right)
-                            {
-                                bounds.push(n);
-                            }
-                        }
-                    } else if reject.is_empty() && matches!(accept.as_slice(), [Statement::Break]) {
-                        if let Some(&Expression::Binary {
+                        && let Some(&Expression::Literal(Literal::U32(n))) = exprs.try_get(right)
+                    {
+                        bounds.push(n);
+                    } else if reject.is_empty()
+                        && matches!(accept.as_slice(), [Statement::Break])
+                        && let Some(&Expression::Binary {
                             op: BinaryOp::GreaterEqual | BinaryOp::Greater,
                             right,
                             ..
                         }) = exprs.try_get(*condition)
-                        {
-                            if let Some(&Expression::Literal(Literal::U32(n))) =
-                                exprs.try_get(right)
-                            {
-                                bounds.push(n);
-                            }
-                        }
+                        && let Some(&Expression::Literal(Literal::U32(n))) = exprs.try_get(right)
+                    {
+                        bounds.push(n);
                     }
                 }
                 // Recurse into nested loops.
@@ -2613,8 +2607,8 @@ mod tests {
     fn eval_const_expr_f32_literal() {
         let mut exprs = Arena::new();
         let types = UniqueArena::new();
-        let h = exprs.append(Expression::Literal(Literal::F32(3.14)));
-        assert_eq!(eval_const_expr_f32(h, &exprs, &types), Some(vec![3.14]));
+        let h = exprs.append(Expression::Literal(Literal::F32(2.78)));
+        assert_eq!(eval_const_expr_f32(h, &exprs, &types), Some(vec![2.78]));
     }
 
     #[test]

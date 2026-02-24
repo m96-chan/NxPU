@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Embed constant weights from `GlobalVariable` initializers into ONNX output.
+- Real vendor NPU backends with operator support matrices (Samsung Exynos, MediaTek Dimensity, Intel OpenVINO, AMD XDNA, Qualcomm Hexagon, Arm Ethos, CEVA NeuPro, Rockchip RKNN).
+- `OperatorSupport` trait and `validate_patterns` helper in `nxpu-backend-core`.
+- Comprehensive test coverage for all vendor backends.
+- Fuzz testing targets for WGSL parser (`fuzz_parse`, `fuzz_lower`).
+- Display and validation tests for backend-core types.
+- Example kernels: `conv2d_5x5.wgsl`, `vecadd_const.wgsl`.
+
+### Fixed
+- Extract loop bounds from naga 28 `If`/`else{Break}` pattern for Conv2D shape inference.
+- Use `let-else` instead of let-chains for MSRV 1.87 compatibility.
+
+### Changed
+- Classify 1-input + embedded weight operations as `ElementWise` for end-to-end ONNX path.
+
 ## [0.2.0] - 2026-02-22
 
 ### Added
