@@ -34,6 +34,7 @@ backend-rockchip = ["dep:nxpu-backend-rockchip", "backend-onnx"]
 nxpu-parser = { path = "../nxpu-parser" }
 nxpu-ir = { path = "../nxpu-ir" }
 nxpu-opt = { path = "../nxpu-opt" }
+nxpu-analysis = { path = "../nxpu-analysis" }
 nxpu-backend-core = { path = "../nxpu-backend-core" }
 nxpu-backend-onnx = { path = "../nxpu-backend-onnx", optional = true }
 nxpu-backend-tflite = { path = "../nxpu-backend-tflite", optional = true }

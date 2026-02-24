@@ -9,6 +9,7 @@ mod dce;
 mod fma_fusion;
 pub mod layout;
 pub mod quantize;
+pub mod schedule;
 pub mod shape;
 mod validation;
 
@@ -20,6 +21,7 @@ pub use quantize::{
     CalibrationData, F32ToBf16, F32ToF16, F32ToInt8, MixedPrecisionPass, MixedPrecisionPolicy,
     QuantizationParams,
 };
+pub use schedule::{Schedule, SchedulePass, ScheduleSlot, compute_schedules, format_schedule};
 pub use shape::ShapeInference;
 pub use validation::{IrValidation, ValidationWarning, collect_warnings};
 

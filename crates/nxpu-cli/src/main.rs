@@ -12,6 +12,7 @@ use nxpu_opt::{OptLevel, PassManager};
 /// NxPU — WGSL to NPU transpiler
 #[derive(Parser)]
 #[command(version, about)]
+#[allow(clippy::struct_excessive_bools)]
 struct Cli {
     /// Input WGSL file
     input: Option<PathBuf>,
@@ -31,6 +32,10 @@ struct Cli {
     /// Dump IR to stderr before backend compilation
     #[arg(long)]
     emit_ir: bool,
+
+    /// Dump operation schedule to stderr (dataflow analysis + scheduling)
+    #[arg(long)]
+    emit_schedule: bool,
 
     /// Validate and optimize without producing output
     #[arg(long)]
@@ -143,6 +148,14 @@ fn run() -> miette::Result<()> {
     // 4. Optionally dump IR to stderr.
     if cli.emit_ir {
         eprintln!("{}", nxpu_ir::dump_module(&module));
+    }
+
+    // 4b. Optionally dump schedule to stderr.
+    if cli.emit_schedule {
+        let schedules = nxpu_opt::compute_schedules(&module);
+        for (name, dfg, schedule) in &schedules {
+            eprintln!("{}", nxpu_opt::format_schedule(name, dfg, schedule));
+        }
     }
 
     // 5. Dry-run: stop here.
@@ -265,6 +278,7 @@ mod tests {
         assert!(cli.output.is_none());
         assert_eq!(cli.opt_level, OptLevel::O1);
         assert!(!cli.emit_ir);
+        assert!(!cli.emit_schedule);
         assert!(!cli.dry_run);
         assert_eq!(cli.precision, PrecisionPolicy::Auto);
         assert!(!cli.list_targets);
@@ -282,6 +296,7 @@ mod tests {
             "--opt-level",
             "2",
             "--emit-ir",
+            "--emit-schedule",
             "--precision",
             "f16",
         ])
@@ -291,6 +306,7 @@ mod tests {
         assert_eq!(cli.output.unwrap(), PathBuf::from("out.onnx"));
         assert_eq!(cli.opt_level, OptLevel::O2);
         assert!(cli.emit_ir);
+        assert!(cli.emit_schedule);
         assert_eq!(cli.precision, PrecisionPolicy::Explicit(Precision::F16));
     }
 
