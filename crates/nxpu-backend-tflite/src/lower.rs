@@ -78,13 +78,27 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
         } => {
             if matches!(op, ActivationOp::Softmax) {
                 build_tflite_softmax(input, output)
+            } else if matches!(
+                op,
+                ActivationOp::Gelu | ActivationOp::Silu | ActivationOp::Mish
+            ) {
+                // No direct TFLite op for GELU/SiLU/Mish -- use CUSTOM
+                let shapes = [vec![-1i32], vec![-1]];
+                build_tflite_unary(
+                    input,
+                    output,
+                    &shapes[0],
+                    &shapes[1],
+                    builtin_op::CUSTOM,
+                    &format!("{}_1d", op.op_name().to_lowercase()),
+                )
             } else {
                 let shapes = [vec![-1i32], vec![-1]];
                 let opcode = match op {
                     ActivationOp::Relu => builtin_op::RELU,
                     ActivationOp::Sigmoid => builtin_op::LOGISTIC,
                     ActivationOp::Tanh => builtin_op::TANH,
-                    ActivationOp::Softmax => unreachable!(),
+                    _ => unreachable!(),
                 };
                 build_tflite_unary(
                     input,
@@ -167,6 +181,37 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
             d_k,
             ..
         } => build_tflite_attention(query, key, value, output, d_k),
+        KernelPattern::Gather {
+            data,
+            indices,
+            output,
+            ..
+        } => {
+            let shapes = [vec![-1i32], vec![-1], vec![-1]];
+            build_tflite(
+                &[data, indices],
+                output,
+                &shapes,
+                builtin_op::GATHER,
+                "gather",
+            )
+        }
+        KernelPattern::Scatter {
+            data,
+            indices,
+            updates,
+            output,
+            ..
+        } => {
+            let shapes = [vec![-1i32], vec![-1], vec![-1]];
+            build_tflite(
+                &[data, indices, updates],
+                output,
+                &shapes,
+                builtin_op::SCATTER_ND,
+                "scatter_nd",
+            )
+        }
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
                 "cannot lower Unknown pattern to TFLite: {reason}"
@@ -680,6 +725,7 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                 ActivationOp::Sigmoid => builtin_op::LOGISTIC,
                 ActivationOp::Tanh => builtin_op::TANH,
                 ActivationOp::Softmax => builtin_op::SOFTMAX,
+                ActivationOp::Gelu | ActivationOp::Silu | ActivationOp::Mish => builtin_op::CUSTOM,
             };
             let shape_1d = vec![-1i32];
             Ok(GraphDesc {
@@ -863,6 +909,82 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                 }],
                 tensors,
                 graph_name: "concat".into(),
+            })
+        }
+        KernelPattern::Gather {
+            data,
+            indices,
+            output,
+            ..
+        } => {
+            let shape_1d = vec![-1i32];
+            Ok(GraphDesc {
+                tensors: vec![
+                    TensorInfo {
+                        name: data.name.clone(),
+                        elem_type: data.elem_type,
+                        shape: shape_1d.clone(),
+                    },
+                    TensorInfo {
+                        name: indices.name.clone(),
+                        elem_type: indices.elem_type,
+                        shape: shape_1d.clone(),
+                    },
+                    TensorInfo {
+                        name: output.name.clone(),
+                        elem_type: output.elem_type,
+                        shape: shape_1d,
+                    },
+                ],
+                ops: vec![OpDesc {
+                    opcode: builtin_op::GATHER,
+                    inputs: vec![0, 1],
+                    outputs: vec![2],
+                }],
+                graph_inputs: vec![0, 1],
+                graph_outputs: vec![2],
+                graph_name: "gather".into(),
+            })
+        }
+        KernelPattern::Scatter {
+            data,
+            indices,
+            updates,
+            output,
+            ..
+        } => {
+            let shape_1d = vec![-1i32];
+            Ok(GraphDesc {
+                tensors: vec![
+                    TensorInfo {
+                        name: data.name.clone(),
+                        elem_type: data.elem_type,
+                        shape: shape_1d.clone(),
+                    },
+                    TensorInfo {
+                        name: indices.name.clone(),
+                        elem_type: indices.elem_type,
+                        shape: shape_1d.clone(),
+                    },
+                    TensorInfo {
+                        name: updates.name.clone(),
+                        elem_type: updates.elem_type,
+                        shape: shape_1d.clone(),
+                    },
+                    TensorInfo {
+                        name: output.name.clone(),
+                        elem_type: output.elem_type,
+                        shape: shape_1d,
+                    },
+                ],
+                ops: vec![OpDesc {
+                    opcode: builtin_op::SCATTER_ND,
+                    inputs: vec![0, 1, 2],
+                    outputs: vec![3],
+                }],
+                graph_inputs: vec![0, 1, 2],
+                graph_outputs: vec![3],
+                graph_name: "scatter_nd".into(),
             })
         }
         // Patterns that are complex (Attention, Split) fall back to build_model.
@@ -2085,7 +2207,7 @@ mod tests {
     use super::*;
     use nxpu_analysis::analyze::data_type;
     use nxpu_analysis::analyze::{
-        ActivationOp, Conv2DShape, MatMulShape, PoolKind, PoolShape, ReduceOp, TensorRole,
+        ActivationOp, Conv2DShape, MatMulShape, NormType, PoolKind, PoolShape, ReduceOp, TensorRole,
     };
 
     fn dummy_handle() -> nxpu_ir::Handle<nxpu_ir::GlobalVariable> {
@@ -2192,6 +2314,9 @@ mod tests {
                 stride_w: 1,
                 pad_h: 0,
                 pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
             },
         };
         let bytes = build_model(&pattern).unwrap();
@@ -2268,6 +2393,9 @@ mod tests {
                 stride_w: 1,
                 pad_h: 0,
                 pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
             },
         }
     }
@@ -2279,6 +2407,7 @@ mod tests {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor(output_name, TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         }
     }
 

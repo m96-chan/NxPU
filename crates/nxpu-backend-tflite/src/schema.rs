@@ -37,6 +37,10 @@ pub mod builtin_op {
     pub const CONCATENATION: i32 = 2;
     pub const SPLIT: i32 = 49;
     pub const BATCH_MATMUL: i32 = 126;
+    pub const GATHER: i32 = 36;
+    pub const SCATTER_ND: i32 = 122;
+    pub const DEPTHWISE_CONV_2D: i32 = 4;
+    pub const CUSTOM: i32 = 32;
 }
 
 /// VTable field slot offsets for each TFLite FlatBuffer table.

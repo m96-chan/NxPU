@@ -91,6 +91,8 @@ fn pattern_op_name(pattern: &analyze::KernelPattern) -> String {
         analyze::KernelPattern::Concat { .. } => "Concat".into(),
         analyze::KernelPattern::Split { .. } => "Split".into(),
         analyze::KernelPattern::Attention { .. } => "Attention".into(),
+        analyze::KernelPattern::Gather { .. } => "Gather".into(),
+        analyze::KernelPattern::Scatter { .. } => "ScatterND".into(),
         analyze::KernelPattern::Unknown { .. } => "Unknown".into(),
     }
 }

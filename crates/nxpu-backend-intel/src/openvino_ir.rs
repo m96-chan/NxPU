@@ -156,6 +156,9 @@ fn build_pattern_layers(
                 ActivationOp::Sigmoid => "Sigmoid",
                 ActivationOp::Tanh => "Tanh",
                 ActivationOp::Softmax => "SoftMax",
+                ActivationOp::Gelu => "Gelu",
+                ActivationOp::Silu => "Swish",
+                ActivationOp::Mish => "Mish",
             };
             let input_ids = create_parameter_layers(&[input], layer_id, layers);
             let compute = IrLayer {
@@ -230,6 +233,7 @@ fn build_pattern_layers(
             bias,
             output,
             epsilon,
+            ..
         } => {
             let input_ids = create_parameter_layers(&[input, scale, bias], layer_id, layers);
             let compute = IrLayer {
@@ -315,6 +319,18 @@ fn generic_io(pattern: &KernelPattern) -> (Vec<TensorBinding>, String) {
         } => (
             vec![query.clone(), key.clone(), value.clone()],
             "ScaledDotProductAttention".into(),
+        ),
+        KernelPattern::Gather { data, indices, .. } => {
+            (vec![data.clone(), indices.clone()], "Gather".into())
+        }
+        KernelPattern::Scatter {
+            data,
+            indices,
+            updates,
+            ..
+        } => (
+            vec![data.clone(), indices.clone(), updates.clone()],
+            "ScatterND".into(),
         ),
         KernelPattern::Unknown { reason } => (vec![], format!("Unknown({reason})")),
         // Covered patterns should not reach here.
@@ -484,6 +500,9 @@ mod tests {
                 stride_w: 1,
                 pad_h: 1,
                 pad_w: 1,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
             },
         }];
 
@@ -645,12 +664,14 @@ mod tests {
 
     #[test]
     fn normalization_ir_xml() {
+        use nxpu_analysis::NormType;
         let patterns = vec![KernelPattern::Normalization {
             input: dummy_binding("input", TensorRole::Input),
             scale: dummy_binding("scale", TensorRole::Input),
             bias: dummy_binding("bias", TensorRole::Input),
             output: dummy_binding("output", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         }];
 
         let xml = build_ir_xml(&patterns, "test_batchnorm");

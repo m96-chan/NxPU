@@ -18,7 +18,9 @@ pub fn output_tensor_names(pattern: &KernelPattern) -> Vec<&str> {
         | KernelPattern::Reshape { output, .. }
         | KernelPattern::Normalization { output, .. }
         | KernelPattern::Concat { output, .. }
-        | KernelPattern::Attention { output, .. } => vec![output.name.as_str()],
+        | KernelPattern::Attention { output, .. }
+        | KernelPattern::Gather { output, .. }
+        | KernelPattern::Scatter { output, .. } => vec![output.name.as_str()],
         KernelPattern::Split { outputs, .. } => outputs.iter().map(|t| t.name.as_str()).collect(),
         KernelPattern::Unknown { .. } => vec![],
     }
@@ -47,6 +49,19 @@ pub fn input_tensor_names(pattern: &KernelPattern) -> Vec<&str> {
         KernelPattern::Attention {
             query, key, value, ..
         } => vec![query.name.as_str(), key.name.as_str(), value.name.as_str()],
+        KernelPattern::Gather { data, indices, .. } => {
+            vec![data.name.as_str(), indices.name.as_str()]
+        }
+        KernelPattern::Scatter {
+            data,
+            indices,
+            updates,
+            ..
+        } => vec![
+            data.name.as_str(),
+            indices.name.as_str(),
+            updates.name.as_str(),
+        ],
         KernelPattern::Unknown { .. } => vec![],
     }
 }
@@ -87,6 +102,10 @@ fn try_fuse_activation(op: &crate::analyze::ActivationOp) -> Option<FusedActivat
         crate::analyze::ActivationOp::Sigmoid => Some(FusedActivation::Sigmoid),
         crate::analyze::ActivationOp::Tanh => Some(FusedActivation::Tanh),
         crate::analyze::ActivationOp::Softmax => None,
+        // Complex activations are not fusible.
+        crate::analyze::ActivationOp::Gelu => None,
+        crate::analyze::ActivationOp::Silu => None,
+        crate::analyze::ActivationOp::Mish => None,
     }
 }
 
@@ -254,6 +273,7 @@ pub fn fuse_patterns(patterns: Vec<KernelPattern>) -> Vec<(FusedPattern, usize)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyze::NormType;
     use crate::analyze::data_type;
     use crate::analyze::*;
 
@@ -324,6 +344,9 @@ mod tests {
                     stride_w: 1,
                     pad_h: 0,
                     pad_w: 0,
+                    groups: 1,
+                    dilation_h: 1,
+                    dilation_w: 1,
                 },
             },
             KernelPattern::Normalization {
@@ -332,6 +355,7 @@ mod tests {
                 bias: make_tensor("beta", TensorRole::Input),
                 output: make_tensor("bn_out", TensorRole::Output),
                 epsilon: 1e-5,
+                norm_type: NormType::Batch,
             },
         ];
 
@@ -396,6 +420,9 @@ mod tests {
                     stride_w: 1,
                     pad_h: 0,
                     pad_w: 0,
+                    groups: 1,
+                    dilation_h: 1,
+                    dilation_w: 1,
                 },
             },
             KernelPattern::Normalization {
@@ -404,6 +431,7 @@ mod tests {
                 bias: make_tensor("beta", TensorRole::Input),
                 output: make_tensor("bn_out", TensorRole::Output),
                 epsilon: 1e-5,
+                norm_type: NormType::Batch,
             },
             KernelPattern::Activation {
                 op: ActivationOp::Relu,
@@ -653,6 +681,9 @@ mod tests {
                     stride_w: 1,
                     pad_h: 0,
                     pad_w: 0,
+                    groups: 1,
+                    dilation_h: 1,
+                    dilation_w: 1,
                 },
             },
             norm: Box::new(KernelPattern::Normalization {
@@ -661,6 +692,7 @@ mod tests {
                 bias: make_tensor("beta", TensorRole::Input),
                 output: make_tensor("bn_out", TensorRole::Output),
                 epsilon: 1e-5,
+                norm_type: crate::NormType::Batch,
             }),
         };
         let s = format!("{pattern}");
@@ -759,6 +791,9 @@ mod tests {
                     stride_w: 1,
                     pad_h: 0,
                     pad_w: 0,
+                    groups: 1,
+                    dilation_h: 1,
+                    dilation_w: 1,
                 },
             },
             norm: Box::new(KernelPattern::Normalization {
@@ -767,6 +802,7 @@ mod tests {
                 bias: make_tensor("beta", TensorRole::Input),
                 output: make_tensor("bn_out", TensorRole::Output),
                 epsilon: 1e-5,
+                norm_type: crate::NormType::Batch,
             }),
         };
         assert!(matches!(
@@ -1005,6 +1041,9 @@ mod tests {
                 stride_w: 1,
                 pad_h: 0,
                 pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
             },
         }];
 
@@ -1062,6 +1101,9 @@ mod tests {
                     stride_w: 1,
                     pad_h: 0,
                     pad_w: 0,
+                    groups: 1,
+                    dilation_h: 1,
+                    dilation_w: 1,
                 },
             },
             KernelPattern::ElementWise {
@@ -1110,6 +1152,129 @@ mod tests {
                     make_tensor("other", TensorRole::Input),
                 ],
                 output: make_tensor("sub_out", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 2);
+    }
+
+    #[test]
+    fn output_tensor_names_for_gather() {
+        let pattern = KernelPattern::Gather {
+            data: make_tensor("data", TensorRole::Input),
+            indices: make_tensor("idx", TensorRole::Input),
+            output: make_tensor("out", TensorRole::Output),
+            axis: 0,
+        };
+        let names = output_tensor_names(&pattern);
+        assert_eq!(names, vec!["out"]);
+    }
+
+    #[test]
+    fn input_tensor_names_for_gather() {
+        let pattern = KernelPattern::Gather {
+            data: make_tensor("data", TensorRole::Input),
+            indices: make_tensor("idx", TensorRole::Input),
+            output: make_tensor("out", TensorRole::Output),
+            axis: 0,
+        };
+        let names = input_tensor_names(&pattern);
+        assert_eq!(names, vec!["data", "idx"]);
+    }
+
+    #[test]
+    fn output_tensor_names_for_scatter() {
+        let pattern = KernelPattern::Scatter {
+            data: make_tensor("data", TensorRole::Input),
+            indices: make_tensor("idx", TensorRole::Input),
+            updates: make_tensor("upd", TensorRole::Input),
+            output: make_tensor("out", TensorRole::Output),
+            axis: 0,
+        };
+        let names = output_tensor_names(&pattern);
+        assert_eq!(names, vec!["out"]);
+    }
+
+    #[test]
+    fn input_tensor_names_for_scatter() {
+        let pattern = KernelPattern::Scatter {
+            data: make_tensor("data", TensorRole::Input),
+            indices: make_tensor("idx", TensorRole::Input),
+            updates: make_tensor("upd", TensorRole::Input),
+            output: make_tensor("out", TensorRole::Output),
+            axis: 0,
+        };
+        let names = input_tensor_names(&pattern);
+        assert_eq!(names, vec!["data", "idx", "upd"]);
+    }
+
+    #[test]
+    fn no_fusion_for_gelu_activation() {
+        let patterns = vec![
+            KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("a", TensorRole::Input),
+                    make_tensor("b", TensorRole::Input),
+                ],
+                output: make_tensor("c", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+            KernelPattern::Activation {
+                op: ActivationOp::Gelu,
+                input: make_tensor("c", TensorRole::Input),
+                output: make_tensor("d", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        // Gelu is not fusible -- remains as 2 separate patterns.
+        assert_eq!(fused.len(), 2);
+    }
+
+    #[test]
+    fn no_fusion_for_silu_activation() {
+        let patterns = vec![
+            KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("a", TensorRole::Input),
+                    make_tensor("b", TensorRole::Input),
+                ],
+                output: make_tensor("c", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+            KernelPattern::Activation {
+                op: ActivationOp::Silu,
+                input: make_tensor("c", TensorRole::Input),
+                output: make_tensor("d", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+        ];
+
+        let fused = fuse_patterns(patterns);
+        assert_eq!(fused.len(), 2);
+    }
+
+    #[test]
+    fn no_fusion_for_mish_activation() {
+        let patterns = vec![
+            KernelPattern::ElementWise {
+                op: ElementWiseOp::Add,
+                inputs: [
+                    make_tensor("a", TensorRole::Input),
+                    make_tensor("b", TensorRole::Input),
+                ],
+                output: make_tensor("c", TensorRole::Output),
+                dim_name: "N".into(),
+            },
+            KernelPattern::Activation {
+                op: ActivationOp::Mish,
+                input: make_tensor("c", TensorRole::Input),
+                output: make_tensor("d", TensorRole::Output),
                 dim_name: "N".into(),
             },
         ];

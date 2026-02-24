@@ -5,8 +5,8 @@
 
 use crate::proto::*;
 use nxpu_analysis::analyze::{
-    ActivationOp, Conv2DShape, ElementWiseOp, EmbeddedWeight, KernelPattern, MatMulShape, PoolKind,
-    PoolShape, ReduceOp, TensorBinding,
+    ActivationOp, Conv2DShape, ElementWiseOp, EmbeddedWeight, KernelPattern, MatMulShape, NormType,
+    PoolKind, PoolShape, ReduceOp, TensorBinding,
 };
 use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
 use nxpu_backend_core::BackendError;
@@ -64,8 +64,9 @@ pub fn build_model(
             scale,
             bias,
             output,
+            norm_type,
             ..
-        } => build_normalization_graph(input, scale, bias, output, ep_name),
+        } => build_normalization_graph(input, scale, bias, output, *norm_type, ep_name),
         KernelPattern::Concat {
             inputs,
             output,
@@ -84,6 +85,19 @@ pub fn build_model(
             d_k,
             seq_len,
         } => build_attention_graph(query, key, value, output, seq_len, d_k, ep_name),
+        KernelPattern::Gather {
+            data,
+            indices,
+            output,
+            axis,
+        } => build_gather_graph(data, indices, output, *axis, ep_name),
+        KernelPattern::Scatter {
+            data,
+            indices,
+            updates,
+            output,
+            axis,
+        } => build_scatter_graph(data, indices, updates, output, *axis, ep_name),
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
                 "cannot lower Unknown pattern to ONNX: {reason}"
@@ -553,6 +567,15 @@ fn build_conv2d_graph(
                 "pads",
                 vec![shape.pad_h, shape.pad_w, shape.pad_h, shape.pad_w],
             ));
+            if shape.groups != 1 {
+                attrs.push(AttributeProto::int("group", shape.groups));
+            }
+            if shape.dilation_h != 1 || shape.dilation_w != 1 {
+                attrs.push(AttributeProto::ints(
+                    "dilations",
+                    vec![shape.dilation_h, shape.dilation_w],
+                ));
+            }
             NodeProto::with_attrs(
                 "Conv",
                 "conv_0",
@@ -646,15 +669,204 @@ fn build_activation_graph(
     dim_name: &str,
     ep_name: &str,
 ) -> GraphProto {
+    match op {
+        ActivationOp::Gelu => build_gelu_graph(input, output, dim_name, ep_name),
+        ActivationOp::Silu => build_silu_graph(input, output, dim_name, ep_name),
+        ActivationOp::Mish => build_mish_graph(input, output, dim_name, ep_name),
+        _ => GraphProto {
+            name: ep_name.into(),
+            initializer: vec![],
+            node: vec![NodeProto::simple(
+                op.op_name(),
+                format!("{}_0", op.op_name().to_lowercase()),
+                vec![input.name.clone()],
+                vec![output.name.clone()],
+            )],
+            input: vec![ValueInfoProto::tensor(
+                &input.name,
+                input.elem_type,
+                vec![TensorShapeDimension::symbolic(dim_name)],
+            )],
+            output: vec![ValueInfoProto::tensor(
+                &output.name,
+                output.elem_type,
+                vec![TensorShapeDimension::symbolic(dim_name)],
+            )],
+        },
+    }
+}
+
+/// Build GELU graph: x * 0.5 * (1 + Erf(x / sqrt(2)))
+fn build_gelu_graph(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    dim_name: &str,
+    ep_name: &str,
+) -> GraphProto {
+    // Decompose: x * 0.5 * (1 + Erf(x / sqrt(2)))
+    let sqrt2_name = "gelu_sqrt2";
+    let div_name = "gelu_div";
+    let erf_name = "gelu_erf";
+    let one_name = "gelu_one";
+    let add_name = "gelu_add";
+    let half_name = "gelu_half";
+    let mul1_name = "gelu_mul1";
+
+    GraphProto {
+        name: ep_name.into(),
+        initializer: vec![
+            TensorProto {
+                dims: vec![],
+                data_type: data_type::FLOAT,
+                name: sqrt2_name.into(),
+                float_data: vec![std::f32::consts::SQRT_2],
+                int64_data: vec![],
+                raw_data: vec![],
+            },
+            TensorProto {
+                dims: vec![],
+                data_type: data_type::FLOAT,
+                name: one_name.into(),
+                float_data: vec![1.0],
+                int64_data: vec![],
+                raw_data: vec![],
+            },
+            TensorProto {
+                dims: vec![],
+                data_type: data_type::FLOAT,
+                name: half_name.into(),
+                float_data: vec![0.5],
+                int64_data: vec![],
+                raw_data: vec![],
+            },
+        ],
+        node: vec![
+            // x / sqrt(2)
+            NodeProto::simple(
+                "Div",
+                "gelu_div_0",
+                vec![input.name.clone(), sqrt2_name.into()],
+                vec![div_name.into()],
+            ),
+            // Erf(x / sqrt(2))
+            NodeProto::simple(
+                "Erf",
+                "gelu_erf_0",
+                vec![div_name.into()],
+                vec![erf_name.into()],
+            ),
+            // 1 + Erf(...)
+            NodeProto::simple(
+                "Add",
+                "gelu_add_0",
+                vec![erf_name.into(), one_name.into()],
+                vec![add_name.into()],
+            ),
+            // x * (1 + Erf(...))
+            NodeProto::simple(
+                "Mul",
+                "gelu_mul_0",
+                vec![input.name.clone(), add_name.into()],
+                vec![mul1_name.into()],
+            ),
+            // result * 0.5
+            NodeProto::simple(
+                "Mul",
+                "gelu_mul_1",
+                vec![mul1_name.into(), half_name.into()],
+                vec![output.name.clone()],
+            ),
+        ],
+        input: vec![
+            ValueInfoProto::tensor(
+                &input.name,
+                input.elem_type,
+                vec![TensorShapeDimension::symbolic(dim_name)],
+            ),
+            ValueInfoProto::tensor(sqrt2_name, data_type::FLOAT, vec![]),
+            ValueInfoProto::tensor(one_name, data_type::FLOAT, vec![]),
+            ValueInfoProto::tensor(half_name, data_type::FLOAT, vec![]),
+        ],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic(dim_name)],
+        )],
+    }
+}
+
+/// Build SiLU graph: x * sigmoid(x) = x * (1 / (1 + exp(-x)))
+fn build_silu_graph(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    dim_name: &str,
+    ep_name: &str,
+) -> GraphProto {
+    let sigmoid_name = "silu_sigmoid";
+
     GraphProto {
         name: ep_name.into(),
         initializer: vec![],
-        node: vec![NodeProto::simple(
-            op.op_name(),
-            format!("{}_0", op.op_name().to_lowercase()),
-            vec![input.name.clone()],
-            vec![output.name.clone()],
+        node: vec![
+            NodeProto::simple(
+                "Sigmoid",
+                "silu_sigmoid_0",
+                vec![input.name.clone()],
+                vec![sigmoid_name.into()],
+            ),
+            NodeProto::simple(
+                "Mul",
+                "silu_mul_0",
+                vec![input.name.clone(), sigmoid_name.into()],
+                vec![output.name.clone()],
+            ),
+        ],
+        input: vec![ValueInfoProto::tensor(
+            &input.name,
+            input.elem_type,
+            vec![TensorShapeDimension::symbolic(dim_name)],
         )],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic(dim_name)],
+        )],
+    }
+}
+
+/// Build Mish graph: x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+fn build_mish_graph(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    dim_name: &str,
+    ep_name: &str,
+) -> GraphProto {
+    let softplus_name = "mish_softplus";
+    let tanh_name = "mish_tanh";
+
+    GraphProto {
+        name: ep_name.into(),
+        initializer: vec![],
+        node: vec![
+            NodeProto::simple(
+                "Softplus",
+                "mish_softplus_0",
+                vec![input.name.clone()],
+                vec![softplus_name.into()],
+            ),
+            NodeProto::simple(
+                "Tanh",
+                "mish_tanh_0",
+                vec![softplus_name.into()],
+                vec![tanh_name.into()],
+            ),
+            NodeProto::simple(
+                "Mul",
+                "mish_mul_0",
+                vec![input.name.clone(), tanh_name.into()],
+                vec![output.name.clone()],
+            ),
+        ],
         input: vec![ValueInfoProto::tensor(
             &input.name,
             input.elem_type,
@@ -788,57 +1000,190 @@ fn build_normalization_graph(
     scale: &TensorBinding,
     bias: &TensorBinding,
     output: &TensorBinding,
+    norm_type: NormType,
     ep_name: &str,
 ) -> GraphProto {
-    // mean → empty string (runtime computed)
-    // var → empty string (runtime computed)
+    match norm_type {
+        NormType::Batch => {
+            // mean -> empty string (runtime computed)
+            // var -> empty string (runtime computed)
+            GraphProto {
+                name: ep_name.into(),
+                initializer: vec![],
+                node: vec![NodeProto::with_attrs(
+                    "BatchNormalization",
+                    "batchnorm_0",
+                    vec![
+                        input.name.clone(),
+                        scale.name.clone(),
+                        bias.name.clone(),
+                        "running_mean".into(),
+                        "running_var".into(),
+                    ],
+                    vec![output.name.clone()],
+                    vec![AttributeProto::float("epsilon", 1e-5)],
+                )],
+                input: vec![
+                    ValueInfoProto::tensor(
+                        &input.name,
+                        input.elem_type,
+                        vec![
+                            TensorShapeDimension::symbolic("N"),
+                            TensorShapeDimension::symbolic("C"),
+                            TensorShapeDimension::symbolic("H"),
+                            TensorShapeDimension::symbolic("W"),
+                        ],
+                    ),
+                    ValueInfoProto::tensor(
+                        &scale.name,
+                        scale.elem_type,
+                        vec![TensorShapeDimension::symbolic("C")],
+                    ),
+                    ValueInfoProto::tensor(
+                        &bias.name,
+                        bias.elem_type,
+                        vec![TensorShapeDimension::symbolic("C")],
+                    ),
+                ],
+                output: vec![ValueInfoProto::tensor(
+                    &output.name,
+                    output.elem_type,
+                    vec![
+                        TensorShapeDimension::symbolic("N"),
+                        TensorShapeDimension::symbolic("C"),
+                        TensorShapeDimension::symbolic("H"),
+                        TensorShapeDimension::symbolic("W"),
+                    ],
+                )],
+            }
+        }
+        NormType::Layer => {
+            // ONNX LayerNormalization (opset 17+)
+            GraphProto {
+                name: ep_name.into(),
+                initializer: vec![],
+                node: vec![NodeProto::with_attrs(
+                    "LayerNormalization",
+                    "layernorm_0",
+                    vec![input.name.clone(), scale.name.clone(), bias.name.clone()],
+                    vec![output.name.clone()],
+                    vec![
+                        AttributeProto::float("epsilon", 1e-5),
+                        AttributeProto::int("axis", -1),
+                    ],
+                )],
+                input: vec![
+                    ValueInfoProto::tensor(
+                        &input.name,
+                        input.elem_type,
+                        vec![
+                            TensorShapeDimension::symbolic("N"),
+                            TensorShapeDimension::symbolic("C"),
+                        ],
+                    ),
+                    ValueInfoProto::tensor(
+                        &scale.name,
+                        scale.elem_type,
+                        vec![TensorShapeDimension::symbolic("C")],
+                    ),
+                    ValueInfoProto::tensor(
+                        &bias.name,
+                        bias.elem_type,
+                        vec![TensorShapeDimension::symbolic("C")],
+                    ),
+                ],
+                output: vec![ValueInfoProto::tensor(
+                    &output.name,
+                    output.elem_type,
+                    vec![
+                        TensorShapeDimension::symbolic("N"),
+                        TensorShapeDimension::symbolic("C"),
+                    ],
+                )],
+            }
+        }
+    }
+}
+
+fn build_gather_graph(
+    data: &TensorBinding,
+    indices: &TensorBinding,
+    output: &TensorBinding,
+    axis: i64,
+    ep_name: &str,
+) -> GraphProto {
     GraphProto {
         name: ep_name.into(),
         initializer: vec![],
         node: vec![NodeProto::with_attrs(
-            "BatchNormalization",
-            "batchnorm_0",
-            vec![
-                input.name.clone(),
-                scale.name.clone(),
-                bias.name.clone(),
-                "running_mean".into(),
-                "running_var".into(),
-            ],
+            "Gather",
+            "gather_0",
+            vec![data.name.clone(), indices.name.clone()],
             vec![output.name.clone()],
-            vec![AttributeProto::float("epsilon", 1e-5)], // IEEE float bit pattern for 1e-5 stored as int (convention)
+            vec![AttributeProto::int("axis", axis)],
         )],
         input: vec![
             ValueInfoProto::tensor(
-                &input.name,
-                input.elem_type,
-                vec![
-                    TensorShapeDimension::symbolic("N"),
-                    TensorShapeDimension::symbolic("C"),
-                    TensorShapeDimension::symbolic("H"),
-                    TensorShapeDimension::symbolic("W"),
-                ],
+                &data.name,
+                data.elem_type,
+                vec![TensorShapeDimension::symbolic("N")],
             ),
             ValueInfoProto::tensor(
-                &scale.name,
-                scale.elem_type,
-                vec![TensorShapeDimension::symbolic("C")],
-            ),
-            ValueInfoProto::tensor(
-                &bias.name,
-                bias.elem_type,
-                vec![TensorShapeDimension::symbolic("C")],
+                &indices.name,
+                indices.elem_type,
+                vec![TensorShapeDimension::symbolic("M")],
             ),
         ],
         output: vec![ValueInfoProto::tensor(
             &output.name,
             output.elem_type,
+            vec![TensorShapeDimension::symbolic("M")],
+        )],
+    }
+}
+
+fn build_scatter_graph(
+    data: &TensorBinding,
+    indices: &TensorBinding,
+    updates: &TensorBinding,
+    output: &TensorBinding,
+    _axis: i64,
+    ep_name: &str,
+) -> GraphProto {
+    GraphProto {
+        name: ep_name.into(),
+        initializer: vec![],
+        node: vec![NodeProto::simple(
+            "ScatterND",
+            "scatter_0",
             vec![
-                TensorShapeDimension::symbolic("N"),
-                TensorShapeDimension::symbolic("C"),
-                TensorShapeDimension::symbolic("H"),
-                TensorShapeDimension::symbolic("W"),
+                data.name.clone(),
+                indices.name.clone(),
+                updates.name.clone(),
             ],
+            vec![output.name.clone()],
+        )],
+        input: vec![
+            ValueInfoProto::tensor(
+                &data.name,
+                data.elem_type,
+                vec![TensorShapeDimension::symbolic("N")],
+            ),
+            ValueInfoProto::tensor(
+                &indices.name,
+                indices.elem_type,
+                vec![TensorShapeDimension::symbolic("M")],
+            ),
+            ValueInfoProto::tensor(
+                &updates.name,
+                updates.elem_type,
+                vec![TensorShapeDimension::symbolic("M")],
+            ),
+        ],
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![TensorShapeDimension::symbolic("N")],
         )],
     }
 }
@@ -1033,7 +1378,7 @@ fn build_attention_graph(
 mod tests {
     use super::*;
     use crate::proto::{data_type, tensor_shape_dimension, type_proto};
-    use nxpu_analysis::analyze::TensorRole;
+    use nxpu_analysis::analyze::{NormType, TensorRole};
     use nxpu_ir::Handle;
 
     fn dummy_handle() -> Handle<nxpu_ir::GlobalVariable> {
@@ -1202,6 +1547,9 @@ mod tests {
                 stride_w: 1,
                 pad_h: 0,
                 pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
             },
         };
         let model = build_model(&pattern, "conv2d", &[]).unwrap();
@@ -1287,6 +1635,7 @@ mod tests {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor("y", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
         let model = build_model(&pattern, "batchnorm", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
@@ -1356,6 +1705,9 @@ mod tests {
             stride_w: 1,
             pad_h: 0,
             pad_w: 0,
+            groups: 1,
+            dilation_h: 1,
+            dilation_w: 1,
         }
     }
 
@@ -1416,6 +1768,7 @@ mod tests {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor("bn_out", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
         let fused = FusedPattern::ConvBatchNorm {
             conv,
@@ -1733,6 +2086,7 @@ mod tests {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor("bn_out", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
         let conv_bn = FusedPattern::ConvBatchNorm {
             conv,
@@ -1898,6 +2252,7 @@ mod tests {
             bias: make_tensor("beta", TensorRole::Input),
             output: make_tensor("bn_out", TensorRole::Output),
             epsilon: 1e-5,
+            norm_type: NormType::Batch,
         };
         let fused = FusedPattern::ConvBatchNorm {
             conv,
