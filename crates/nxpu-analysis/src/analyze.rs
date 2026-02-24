@@ -321,14 +321,12 @@ pub enum KernelPattern {
         epsilon: f32,
     },
     /// Concatenation of multiple inputs along an axis.
-    // TODO: axis is always 0; infer actual concat axis from IR when possible.
     Concat {
         inputs: Vec<TensorBinding>,
         output: TensorBinding,
         axis: i64,
     },
     /// Split a single input into multiple outputs along an axis.
-    // TODO: axis is always 0; infer actual split axis from IR when possible.
     Split {
         input: TensorBinding,
         outputs: Vec<TensorBinding>,
@@ -517,10 +515,11 @@ pub fn classify_entry_point(
                 .iter()
                 .map(|(h, gv)| make_binding(module, *h, gv, TensorRole::Output))
                 .collect();
+            let axis = infer_split_axis(&ep.function.body, &ep.function.expressions, &shape_names);
             return Ok(KernelPattern::Split {
                 input,
                 outputs: out_bindings,
-                axis: 0,
+                axis,
             });
         }
 
@@ -658,10 +657,11 @@ pub fn classify_entry_point(
 
         // Concat: 2 inputs + no loop + has If + no binary store op
         if has_if && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none() {
+            let axis = infer_concat_axis(&ep.function.body, &ep.function.expressions, &shape_names);
             return Ok(KernelPattern::Concat {
                 inputs: vec![input_a, input_b],
                 output: output_c,
-                axis: 0,
+                axis,
             });
         }
 
@@ -955,6 +955,104 @@ fn scalar_to_onnx_data_type(scalar: &Scalar) -> i32 {
         (ScalarKind::Uint, 1) => data_type::UINT8,
         (ScalarKind::Bool, _) => data_type::BOOL,
         _ => data_type::FLOAT,
+    }
+}
+
+/// Normalize a potentially negative axis to a positive axis.
+///
+/// For example, `normalize_axis(-1, 4)` returns `3`.
+pub fn normalize_axis(axis: i64, ndim: usize) -> i64 {
+    if axis < 0 {
+        let ndim = ndim as i64;
+        ((axis % ndim) + ndim) % ndim
+    } else {
+        axis
+    }
+}
+
+/// Infer the concat axis from the If condition in the function body.
+///
+/// In WGSL concat patterns, the If condition checks whether the linear index
+/// falls before or after a boundary (e.g., `if idx < params.C1`). The boundary
+/// param name maps to a position in the params struct, which gives us the axis.
+fn infer_concat_axis(body: &[Statement], exprs: &Arena<Expression>, shape_names: &[String]) -> i64 {
+    find_if_comparison_axis(body, exprs, shape_names).unwrap_or(0)
+}
+
+/// Infer the split axis from the If condition in the function body.
+///
+/// Works identically to [`infer_concat_axis`]: the If condition compares
+/// against a params struct member whose index indicates the split axis.
+fn infer_split_axis(body: &[Statement], exprs: &Arena<Expression>, shape_names: &[String]) -> i64 {
+    find_if_comparison_axis(body, exprs, shape_names).unwrap_or(0)
+}
+
+/// Walk the statement tree to find an If whose condition is a comparison
+/// (Less, LessEqual, Greater, GreaterEqual) where one operand is an
+/// `AccessIndex` into the uniform params struct. The `index` field of
+/// `AccessIndex` gives the struct member position, which corresponds to
+/// the concat/split axis.
+fn find_if_comparison_axis(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    _shape_names: &[String],
+) -> Option<i64> {
+    for stmt in body {
+        match stmt {
+            Statement::If { condition, .. } => {
+                if let Some(Expression::Binary {
+                    op, left, right, ..
+                }) = exprs.try_get(*condition)
+                    && matches!(
+                        op,
+                        BinaryOp::Less
+                            | BinaryOp::LessEqual
+                            | BinaryOp::Greater
+                            | BinaryOp::GreaterEqual
+                    )
+                {
+                    // Check right operand first (most common: `idx < params.C1`)
+                    if let Some(idx) = extract_uniform_member_index(exprs, *right) {
+                        return Some(idx as i64);
+                    }
+                    if let Some(idx) = extract_uniform_member_index(exprs, *left) {
+                        return Some(idx as i64);
+                    }
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                if let Some(axis) = find_if_comparison_axis(body, exprs, _shape_names) {
+                    return Some(axis);
+                }
+                if let Some(axis) = find_if_comparison_axis(continuing, exprs, _shape_names) {
+                    return Some(axis);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract the struct member index from an expression that accesses a
+/// uniform params member.
+///
+/// Handles both direct `AccessIndex { base, index }` and
+/// `Load { pointer: AccessIndex { base, index } }` patterns, since
+/// different naga versions may emit either form.
+fn extract_uniform_member_index(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+) -> Option<u32> {
+    match exprs.try_get(handle)? {
+        Expression::AccessIndex { index, .. } => Some(*index),
+        Expression::Load { pointer } => match exprs.try_get(*pointer)? {
+            Expression::AccessIndex { index, .. } => Some(*index),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -2743,5 +2841,491 @@ mod tests {
 
         let weights = extract_embedded_weights(&module);
         assert!(weights.is_empty());
+    }
+
+    // --- Concat/Split axis inference tests ---
+
+    /// Build a concat-like module with 2 inputs, 1 output, and an If condition
+    /// that compares against `AccessIndex { base: params, index: boundary_index }`.
+    /// This simulates the IR that naga produces for `if c < params.C1`.
+    fn make_concat_module(boundary_index: u32, shape_names: &[&str]) -> Module {
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let array_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members: shape_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| StructMember {
+                        name: Some((*name).into()),
+                        ty: u32_ty,
+                        offset: (i * 4) as u32,
+                    })
+                    .collect(),
+                span: (shape_names.len() * 4) as u32,
+            },
+        });
+
+        // Input a (binding 0)
+        module.global_variables.append(GlobalVariable {
+            name: Some("a".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Input b (binding 1)
+        module.global_variables.append(GlobalVariable {
+            name: Some("b".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 1,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Output (binding 2)
+        module.global_variables.append(GlobalVariable {
+            name: Some("result".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 2,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Uniform params (binding 3)
+        module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 3,
+            }),
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Build function with If(idx < AccessIndex(params, boundary_index))
+        let mut func = Function::new("main");
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        // params GlobalVariable (handle index 3)
+        let params_gv = {
+            let mut iter = module.global_variables.iter();
+            iter.nth(3).unwrap().0
+        };
+        let params_expr = func
+            .expressions
+            .append(Expression::GlobalVariable(params_gv));
+        let access = func.expressions.append(Expression::AccessIndex {
+            base: params_expr,
+            index: boundary_index,
+        });
+        let load = func
+            .expressions
+            .append(Expression::Load { pointer: access });
+        let cmp = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Less,
+            left: idx,
+            right: load,
+        });
+
+        // If body: Store (accept), Store (reject)
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        let ptr = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        func.body.push(Statement::If {
+            condition: cmp,
+            accept: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+            reject: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [256, 1, 1],
+            function: func,
+        });
+
+        module
+    }
+
+    /// Build a split-like module with 1 input, 2 outputs, and an If condition
+    /// that compares against `AccessIndex { base: params, index: boundary_index }`.
+    fn make_split_module(boundary_index: u32, shape_names: &[&str]) -> Module {
+        let mut module = Module::default();
+
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let array_f32 = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Array {
+                base: f32_ty,
+                size: ArraySize::Dynamic,
+                stride: 4,
+            },
+        });
+        let params_ty = module.types.insert(Type {
+            name: Some("Params".into()),
+            inner: TypeInner::Struct {
+                members: shape_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| StructMember {
+                        name: Some((*name).into()),
+                        ty: u32_ty,
+                        offset: (i * 4) as u32,
+                    })
+                    .collect(),
+                span: (shape_names.len() * 4) as u32,
+            },
+        });
+
+        // Input (binding 0) - read-only storage
+        module.global_variables.append(GlobalVariable {
+            name: Some("input".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 0,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Output a (binding 1)
+        module.global_variables.append(GlobalVariable {
+            name: Some("out_a".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 1,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Output b (binding 2)
+        module.global_variables.append(GlobalVariable {
+            name: Some("out_b".into()),
+            space: AddressSpace::Storage {
+                access: StorageAccess::LOAD | StorageAccess::STORE,
+            },
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 2,
+            }),
+            ty: array_f32,
+            init: None,
+            layout: None,
+        });
+        // Uniform params (binding 3)
+        module.global_variables.append(GlobalVariable {
+            name: Some("params".into()),
+            space: AddressSpace::Uniform,
+            binding: Some(ResourceBinding {
+                group: 0,
+                binding: 3,
+            }),
+            ty: params_ty,
+            init: None,
+            layout: None,
+        });
+
+        // Build function with If(idx < AccessIndex(params, boundary_index))
+        let mut func = Function::new("main");
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let params_gv = {
+            let mut iter = module.global_variables.iter();
+            iter.nth(3).unwrap().0
+        };
+        let params_expr = func
+            .expressions
+            .append(Expression::GlobalVariable(params_gv));
+        let access = func.expressions.append(Expression::AccessIndex {
+            base: params_expr,
+            index: boundary_index,
+        });
+        let load = func
+            .expressions
+            .append(Expression::Load { pointer: access });
+        let cmp = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Less,
+            left: idx,
+            right: load,
+        });
+
+        let val = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        let ptr = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(0.0)));
+        func.body.push(Statement::If {
+            condition: cmp,
+            accept: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+            reject: vec![Statement::Store {
+                pointer: ptr,
+                value: val,
+            }],
+        });
+
+        module.entry_points.push(EntryPoint {
+            name: "main".into(),
+            workgroup_size: [256, 1, 1],
+            function: func,
+        });
+
+        module
+    }
+
+    #[test]
+    fn classify_concat_axis_0_default() {
+        // Concat with boundary at index 0 → axis = 0 (same as before).
+        let module = make_concat_module(0, &["N_a", "N_b"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Concat { axis, .. } => {
+                assert_eq!(*axis, 0, "expected axis 0 for boundary at index 0");
+            }
+            _ => panic!("expected Concat pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_concat_axis_1_inferred() {
+        // Concat with boundary at index 1 (params.C1) → axis = 1.
+        let module = make_concat_module(1, &["N", "C1", "C2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Concat {
+                axis,
+                inputs,
+                output,
+                ..
+            } => {
+                assert_eq!(*axis, 1, "expected axis 1 for boundary at index 1");
+                assert_eq!(inputs[0].name, "a");
+                assert_eq!(inputs[1].name, "b");
+                assert_eq!(output.name, "result");
+            }
+            _ => panic!("expected Concat pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_concat_axis_2_inferred() {
+        // Concat with boundary at index 2 → axis = 2.
+        let module = make_concat_module(2, &["N", "C", "W1", "W2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Concat { axis, .. } => {
+                assert_eq!(*axis, 2, "expected axis 2 for boundary at index 2");
+            }
+            _ => panic!("expected Concat pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_split_axis_0_default() {
+        // Split with boundary at index 0 → axis = 0.
+        let module = make_split_module(0, &["N_a", "N_b"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Split { axis, .. } => {
+                assert_eq!(*axis, 0, "expected axis 0 for boundary at index 0");
+            }
+            _ => panic!("expected Split pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_split_axis_1_inferred() {
+        // Split with boundary at index 1 (params.C1) → axis = 1.
+        let module = make_split_module(1, &["N", "C1", "C2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Split {
+                axis,
+                input,
+                outputs,
+                ..
+            } => {
+                assert_eq!(*axis, 1, "expected axis 1 for boundary at index 1");
+                assert_eq!(input.name, "input");
+                assert_eq!(outputs.len(), 2);
+                assert_eq!(outputs[0].name, "out_a");
+                assert_eq!(outputs[1].name, "out_b");
+            }
+            _ => panic!("expected Split pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_split_axis_2_inferred() {
+        // Split with boundary at index 2 → axis = 2.
+        let module = make_split_module(2, &["N", "C", "W1", "W2"]);
+        let pattern = classify_entry_point(&module, 0).unwrap();
+        match &pattern {
+            KernelPattern::Split { axis, .. } => {
+                assert_eq!(*axis, 2, "expected axis 2 for boundary at index 2");
+            }
+            _ => panic!("expected Split pattern, got {pattern:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_axis_positive() {
+        assert_eq!(normalize_axis(0, 3), 0);
+        assert_eq!(normalize_axis(1, 4), 1);
+        assert_eq!(normalize_axis(2, 4), 2);
+    }
+
+    #[test]
+    fn normalize_axis_negative() {
+        assert_eq!(normalize_axis(-1, 4), 3);
+        assert_eq!(normalize_axis(-2, 4), 2);
+        assert_eq!(normalize_axis(-3, 4), 1);
+        assert_eq!(normalize_axis(-4, 4), 0);
+    }
+
+    #[test]
+    fn normalize_axis_negative_wraps() {
+        // -1 with ndim 3 → 2
+        assert_eq!(normalize_axis(-1, 3), 2);
+        // -2 with ndim 3 → 1
+        assert_eq!(normalize_axis(-2, 3), 1);
+    }
+
+    #[test]
+    fn find_if_comparison_axis_direct_access_index() {
+        // Test that find_if_comparison_axis works with direct AccessIndex
+        // (without Load wrapper).
+        let mut func = Function::new("test");
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let base = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let access = func
+            .expressions
+            .append(Expression::AccessIndex { base, index: 2 });
+        let cmp = func.expressions.append(Expression::Binary {
+            op: BinaryOp::Less,
+            left: idx,
+            right: access,
+        });
+
+        let body = vec![Statement::If {
+            condition: cmp,
+            accept: vec![],
+            reject: vec![],
+        }];
+        let names: Vec<String> = vec!["N".into(), "C".into(), "W".into()];
+        let result = find_if_comparison_axis(&body, &func.expressions, &names);
+        assert_eq!(result, Some(2));
+    }
+
+    #[test]
+    fn find_if_comparison_axis_in_loop() {
+        // Test that the function searches into Loop bodies.
+        let mut func = Function::new("test");
+        let idx = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let base = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let access = func
+            .expressions
+            .append(Expression::AccessIndex { base, index: 1 });
+        let load = func
+            .expressions
+            .append(Expression::Load { pointer: access });
+        let cmp = func.expressions.append(Expression::Binary {
+            op: BinaryOp::LessEqual,
+            left: idx,
+            right: load,
+        });
+
+        let body = vec![Statement::Loop {
+            body: vec![Statement::If {
+                condition: cmp,
+                accept: vec![],
+                reject: vec![],
+            }],
+            continuing: vec![],
+            break_if: None,
+        }];
+        let names: Vec<String> = vec!["N".into(), "C".into()];
+        let result = find_if_comparison_axis(&body, &func.expressions, &names);
+        assert_eq!(result, Some(1));
+    }
+
+    #[test]
+    fn find_if_comparison_axis_no_if_returns_none() {
+        let func = Function::new("test");
+        let body = vec![Statement::Break];
+        let names: Vec<String> = vec!["N".into()];
+        let result = find_if_comparison_axis(&body, &func.expressions, &names);
+        assert_eq!(result, None);
     }
 }
