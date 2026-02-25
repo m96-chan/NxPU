@@ -109,11 +109,9 @@ pub fn calculate_occupancy(
     // How many workgroups can fit based on register pressure?
     let total_regs_per_group = regs_per_thread * threads;
     let total_regs_available = hw.registers_per_thread * hw.warp_size * hw.max_warps_per_cu;
-    let groups_by_regs = if total_regs_per_group == 0 {
-        hw.max_warps_per_cu / warps_per_group.max(1)
-    } else {
-        total_regs_available / total_regs_per_group
-    };
+    let groups_by_regs = total_regs_available
+        .checked_div(total_regs_per_group)
+        .unwrap_or(hw.max_warps_per_cu / warps_per_group.max(1));
 
     let max_concurrent_groups = groups_by_mem.min(groups_by_regs);
     let active_warps = max_concurrent_groups * warps_per_group;

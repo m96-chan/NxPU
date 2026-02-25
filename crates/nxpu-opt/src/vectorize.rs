@@ -24,11 +24,7 @@ impl VectorWidth {
     /// Compute the number of lanes that fit in a register of the given bit width.
     pub fn for_register_width(scalar: Scalar, register_bits: u32) -> Self {
         let scalar_bits = scalar_width_bits(scalar);
-        let lanes = if scalar_bits > 0 {
-            register_bits / scalar_bits
-        } else {
-            1
-        };
+        let lanes = (register_bits).checked_div(scalar_bits).unwrap_or(1);
         Self {
             scalar,
             lanes,
