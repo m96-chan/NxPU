@@ -113,6 +113,16 @@ pub struct BackendOptions {
     /// ONNX backends inject QuantizeLinear/DequantizeLinear (QDQ) nodes,
     /// TFLite backends include them in the companion JSON.
     pub per_channel_params: Vec<PerChannelParam>,
+    /// Tiling plans computed by the tiling pass.
+    ///
+    /// Backends may use these to emit cache-blocking metadata or
+    /// generate tiled loop structures.
+    pub tiling_plans: Vec<TilingPlanInfo>,
+    /// Vectorization hints computed by the vectorization pass.
+    ///
+    /// Backends may use these to emit SIMD annotations or select
+    /// vector instruction widths.
+    pub vectorization_hints: Vec<VectorizationHintInfo>,
 }
 
 /// A per-tensor quantization parameter entry.
@@ -137,6 +147,32 @@ pub struct PerChannelParam {
     pub zero_points: Vec<i32>,
     /// The axis along which channels are quantized (typically 0 for output channels).
     pub channel_axis: u32,
+}
+
+/// A tiling plan passed through to backends.
+#[derive(Clone, Debug)]
+pub struct TilingPlanInfo {
+    /// Operation name.
+    pub op_name: String,
+    /// Tile dimension configurations.
+    pub tiles: Vec<(String, u32)>,
+    /// Cache reuse factor.
+    pub reuse_factor: f64,
+}
+
+/// A vectorization hint passed through to backends.
+#[derive(Clone, Debug)]
+pub struct VectorizationHintInfo {
+    /// Operation name.
+    pub op_name: String,
+    /// Dimension name to vectorize.
+    pub dim_name: String,
+    /// Number of SIMD lanes.
+    pub lanes: u32,
+    /// Whether this is a reduction dimension.
+    pub is_reduction: bool,
+    /// Whether memory access is contiguous.
+    pub is_contiguous: bool,
 }
 
 impl fmt::Display for BackendOptions {
