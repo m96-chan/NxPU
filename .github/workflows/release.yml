@@ -66,7 +66,7 @@ jobs:
           7z a ../../../nxpu-${{ matrix.target }}.zip nxpu.exe
         shell: bash
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: nxpu-${{ matrix.target }}
           path: nxpu-${{ matrix.target }}.*
