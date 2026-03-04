@@ -657,17 +657,14 @@ fn is_causal_guard(
 fn block_stores_large_negative(body: &[Statement], exprs: &Arena<Expression>) -> bool {
     for stmt in body {
         match stmt {
-            Statement::Store { value, .. } => {
-                if expr_is_large_negative(*value, exprs) {
-                    return true;
-                }
+            Statement::Store { value, .. } if expr_is_large_negative(*value, exprs) => {
+                return true;
             }
-            Statement::If { accept, reject, .. } => {
+            Statement::If { accept, reject, .. }
                 if block_stores_large_negative(accept, exprs)
-                    || block_stores_large_negative(reject, exprs)
-                {
-                    return true;
-                }
+                    || block_stores_large_negative(reject, exprs) =>
+            {
+                return true;
             }
             _ => {}
         }
@@ -1600,26 +1597,21 @@ fn find_store_math_fun(
 ) -> bool {
     for stmt in body {
         match stmt {
-            Statement::Store { value, .. } => {
-                if contains_math_fun(exprs, *value, target) {
-                    return true;
-                }
+            Statement::Store { value, .. } if contains_math_fun(exprs, *value, target) => {
+                return true;
             }
-            Statement::If { accept, reject, .. } => {
+            Statement::If { accept, reject, .. }
                 if find_store_math_fun(accept, exprs, target)
-                    || find_store_math_fun(reject, exprs, target)
-                {
-                    return true;
-                }
+                    || find_store_math_fun(reject, exprs, target) =>
+            {
+                return true;
             }
             Statement::Loop {
                 body, continuing, ..
-            } => {
-                if find_store_math_fun(body, exprs, target)
-                    || find_store_math_fun(continuing, exprs, target)
-                {
-                    return true;
-                }
+            } if find_store_math_fun(body, exprs, target)
+                || find_store_math_fun(continuing, exprs, target) =>
+            {
+                return true;
             }
             _ => {}
         }
@@ -1655,21 +1647,18 @@ fn find_store_binary_divide(body: &[Statement], exprs: &Arena<Expression>) -> bo
                     return true;
                 }
             }
-            Statement::If { accept, reject, .. } => {
+            Statement::If { accept, reject, .. }
                 if find_store_binary_divide(accept, exprs)
-                    || find_store_binary_divide(reject, exprs)
-                {
-                    return true;
-                }
+                    || find_store_binary_divide(reject, exprs) =>
+            {
+                return true;
             }
             Statement::Loop {
                 body, continuing, ..
-            } => {
-                if find_store_binary_divide(body, exprs)
-                    || find_store_binary_divide(continuing, exprs)
-                {
-                    return true;
-                }
+            } if find_store_binary_divide(body, exprs)
+                || find_store_binary_divide(continuing, exprs) =>
+            {
+                return true;
             }
             _ => {}
         }
