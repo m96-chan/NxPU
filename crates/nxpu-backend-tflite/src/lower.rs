@@ -20,6 +20,36 @@ use crate::schema::{
 /// File identifier for TFLite FlatBuffer files.
 const TFLITE_FILE_ID: &str = "TFL3";
 
+/// Concrete extent written for a dimension the kernel leaves symbolic.
+///
+/// A WGSL kernel over `array<f32>` carries no length, so most dimensions here
+/// are unknown at compile time. TFLite has a place for that — `shape_signature`
+/// — but `shape` itself must be concrete: a negative value there makes
+/// `BytesRequired` overflow, and the interpreter refuses to be constructed at
+/// all, on any device, delegate or not.
+///
+/// Every model this backend emitted before this constant existed carried `-1`
+/// in `shape` and so could never be loaded by anything. The suite did not
+/// notice because it checked that the file began with `TFL3` and stopped.
+const SYMBOLIC_EXTENT: i32 = 1;
+
+/// Create a `Tensor.shape` vector, replacing symbolic dimensions with
+/// [`SYMBOLIC_EXTENT`].
+///
+/// Every shape written into a tensor goes through here, so a `-1` arriving
+/// from any of the pattern builders is normalised in one place rather than at
+/// each of the thirteen sites that build one.
+fn shape_vector<'a>(
+    fbb: &mut FlatBufferBuilder<'a>,
+    dims: &[i32],
+) -> flatbuffers::WIPOffset<flatbuffers::Vector<'a, i32>> {
+    let concrete: Vec<i32> = dims
+        .iter()
+        .map(|&d| if d < 0 { SYMBOLIC_EXTENT } else { d })
+        .collect();
+    fbb.create_vector(&concrete)
+}
+
 /// Build a TFLite FlatBuffer model from a classified kernel pattern.
 pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
     let bytes = match pattern {
@@ -268,7 +298,7 @@ fn build_from_graph_desc(desc: &GraphDesc) -> Vec<u8> {
     let shape_offsets: Vec<_> = desc
         .tensors
         .iter()
-        .map(|t| fbb.create_vector(&t.shape))
+        .map(|t| shape_vector(&mut fbb, &t.shape))
         .collect();
 
     // --- op input/output index vectors ---
@@ -1128,7 +1158,7 @@ fn build_tflite(
     let sg_name = fbb.create_string(graph_name);
 
     // Shape vectors
-    let shape_vecs: Vec<_> = shapes.iter().map(|s| fbb.create_vector(s)).collect();
+    let shape_vecs: Vec<_> = shapes.iter().map(|s| shape_vector(&mut fbb, s)).collect();
 
     // Operator input/output index vectors
     let input_indices: Vec<i32> = (0..inputs.len() as i32).collect();
@@ -1242,8 +1272,8 @@ fn build_tflite_unary(
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string(graph_name);
 
-    let shape_in = fbb.create_vector(in_shape);
-    let shape_out = fbb.create_vector(out_shape);
+    let shape_in = shape_vector(&mut fbb, in_shape);
+    let shape_out = shape_vector(&mut fbb, out_shape);
 
     let op_inputs = fbb.create_vector(&[0i32]);
     let op_outputs = fbb.create_vector(&[1i32]);
@@ -1345,8 +1375,8 @@ fn build_tflite_batchnorm(
     let sg_name = fbb.create_string("batchnorm");
 
     // Shapes
-    let shape_nd = fbb.create_vector(&[-1i32, -1, -1, -1]);
-    let shape_1d = fbb.create_vector(&[-1i32]);
+    let shape_nd = shape_vector(&mut fbb, &[-1i32, -1, -1, -1]);
+    let shape_1d = shape_vector(&mut fbb, &[-1i32]);
 
     // Buffers: sentinel + input(1) + scale(2) + bias(3) + mul_result(4) + output(5)
     let mut buffer_offsets = Vec::new();
@@ -1489,8 +1519,8 @@ fn build_tflite_softmax(input: &TensorBinding, output: &TensorBinding) -> Vec<u8
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("softmax_1d");
 
-    let shape_in = fbb.create_vector(&[-1i32]);
-    let shape_out = fbb.create_vector(&[-1i32]);
+    let shape_in = shape_vector(&mut fbb, &[-1i32]);
+    let shape_out = shape_vector(&mut fbb, &[-1i32]);
 
     let op_inputs = fbb.create_vector(&[0i32]);
     let op_outputs = fbb.create_vector(&[1i32]);
@@ -1603,7 +1633,7 @@ fn build_tflite_conv2d(
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("conv2d");
 
-    let shape_4d = fbb.create_vector(&[-1i32, -1, -1, -1]);
+    let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1]);
 
     let op_inputs = fbb.create_vector(&[0i32, 1]);
     let op_outputs = fbb.create_vector(&[2i32]);
@@ -1729,7 +1759,7 @@ fn build_tflite_pool(
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string(graph_name);
 
-    let shape_4d = fbb.create_vector(&[-1i32, -1, -1, -1]);
+    let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1]);
 
     let op_inputs = fbb.create_vector(&[0i32]);
     let op_outputs = fbb.create_vector(&[1i32]);
@@ -1871,7 +1901,7 @@ fn build_tflite_attention(
     let sg_name = fbb.create_string("attention");
 
     // Shapes
-    let shape_2d = fbb.create_vector(&[-1i32, -1]);
+    let shape_2d = shape_vector(&mut fbb, &[-1i32, -1]);
     let shape_scalar = fbb.create_vector(&[1i32]);
 
     let qtype = onnx_to_tflite_type(query.elem_type);
@@ -2121,7 +2151,7 @@ fn build_tflite_concat(inputs: &[TensorBinding], output: &TensorBinding, axis: i
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("concat");
 
-    let shape_1d = fbb.create_vector(&[-1i32]);
+    let shape_1d = shape_vector(&mut fbb, &[-1i32]);
 
     let num_tensors = inputs.len() + 1; // inputs + output
     let mut buffer_offsets = Vec::new();
@@ -2244,8 +2274,8 @@ fn build_tflite_split(input: &TensorBinding, outputs: &[TensorBinding], axis: i6
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("split");
 
-    let shape_in = fbb.create_vector(&[-1i32]);
-    let shape_out = fbb.create_vector(&[-1i32]);
+    let shape_in = shape_vector(&mut fbb, &[-1i32]);
+    let shape_out = shape_vector(&mut fbb, &[-1i32]);
     let shape_scalar = fbb.create_vector::<i32>(&[]);
 
     // Buffer for axis constant: little-endian i32
