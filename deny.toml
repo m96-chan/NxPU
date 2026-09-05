@@ -19,7 +19,6 @@ allow = [
 [advisories]
 ignore = [
     # paste is unmaintained but pulled transitively by tract; no fix available
-    "RUSTSEC-2024-0436",
 ]
 
 [bans]
