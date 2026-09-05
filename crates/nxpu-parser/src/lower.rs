@@ -146,6 +146,11 @@ impl LowerCtx<'_> {
                     span,
                 })
             }
+            // naga 29 added cooperative matrices — subgroup-level matrix
+            // primitives. They map onto the same hardware an NPU backend
+            // targets, so this is a rejection worth revisiting rather than a
+            // permanent one.
+            naga::TypeInner::CooperativeMatrix { .. } => Err(unsupported("CooperativeMatrix type")),
             naga::TypeInner::Image { .. } => Err(unsupported("Image type")),
             naga::TypeInner::Sampler { .. } => Err(unsupported("Sampler type")),
             naga::TypeInner::AccelerationStructure { .. } => {
@@ -521,6 +526,12 @@ impl LowerCtx<'_> {
                 self.map_func_expr(fctx, expr)?,
             )),
             // Unsupported expression kinds
+            naga::Expression::CooperativeLoad { .. } => {
+                Err(unsupported("CooperativeLoad expression"))
+            }
+            naga::Expression::CooperativeMultiplyAdd { .. } => {
+                Err(unsupported("CooperativeMultiplyAdd expression"))
+            }
             naga::Expression::Derivative { .. } => Err(unsupported("Derivative expression")),
             naga::Expression::Relational { .. } => Err(unsupported("Relational expression")),
             naga::Expression::ImageSample { .. } => Err(unsupported("ImageSample expression")),
@@ -760,6 +771,12 @@ impl LowerCtx<'_> {
             }
             // Unsupported statements
             naga::Statement::Switch { .. } => return Err(unsupported("Switch statement")),
+            naga::Statement::CooperativeStore { .. } => {
+                return Err(unsupported("CooperativeStore statement"));
+            }
+            naga::Statement::RayPipelineFunction(_) => {
+                return Err(unsupported("RayPipelineFunction statement"));
+            }
             naga::Statement::Kill => return Err(unsupported("Kill statement")),
             naga::Statement::ImageStore { .. } => return Err(unsupported("ImageStore statement")),
             naga::Statement::ImageAtomic { .. } => {
