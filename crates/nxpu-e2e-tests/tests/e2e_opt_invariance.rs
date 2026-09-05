@@ -201,6 +201,77 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// A row softmax, written as two reduction loops and a normalising pass rather
+/// than the workgroup tree `vendor/web-xpu-ops` uses. Recognition looks for an
+/// `exp` accumulated in a loop and an `exp` stored over a divide, and both
+/// halves are things the optimizer rewrites around: the accumulation is an add
+/// in a loop, and `exp(..) / total` here is the reciprocal-multiply spelling's
+/// twin.
+const SOFTMAX: &str = r#"
+struct Params { N: u32, D: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= params.N) { return; }
+  let base = row * params.D;
+  var row_max = input[base];
+  for (var c = 1u; c < params.D; c += 1u) { row_max = max(row_max, input[base + c]); }
+  var total = 0.0;
+  for (var c = 0u; c < params.D; c += 1u) { total += exp(input[base + c] - row_max); }
+  for (var c = 0u; c < params.D; c += 1u) {
+    output[base + c] = exp(input[base + c] - row_max) / total;
+  }
+}
+"#;
+
+/// One input, two outputs, and neither of them a slice of it — an activation
+/// quantizer's codes and per-row scales, cut down. The multi-output arm has to
+/// refuse it identically at every level, reason included.
+const QUANTIZE: &str = r#"
+struct Params { N: u32, D: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<i32>;
+@group(0) @binding(2) var<storage, read_write> scales: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= params.N) { return; }
+  let base = row * params.D;
+  var absmax = 0.0;
+  for (var c = 0u; c < params.D; c += 1u) { absmax = max(absmax, abs(input[base + c])); }
+  scales[row] = absmax / 127.0;
+  let inv_scale = 127.0 / absmax;
+  for (var c = 0u; c < params.D; c += 1u) {
+    output[base + c] = clamp(i32(round(input[base + c] * inv_scale)), -127, 127);
+  }
+}
+"#;
+
+/// The split `examples/split.wgsl` compiles, kept here so that tightening the
+/// multi-output arm around the quantizer above is checked against the op it
+/// still has to accept.
+const SPLIT: &str = r#"
+struct Params { N: u32, split_at: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out_a: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out_b: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.N) { return; }
+  if (idx < params.split_at) {
+    out_a[idx] = input[idx];
+  } else {
+    out_b[idx - params.split_at] = input[idx];
+  }
+}
+"#;
+
 const KERNELS: &[(&str, &str)] = &[
     ("axpy", AXPY),
     ("alibi", ALIBI),
@@ -211,6 +282,9 @@ const KERNELS: &[(&str, &str)] = &[
     ("matmul", MATMUL),
     ("relu", RELU),
     ("gelu", GELU),
+    ("softmax", SOFTMAX),
+    ("quantize", QUANTIZE),
+    ("split", SPLIT),
 ];
 
 #[test]
