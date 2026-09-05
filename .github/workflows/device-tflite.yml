@@ -200,18 +200,34 @@ jobs:
             exit 1
           fi
           python3 - <<'PY'
-          import struct
-          load = lambda p: struct.unpack(f"<{len(open(p,'rb').read())//4}f", open(p,'rb').read())
-          want, got = load("model/expected-0.bin"), load("device/device-out/output-0.bin")
+          import struct, collections
+          read = lambda p: open(p, "rb").read()
+          floats = lambda b: struct.unpack(f"<{len(b)//4}f", b)
+          words = lambda b: struct.unpack(f"<{len(b)//4}I", b)
+          we, ge = read("model/expected-0.bin"), read("device/device-out/output-0.bin")
+          want, got = floats(we), floats(ge)
           if len(want) != len(got):
               raise SystemExit(f"length: expected {len(want)}, device returned {len(got)}")
-          worst = max((abs(w - g), i, w, g) for i, (w, g) in enumerate(zip(want, got)))
-          d, i, w, g = worst
-          print(f"{len(want)} elements, worst absolute difference {d:g} at index {i} "
-                f"(expected {w:g}, device {g:g})")
-          # f32 elementwise add on any sane accelerator should be exact or near
-          # it; a loose bound here would hide the bug this exists to find.
-          if d > 1e-5:
-              raise SystemExit("outside tolerance")
+
+          # Compared in ULP rather than absolute difference. An absolute bound
+          # cannot work across magnitudes: the first version of this passed at
+          # 1.0 and failed at 256.75 for deviations that were the same size in
+          # the only unit that matters.
+          ulp = [g - w for w, g in zip(words(we), words(ge))]
+          histogram = dict(sorted(collections.Counter(ulp).items()))
+          worst = max(abs(u) for u in ulp)
+          print(f"{len(want)} elements, ULP difference histogram: {histogram}")
+          i = max(range(len(ulp)), key=lambda i: abs(ulp[i]))
+          print(f"worst at index {i}: expected {want[i]!r}, device {got[i]!r}")
+
+          # This accelerator is not bit-exact for f32 and the deviation has a
+          # direction, so the bound is a tolerance rather than equality. It is
+          # deliberately tight: 1 ULP is what has been observed, and a looser
+          # bound would stop reporting the day it grows.
+          if worst > 1:
+              raise SystemExit(f"outside tolerance: {worst} ULP")
+          if any(u != 0 for u in ulp):
+              print(f"::notice::within tolerance, but not exact: "
+                    f"{sum(1 for u in ulp if u)} of {len(ulp)} elements differ by 1 ULP")
           print("within tolerance")
           PY
