@@ -800,7 +800,11 @@ pub fn classify_entry_point(
             }
 
             // ElementWise with embedded weight: 1 storage input + binary op + private init global.
-            let ew_op = find_store_binary_op(&ep.function.body, &ep.function.expressions);
+            let ew_op = match find_store_value_op(&ep.function.body, &ep.function.expressions) {
+                Some(StoreValueOp::Binary(op)) => Some(op),
+                // A multiply-add is not an element-wise binary op; fall through.
+                Some(StoreValueOp::MultiplyAdd) | None => None,
+            };
             if let (Some(ew_op), Some(&(wh, wgv))) = (ew_op, init_globals.first()) {
                 let weight = make_binding(module, wh, wgv, TensorRole::Input);
                 let dim_name = shape_names.first().cloned().unwrap_or_else(|| "N".into());
@@ -978,7 +982,7 @@ pub fn classify_entry_point(
             || input_b.elem_type == data_type::INT32
             || input_b.elem_type == data_type::INT64;
         if second_is_int
-            && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none()
+            && find_store_value_op(&ep.function.body, &ep.function.expressions).is_none()
             && !has_structural_if
         {
             return Ok(KernelPattern::Gather {
@@ -991,7 +995,7 @@ pub fn classify_entry_point(
 
         // Concat: 2 inputs + no loop + has If + no binary store op
         if has_structural_if
-            && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none()
+            && find_store_value_op(&ep.function.body, &ep.function.expressions).is_none()
         {
             let axis = infer_concat_axis(&ep.function.body, &ep.function.expressions, &shape_names);
             return Ok(KernelPattern::Concat {
@@ -1002,10 +1006,25 @@ pub fn classify_entry_point(
         }
 
         // ElementWise: store of binary operation.
-        let op =
-            find_store_binary_op(&ep.function.body, &ep.function.expressions).ok_or_else(|| {
-                AnalysisError::UnsupportedPattern("no recognizable binary operation found".into())
-            })?;
+        let op = match find_store_value_op(&ep.function.body, &ep.function.expressions) {
+            Some(StoreValueOp::Binary(op)) => op,
+            // `y + a * x` is not an add — the multiply has nowhere to go in a
+            // two-operand `ElementWise`, and reporting `Add` would silently
+            // drop it. Say what was found instead, and say it identically
+            // whether or not FMA fusion has already rewritten the expression.
+            Some(StoreValueOp::MultiplyAdd) => {
+                return Ok(KernelPattern::Unknown {
+                    reason: "fused multiply-add (`c + a * b`, or `fma(a, b, c)` after \
+                             optimization): a three-operand op with no element-wise equivalent"
+                        .into(),
+                });
+            }
+            None => {
+                return Err(AnalysisError::UnsupportedPattern(
+                    "no recognizable binary operation found".into(),
+                ));
+            }
+        };
 
         let dim_name = shape_names.first().cloned().unwrap_or_else(|| "N".into());
 
@@ -1451,28 +1470,40 @@ fn has_loop(body: &[Statement]) -> bool {
     })
 }
 
-/// Search a block for a Store whose value is a Binary expression,
-/// returning the corresponding element-wise op.
-fn find_store_binary_op(body: &[Statement], exprs: &Arena<Expression>) -> Option<ElementWiseOp> {
+/// What the value expression of a `Store` computes, as far as element-wise
+/// classification is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreValueOp {
+    /// A plain two-operand binary op: `a + b`, `a - b`, `a * b`, `a / b`.
+    Binary(ElementWiseOp),
+    /// A three-operand multiply-add, in either of the two spellings this
+    /// pipeline can produce for it: `c + a * b` as the kernel author wrote it,
+    /// or `fma(a, b, c)` after `nxpu-opt`'s FMA fusion pass has rewritten it.
+    ///
+    /// It is deliberately *not* mapped onto [`ElementWiseOp::Add`]. Calling it
+    /// an add discards the multiply, which is how `axpy` — `y + a * x` — used
+    /// to classify as a bare `Add` at `--opt-level 0` and then fail outright at
+    /// `--opt-level 1` once fusion had rewritten it. Naming the shape here lets
+    /// the classifier give the same answer at every optimization level, and
+    /// leaves a single place to add a real three-operand pattern later.
+    MultiplyAdd,
+}
+
+/// Search a block for a Store whose value is a recognizable arithmetic
+/// expression, returning what kind it is.
+fn find_store_value_op(body: &[Statement], exprs: &Arena<Expression>) -> Option<StoreValueOp> {
     for stmt in body {
         match stmt {
             Statement::Store { value, .. } => {
-                if let Some(Expression::Binary { op, .. }) = exprs.try_get(*value) {
-                    let ew = match op {
-                        BinaryOp::Add => ElementWiseOp::Add,
-                        BinaryOp::Subtract => ElementWiseOp::Sub,
-                        BinaryOp::Multiply => ElementWiseOp::Mul,
-                        BinaryOp::Divide => ElementWiseOp::Div,
-                        _ => continue,
-                    };
-                    return Some(ew);
+                if let Some(op) = classify_store_value_op(exprs, *value) {
+                    return Some(op);
                 }
             }
             Statement::If { accept, reject, .. } => {
-                if let Some(op) = find_store_binary_op(accept, exprs) {
+                if let Some(op) = find_store_value_op(accept, exprs) {
                     return Some(op);
                 }
-                if let Some(op) = find_store_binary_op(reject, exprs) {
+                if let Some(op) = find_store_value_op(reject, exprs) {
                     return Some(op);
                 }
             }
@@ -1480,6 +1511,52 @@ fn find_store_binary_op(body: &[Statement], exprs: &Arena<Expression>) -> Option
         }
     }
     None
+}
+
+/// Classify a single stored value expression.
+fn classify_store_value_op(
+    exprs: &Arena<Expression>,
+    value: Handle<Expression>,
+) -> Option<StoreValueOp> {
+    match exprs.try_get(value)? {
+        // What FMA fusion leaves behind.
+        Expression::Math {
+            fun: MathFunction::Fma,
+            ..
+        } => Some(StoreValueOp::MultiplyAdd),
+        Expression::Binary { op, left, right } => {
+            let ew = match op {
+                // The same three-operand op before fusion. Only `Add` is
+                // checked because only `Add` is what FmaFusion rewrites; a
+                // `Subtract` over multiplies (rope's rotation, say) stays a
+                // `Subtract` at every level and needs no special case.
+                BinaryOp::Add => {
+                    if expr_is_multiply(exprs, *left) || expr_is_multiply(exprs, *right) {
+                        return Some(StoreValueOp::MultiplyAdd);
+                    }
+                    ElementWiseOp::Add
+                }
+                BinaryOp::Subtract => ElementWiseOp::Sub,
+                BinaryOp::Multiply => ElementWiseOp::Mul,
+                BinaryOp::Divide => ElementWiseOp::Div,
+                _ => return None,
+            };
+            Some(StoreValueOp::Binary(ew))
+        }
+        _ => None,
+    }
+}
+
+/// Whether an expression is directly a multiplication — the operand shape
+/// FMA fusion looks for.
+fn expr_is_multiply(exprs: &Arena<Expression>, handle: Handle<Expression>) -> bool {
+    matches!(
+        exprs.try_get(handle),
+        Some(Expression::Binary {
+            op: BinaryOp::Multiply,
+            ..
+        })
+    )
 }
 
 /// Search for a Store whose value is a Math expression, detecting activation type.
@@ -1596,7 +1673,23 @@ fn contains_binary_op(
                 || contains_binary_op(exprs, *left, target)
                 || contains_binary_op(exprs, *right, target)
         }
-        Some(Expression::Math { arg, .. }) => contains_binary_op(exprs, *arg, target),
+        Some(Expression::Math {
+            fun,
+            arg,
+            arg1,
+            arg2,
+            arg3,
+        }) => {
+            // `fma(a, b, c)` is a multiply and an add wearing one name. Say so,
+            // or a pattern that asks "is there a multiply in here?" changes its
+            // answer the moment FMA fusion runs.
+            (*fun == MathFunction::Fma && matches!(target, BinaryOp::Multiply | BinaryOp::Add))
+                || contains_binary_op(exprs, *arg, target)
+                || [*arg1, *arg2, *arg3]
+                    .into_iter()
+                    .flatten()
+                    .any(|h| contains_binary_op(exprs, h, target))
+        }
         Some(Expression::Unary { expr, .. }) => contains_binary_op(exprs, *expr, target),
         _ => false,
     }
@@ -1609,8 +1702,21 @@ fn contains_math_fun(
     target: MathFunction,
 ) -> bool {
     match exprs.try_get(handle) {
-        Some(Expression::Math { fun, arg, .. }) => {
-            *fun == target || contains_math_fun(exprs, *arg, target)
+        Some(Expression::Math {
+            fun,
+            arg,
+            arg1,
+            arg2,
+            arg3,
+        }) => {
+            // All operands, not just the first: `fma` carries two more, and
+            // anything fused into them was invisible to this walk before.
+            *fun == target
+                || contains_math_fun(exprs, *arg, target)
+                || [*arg1, *arg2, *arg3]
+                    .into_iter()
+                    .flatten()
+                    .any(|h| contains_math_fun(exprs, h, target))
         }
         Some(Expression::Binary { left, right, .. }) => {
             contains_math_fun(exprs, *left, target) || contains_math_fun(exprs, *right, target)
