@@ -819,8 +819,13 @@ pub fn classify_entry_point(
         }
 
         // Has loop + single input → Pool or Reduce
-        if shape_names.len() >= 4 {
-            // Pool pattern: many spatial params
+        //
+        // "Four or more parameters" is not evidence of pooling. A pool has a
+        // spatial window, so the loop bounds have to be there; without them
+        // the kernel size was invented as 2x2 and the stride copied from it,
+        // and a reduction over a 4-parameter tensor came back as AveragePool.
+        let pool_bounds = extract_loop_bound_literals(&ep.function.body, &ep.function.expressions);
+        if shape_names.len() >= 4 && !pool_bounds.is_empty() {
             let pool_kind = if find_store_math_fun(
                 &ep.function.body,
                 &ep.function.expressions,
@@ -830,9 +835,9 @@ pub fn classify_entry_point(
             } else {
                 PoolKind::Avg
             };
-            let bounds = extract_loop_bound_literals(&ep.function.body, &ep.function.expressions);
+            let bounds = pool_bounds;
             let strides = extract_multiply_literals(&ep.function.expressions);
-            let kh_u = bounds.first().copied().unwrap_or(2);
+            let kh_u = bounds[0];
             let kw_u = bounds.get(1).copied().unwrap_or(kh_u);
             let sh_u = strides.first().copied().unwrap_or(kh_u);
             let sw_u = strides.get(1).copied().unwrap_or(sh_u);
@@ -1018,6 +1023,13 @@ pub fn classify_entry_point(
     }
 
     // 2 inputs + loop: Conv2D (many params) vs MatMul (3 params)
+    //
+    // The parameter count is the only evidence here and it is not enough:
+    // rmsnorm, an inverse STFT and attention scores all land in this arm and
+    // are reported as CONV_2D. Requiring literal loop bounds was tried and is
+    // wrong in the other direction — a conv whose kernel size comes from
+    // params has none. Distinguishing these needs the conv recogniser to look
+    // at what the kernel does, not at how many numbers it was handed.
     if shape_names.len() > 3 {
         let conv_shape = extract_conv2d_shape(
             &shape_names,
@@ -1033,18 +1045,24 @@ pub fn classify_entry_point(
     }
 
     // MatMul: loop + accumulation pattern.
-    let shape = if shape_names.len() >= 3 {
-        MatMulShape {
-            m: shape_names[0].clone(),
-            n: shape_names[1].clone(),
-            k: shape_names[2].clone(),
-        }
-    } else {
-        MatMulShape {
-            m: "M".into(),
-            n: "N".into(),
-            k: "K".into(),
-        }
+    //
+    // The dimensions have to come from the kernel. Inventing M, N and K when
+    // the params struct does not name three of them meant every two-input
+    // looping kernel became a matmul over dimensions nobody had established —
+    // a scatter, among others.
+    if shape_names.len() < 3 {
+        return Ok(KernelPattern::Unknown {
+            reason: format!(
+                "2 inputs and a loop, but {} shape parameters — too few to \
+                 establish a matmul's M, N and K",
+                shape_names.len()
+            ),
+        });
+    }
+    let shape = MatMulShape {
+        m: shape_names[0].clone(),
+        n: shape_names[1].clone(),
+        k: shape_names[2].clone(),
     };
 
     Ok(KernelPattern::MatMul {
