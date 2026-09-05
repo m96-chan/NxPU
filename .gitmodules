@@ -1,0 +1,3 @@
+[submodule "vendor/web-xpu-ops"]
+	path = vendor/web-xpu-ops
+	url = https://github.com/m96-chan/web-xpu-ops.git
