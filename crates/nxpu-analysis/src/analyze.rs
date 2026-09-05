@@ -954,6 +954,7 @@ pub fn classify_entry_point(
                     MathFunction::InverseSqrt,
                 ))
             && !has_math_function_in_expressions(&ep.function.expressions, MathFunction::Exp)
+            && !has_nested_loop(&ep.function.body)
         {
             let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
             let scale = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
@@ -2156,6 +2157,30 @@ fn detect_permutation(
         return None;
     }
     Some(perm)
+}
+
+/// Whether a loop appears inside another loop.
+///
+/// A normalization reduces once over a row: its passes are sequential loops,
+/// never nested. A filterbank contracts a matrix against a spectrum, so its
+/// loops nest. That is the difference between `mel`, which was reported as
+/// BatchNormalization because it has three inputs and a square root, and a
+/// normalization that actually is one.
+fn has_nested_loop(body: &[Statement]) -> bool {
+    fn inside_loop(body: &[Statement]) -> bool {
+        body.iter().any(|s| match s {
+            Statement::Loop { .. } => true,
+            Statement::If { accept, reject, .. } => inside_loop(accept) || inside_loop(reject),
+            _ => false,
+        })
+    }
+    body.iter().any(|s| match s {
+        Statement::Loop { body, continuing, .. } => {
+            inside_loop(body) || inside_loop(continuing) || has_nested_loop(body)
+        }
+        Statement::If { accept, reject, .. } => has_nested_loop(accept) || has_nested_loop(reject),
+        _ => false,
+    })
 }
 
 /// Check if a block contains a Store whose value (or sub-expr) uses a specific Math function.
