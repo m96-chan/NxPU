@@ -657,7 +657,7 @@ mod tests {
             dim_name: "N".into(),
         });
         let s = format!("{pattern}");
-        assert!(!s.is_empty());
+        assert_ne!(s.len(), 0);
     }
 
     #[test]
@@ -904,7 +904,7 @@ mod tests {
             reason: "test".into(),
         };
         let names = output_tensor_names(&pattern);
-        assert!(names.is_empty());
+        assert_eq!(names.len(), 0);
     }
 
     #[test]
@@ -913,7 +913,7 @@ mod tests {
             reason: "test".into(),
         };
         let names = input_tensor_names(&pattern);
-        assert!(names.is_empty());
+        assert_eq!(names.len(), 0);
     }
 
     #[test]

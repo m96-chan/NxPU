@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn compile_conv2d() {
         let output = load_and_compile("conv2d", &BackendOptions::default());
-        assert!(!output.files.is_empty());
+        assert_ne!(output.files.len(), 0);
         let has_tflite = output.files.iter().any(|f| f.name.ends_with(".tflite"));
         assert!(has_tflite);
     }
@@ -172,13 +172,13 @@ mod tests {
     #[test]
     fn compile_relu() {
         let output = load_and_compile("relu", &BackendOptions::default());
-        assert!(!output.files.is_empty());
+        assert_ne!(output.files.len(), 0);
     }
 
     #[test]
     fn compile_attention() {
         let output = load_and_compile("attention", &BackendOptions::default());
-        assert!(!output.files.is_empty());
+        assert_ne!(output.files.len(), 0);
     }
 
     #[test]

@@ -170,7 +170,7 @@ mod tests {
         });
 
         let warnings = collect_warnings(&module);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings.len(), 0);
     }
 
     #[test]
@@ -183,7 +183,7 @@ mod tests {
         });
 
         let warnings = collect_warnings(&module);
-        assert!(!warnings.is_empty());
+        assert_ne!(warnings.len(), 0);
         assert!(
             warnings[0].message.contains("workgroup_size[0] = 0"),
             "unexpected message: {}",
@@ -205,7 +205,7 @@ mod tests {
         });
 
         let warnings = collect_warnings(&module);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings.len(), 0);
     }
 
     #[test]

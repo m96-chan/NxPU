@@ -254,25 +254,25 @@ mod tests {
     #[test]
     fn compile_attention() {
         let output = load_and_compile("attention", &BackendOptions::default());
-        assert!(!output.files.is_empty());
+        assert_ne!(output.files.len(), 0);
     }
 
     #[test]
     fn compile_maxpool() {
         let output = load_and_compile("maxpool", &BackendOptions::default());
-        assert!(!output.files.is_empty());
+        assert_ne!(output.files.len(), 0);
     }
 
     #[test]
     fn compile_reduce_sum() {
         let output = load_and_compile("reduce_sum", &BackendOptions::default());
-        assert!(!output.files.is_empty());
+        assert_ne!(output.files.len(), 0);
     }
 
     #[test]
     fn compile_batchnorm() {
         let output = load_and_compile("batchnorm", &BackendOptions::default());
-        assert!(!output.files.is_empty());
+        assert_ne!(output.files.len(), 0);
     }
 
     #[test]

@@ -549,7 +549,7 @@ mod tests {
     fn empty_module_produces_empty_plan() {
         let module = Module::default();
         let plan = plan_memory(&module);
-        assert!(plan.allocations.is_empty());
+        assert_eq!(plan.allocations.len(), 0);
         assert_eq!(plan.peak_bytes, 0);
     }
 
@@ -1159,7 +1159,7 @@ mod tests {
     fn greedy_allocate_empty() {
         let intervals = HashMap::new();
         let plan = greedy_allocate(&intervals);
-        assert!(plan.allocations.is_empty());
+        assert_eq!(plan.allocations.len(), 0);
         assert_eq!(plan.peak_bytes, 0);
     }
 
@@ -1401,7 +1401,7 @@ mod tests {
 
         let plan = plan_memory(&module);
         // Should have at least 1 allocation for the global.
-        assert!(!plan.allocations.is_empty());
+        assert_ne!(plan.allocations.len(), 0);
         assert!(plan.peak_bytes >= 256);
     }
 
@@ -1741,7 +1741,7 @@ mod tests {
         });
 
         let plan = plan_memory(&module);
-        assert!(plan.allocations.is_empty());
+        assert_eq!(plan.allocations.len(), 0);
         assert_eq!(plan.peak_bytes, 0);
     }
 
@@ -1760,7 +1760,7 @@ mod tests {
         });
 
         let plan = plan_memory(&module);
-        assert!(plan.allocations.is_empty());
+        assert_eq!(plan.allocations.len(), 0);
         assert_eq!(plan.peak_bytes, 0);
     }
 

@@ -449,14 +449,14 @@ mod tests {
     fn graph_module() {
         let gm = GraphModule::default();
         assert!(gm.graph.is_none());
-        assert!(gm.module.entry_points.is_empty());
+        assert_eq!(gm.module.entry_points.len(), 0);
     }
 
     #[test]
     fn topological_order_empty_graph() {
         let graph = ComputeGraph::new();
         let order = graph.topological_order().unwrap();
-        assert!(order.is_empty());
+        assert_eq!(order.len(), 0);
     }
 
     #[test]

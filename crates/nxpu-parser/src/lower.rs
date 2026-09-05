@@ -1166,7 +1166,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(module.entry_points[0].workgroup_size, [64, 1, 1]);
 
         // Should have at least one global variable (buf).
-        assert!(!module.global_variables.is_empty());
+        assert_ne!(module.global_variables.len(), 0);
     }
 
     // ---- Nested structs ----

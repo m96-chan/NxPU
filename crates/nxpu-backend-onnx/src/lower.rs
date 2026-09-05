@@ -1895,10 +1895,13 @@ mod tests {
         assert_eq!(init.dims, vec![2, 3]);
         assert_eq!(init.data_type, data_type::FLOAT);
         assert_eq!(init.name, "weights");
-        assert!(init.float_data.is_empty());
+        assert_eq!(init.float_data.len(), 0);
         assert_eq!(init.raw_data.len(), 24); // 6 * 4 bytes
 
         // Verify raw_data decodes back to original floats
+        // See the note in nxpu-opt's calibrate.rs: the lint's suggested
+        // `as_chunks` is newer than this workspace's rust-version.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         let decoded: Vec<f32> = init
             .raw_data
             .chunks_exact(4)
@@ -2728,7 +2731,7 @@ mod tests {
         // Graph should be unchanged.
         assert_eq!(graph.node.len(), 1);
         assert_eq!(graph.node[0].op_type, "Conv");
-        assert!(graph.initializer.is_empty());
+        assert_eq!(graph.initializer.len(), 0);
     }
 
     #[test]
@@ -2763,7 +2766,7 @@ mod tests {
             output: vec![],
         };
         maybe_add_layout_transpose(&mut graph, &[0, 1, 2, 3], "x", "y");
-        assert!(graph.node.is_empty());
+        assert_eq!(graph.node.len(), 0);
     }
 
     #[test]
@@ -2776,7 +2779,7 @@ mod tests {
             output: vec![],
         };
         maybe_add_layout_transpose(&mut graph, &[], "x", "y");
-        assert!(graph.node.is_empty());
+        assert_eq!(graph.node.len(), 0);
     }
 
     #[test]

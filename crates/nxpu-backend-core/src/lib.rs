@@ -244,6 +244,28 @@ pub enum OutputContent {
     Binary(Vec<u8>),
 }
 
+impl OutputContent {
+    /// Size of the content in bytes — UTF-8 bytes for text, raw bytes for
+    /// binary.
+    ///
+    /// Exists so a caller that only wants to know whether a backend produced
+    /// anything does not have to match on the variant. Five backend test
+    /// suites were each carrying the same two-arm match, and in every one of
+    /// them the text arm was unreachable, because those backends emit binary
+    /// only.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Text(s) => s.len(),
+            Self::Binary(b) => b.len(),
+        }
+    }
+
+    /// Whether the content is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 impl fmt::Display for OutputContent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -511,6 +533,30 @@ impl Backend for IrDumpBackend {
 }
 
 #[cfg(test)]
+mod output_content_tests {
+    use super::*;
+
+    #[test]
+    fn text_length_is_utf8_bytes() {
+        // Not chars: a caller sizing a buffer needs bytes.
+        assert_eq!(OutputContent::Text("hello".into()).len(), 5);
+        assert_eq!(OutputContent::Text("日本語".into()).len(), 9);
+    }
+
+    #[test]
+    fn binary_length_is_bytes() {
+        assert_eq!(OutputContent::Binary(vec![0u8; 7]).len(), 7);
+    }
+
+    #[test]
+    fn both_variants_report_empty() {
+        assert!(OutputContent::Text(String::new()).is_empty());
+        assert!(OutputContent::Binary(Vec::new()).is_empty());
+        assert!(!OutputContent::Binary(vec![1]).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -675,13 +721,13 @@ mod tests {
     #[test]
     fn registry_empty_list_targets() {
         let reg = BackendRegistry::new();
-        assert!(reg.list_targets().is_empty());
+        assert_eq!(reg.list_targets().len(), 0);
     }
 
     #[test]
     fn registry_default_is_empty() {
         let reg = BackendRegistry::default();
-        assert!(reg.list_targets().is_empty());
+        assert_eq!(reg.list_targets().len(), 0);
     }
 
     #[test]
@@ -770,7 +816,7 @@ mod tests {
     #[test]
     fn memory_plan_default() {
         let plan = MemoryPlan::default();
-        assert!(plan.allocations.is_empty());
+        assert_eq!(plan.allocations.len(), 0);
         assert_eq!(plan.peak_bytes, 0);
     }
 
@@ -819,7 +865,7 @@ mod tests {
     #[test]
     fn per_channel_param_default_empty() {
         let opts = BackendOptions::default();
-        assert!(opts.per_channel_params.is_empty());
+        assert_eq!(opts.per_channel_params.len(), 0);
         let s = format!("{opts}");
         assert!(!s.contains("per_channel"));
     }
