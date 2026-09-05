@@ -937,6 +937,24 @@ pub fn classify_entry_point(
             let scale = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
             let bias = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
             let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
+            // A group count in the params means group normalization, and the
+            // formats this compiler targets cannot express it: ONNX's
+            // GroupNormalization takes num_groups as a static attribute, and
+            // here it is a uniform the host sets at dispatch time. Saying so
+            // is the only honest answer — reporting it as BatchNormalization,
+            // which is what the parameter count produced, is a graph that runs
+            // and computes something else.
+            if shape_names
+                .iter()
+                .any(|n| n == "G" || n.eq_ignore_ascii_case("groups"))
+            {
+                return Ok(KernelPattern::Unknown {
+                    reason: "group normalization with a group count supplied at \
+                             runtime — the target formats need it as a static \
+                             attribute"
+                        .into(),
+                });
+            }
             let norm_type = if shape_names.len() <= 2 {
                 NormType::Layer
             } else {
@@ -1041,14 +1059,44 @@ pub fn classify_entry_point(
         });
     }
 
+    // A matmul does not compute a reciprocal square root. RMSNorm is a
+    // normalization with a scale and no bias, so it has two inputs rather than
+    // three and never reached the Normalization branch — it fell through to
+    // here and was reported as BATCH_MATMUL. Serving it properly needs the
+    // Normalization pattern to make its bias optional, which is a change to
+    // every backend that lowers one; until then, refusing is the honest half.
+    if (has_math_function_in_expressions(&ep.function.expressions, MathFunction::InverseSqrt)
+        || has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sqrt))
+        && !has_math_function_in_expressions(&ep.function.expressions, MathFunction::Exp)
+    {
+        return Ok(KernelPattern::Unknown {
+            reason: "2 inputs, a loop and a reciprocal square root — a \
+                     normalization without a bias, which Normalization cannot \
+                     yet represent"
+                .into(),
+        });
+    }
+
+    // A convolution does not evaluate trigonometry. An STFT does — its
+    // twiddle factors are sin and cos — and with five parameters it landed in
+    // the arm below and was reported as CONV_2D.
+    if has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sin)
+        || has_math_function_in_expressions(&ep.function.expressions, MathFunction::Cos)
+    {
+        return Ok(KernelPattern::Unknown {
+            reason: "2 inputs, a loop and trigonometry — a transform rather \
+                     than a convolution or a matmul"
+                .into(),
+        });
+    }
+
     // 2 inputs + loop: Conv2D (many params) vs MatMul (3 params)
     //
-    // The parameter count is the only evidence here and it is not enough:
-    // rmsnorm, an inverse STFT and attention scores all land in this arm and
-    // are reported as CONV_2D. Requiring literal loop bounds was tried and is
-    // wrong in the other direction — a conv whose kernel size comes from
-    // params has none. Distinguishing these needs the conv recogniser to look
-    // at what the kernel does, not at how many numbers it was handed.
+    // The parameter count is the only evidence left here and it is not much:
+    // it separates conv from matmul by how many numbers the kernel was handed.
+    // Requiring literal loop bounds was tried and is wrong — a conv whose
+    // kernel size comes from params has none. Distinguishing what remains
+    // needs the recogniser to look at what the kernel computes.
     if shape_names.len() > 3 {
         let conv_shape = extract_conv2d_shape(
             &shape_names,
