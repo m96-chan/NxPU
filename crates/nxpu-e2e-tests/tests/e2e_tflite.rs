@@ -206,3 +206,89 @@ fn causal_attention_tflite_compiles() {
     assert!(bytes.len() > 8);
     assert_eq!(&bytes[4..8], b"TFL3");
 }
+
+// --- Loadability ---
+//
+// Every test above asserts the file begins with `TFL3` and stops there, which
+// is why nothing noticed that no model this backend produced could be loaded
+// at all: `Tensor.shape` carried `-1` for symbolic dimensions, and TFLite
+// overflows `BytesRequired` on a negative extent rather than treating it as
+// unknown. A phone reported it, after the models had been shipped for months:
+//
+//   Cannot create interpreter: BytesRequired number of bytes overflowed.
+//   Tensor 0 is invalidly specified in schema.
+//
+// Scanning the buffer for the word is crude next to parsing the FlatBuffer,
+// but it fails for exactly the reason the device failed, and it covers every
+// pattern rather than the handful anyone would write a reader for.
+
+fn has_negative_dim_word(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|w| w == [0xff, 0xff, 0xff, 0xff])
+}
+
+#[test]
+fn no_example_carries_a_negative_extent() {
+    // The same set the tests above compile, so this asserts loadability of
+    // exactly what is already asserted to be well-formed.
+    let examples = [
+        "attention",
+        "batchnorm",
+        "causal_attention",
+        "concat",
+        "conv2d",
+        "depthwise_conv",
+        "gather",
+        "gelu",
+        "layernorm",
+        "matmul",
+        "maxpool",
+        "multihead_attention",
+        "reduce_sum",
+        "relu",
+        "scatter",
+        "split",
+        "tanh_act",
+        "vecadd",
+        "vecmul",
+        "vecsub",
+    ];
+    // transpose is deliberately absent: it classifies as Unknown and is
+    // expected not to compile at all (see transpose_tflite_unknown).
+    let offenders: Vec<&str> = examples
+        .into_iter()
+        .filter(|name| {
+            let source = common::load_example(name);
+            let output = common::compile_wgsl(&source, &TfLiteBackend, 1);
+            has_negative_dim_word(common::first_binary(&output))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these models cannot be loaded by any interpreter: {offenders:?}"
+    );
+}
+
+#[test]
+fn the_requested_extent_reaches_the_model() {
+    use nxpu_backend_core::{Backend, BackendOptions};
+    let source = common::load_example("vecadd");
+    let compile = |extent: Option<u32>| {
+        let mut module = nxpu_parser::parse(&source).expect("WGSL parse failed");
+        nxpu_opt::PassManager::for_level(nxpu_opt::OptLevel::O1).run(&mut module);
+        let output = TfLiteBackend
+            .compile(
+                &module,
+                &BackendOptions {
+                    opt_level: 1,
+                    symbolic_extent: extent,
+                    ..Default::default()
+                },
+            )
+            .expect("backend compilation failed");
+        common::first_binary(&output).to_vec()
+    };
+    // Same graph, different extents: if the flag did not reach the tensors the
+    // two would be byte-identical, which is how the first attempt failed.
+    assert_ne!(compile(None), compile(Some(1024)));
+    assert!(!has_negative_dim_word(&compile(Some(1024))));
+}

@@ -20,8 +20,34 @@ use crate::schema::{
 /// File identifier for TFLite FlatBuffer files.
 const TFLITE_FILE_ID: &str = "TFL3";
 
+/// Create a `Tensor.shape` vector, replacing symbolic dimensions with
+/// [`SYMBOLIC_EXTENT`].
+///
+/// Every shape written into a tensor goes through here, so a `-1` arriving
+/// from any of the pattern builders is normalised in one place rather than at
+/// each of the thirteen sites that build one.
+fn shape_vector<'a>(
+    fbb: &mut FlatBufferBuilder<'a>,
+    dims: &[i32],
+    extent: i32,
+) -> flatbuffers::WIPOffset<flatbuffers::Vector<'a, i32>> {
+    fbb.create_vector(&concrete_shape(dims, extent))
+}
+
+/// Substitute `extent` for every symbolic dimension, leaving known ones alone.
+///
+/// Separate from [`shape_vector`] so the rule can be asserted directly: every
+/// pattern this backend lowers today produces entirely symbolic shapes, so the
+/// branch that preserves a known dimension is never reached through them, and
+/// a rule nothing exercises is a rule nothing protects.
+fn concrete_shape(dims: &[i32], extent: i32) -> Vec<i32> {
+    dims.iter()
+        .map(|&d| if d < 0 { extent } else { d })
+        .collect()
+}
+
 /// Build a TFLite FlatBuffer model from a classified kernel pattern.
-pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
+pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, BackendError> {
     let bytes = match pattern {
         KernelPattern::MatMul {
             inputs,
@@ -35,6 +61,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
                 &shapes,
                 builtin_op::BATCH_MATMUL,
                 &format!("matmul_{}x{}x{}", shape.m, shape.n, shape.k),
+                extent,
             )
         }
         KernelPattern::ElementWise {
@@ -53,6 +80,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
                 &shapes,
                 opcode,
                 &format!("{}_1d", op.op_name().to_lowercase()),
+                extent,
             )
         }
         KernelPattern::Conv2D {
@@ -60,7 +88,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
             weight,
             output,
             shape,
-        } => build_tflite_conv2d(input, weight, output, shape),
+        } => build_tflite_conv2d(input, weight, output, shape, extent),
         KernelPattern::Pool {
             kind,
             input,
@@ -71,13 +99,13 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
                 PoolKind::Max => builtin_op::MAX_POOL_2D,
                 PoolKind::Avg => builtin_op::AVERAGE_POOL_2D,
             };
-            build_tflite_pool(input, output, opcode, shape, "pool")
+            build_tflite_pool(input, output, opcode, shape, "pool", extent)
         }
         KernelPattern::Activation {
             op, input, output, ..
         } => {
             if matches!(op, ActivationOp::Softmax) {
-                build_tflite_softmax(input, output)
+                build_tflite_softmax(input, output, extent)
             } else if matches!(
                 op,
                 ActivationOp::Gelu | ActivationOp::Silu | ActivationOp::Mish
@@ -91,6 +119,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
                     &shapes[1],
                     builtin_op::CUSTOM,
                     &format!("{}_1d", op.op_name().to_lowercase()),
+                    extent,
                 )
             } else {
                 let shapes = [vec![-1i32], vec![-1]];
@@ -107,6 +136,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
                     &shapes[1],
                     opcode,
                     &format!("{}_1d", op.op_name().to_lowercase()),
+                    extent,
                 )
             }
         }
@@ -127,6 +157,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
                 &shapes[1],
                 opcode,
                 &format!("{}_reduce", op.op_name().to_lowercase()),
+                extent,
             )
         }
         KernelPattern::Transpose { input, output, .. } => {
@@ -138,6 +169,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
                 &shapes[1],
                 builtin_op::TRANSPOSE,
                 "transpose",
+                extent,
             )
         }
         KernelPattern::Reshape { input, output, .. } => {
@@ -149,6 +181,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
                 &shapes[1],
                 builtin_op::RESHAPE,
                 "reshape",
+                extent,
             )
         }
         KernelPattern::Normalization {
@@ -159,18 +192,18 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
             ..
         } => {
             // TFLite doesn't have a direct BatchNorm op; expand to MUL(input, scale) + ADD(mul_result, bias)
-            build_tflite_batchnorm(input, scale, bias, output)
+            build_tflite_batchnorm(input, scale, bias, output, extent)
         }
         KernelPattern::Concat {
             inputs,
             output,
             axis,
-        } => build_tflite_concat(inputs, output, *axis),
+        } => build_tflite_concat(inputs, output, *axis, extent),
         KernelPattern::Split {
             input,
             outputs,
             axis,
-        } => build_tflite_split(input, outputs, *axis),
+        } => build_tflite_split(input, outputs, *axis, extent),
         KernelPattern::Attention {
             query,
             key,
@@ -180,7 +213,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
             num_heads,
             causal,
             ..
-        } => build_tflite_attention(query, key, value, output, d_k, *num_heads, *causal),
+        } => build_tflite_attention(query, key, value, output, d_k, *num_heads, *causal, extent),
         KernelPattern::Gather {
             data,
             indices,
@@ -194,6 +227,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
                 &shapes,
                 builtin_op::GATHER,
                 "gather",
+                extent,
             )
         }
         KernelPattern::Scatter {
@@ -210,6 +244,7 @@ pub fn build_model(pattern: &KernelPattern) -> Result<Vec<u8>, BackendError> {
                 &shapes,
                 builtin_op::SCATTER_ND,
                 "scatter_nd",
+                extent,
             )
         }
         KernelPattern::Unknown { reason } => {
@@ -252,7 +287,7 @@ struct GraphDesc {
 /// Creates one buffer slot per tensor plus the mandatory sentinel buffer at
 /// index 0.  Deduplicates operator codes so each unique opcode appears only
 /// once in the `operator_codes` vector.
-fn build_from_graph_desc(desc: &GraphDesc) -> Vec<u8> {
+fn build_from_graph_desc(desc: &GraphDesc, extent: i32) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::with_capacity(2048);
 
     // --- strings ---
@@ -268,7 +303,7 @@ fn build_from_graph_desc(desc: &GraphDesc) -> Vec<u8> {
     let shape_offsets: Vec<_> = desc
         .tensors
         .iter()
-        .map(|t| fbb.create_vector(&t.shape))
+        .map(|t| shape_vector(&mut fbb, &t.shape, extent))
         .collect();
 
     // --- op input/output index vectors ---
@@ -1048,28 +1083,28 @@ fn append_activation(
 /// Handles single patterns, Conv+BatchNorm, MatMul+Bias (Gemm), and
 /// activation fusion.  All fused combinations now emit proper multi-operator
 /// subgraphs instead of delegating to the unfused single-op builder.
-pub fn build_fused_model(fp: &FusedPattern) -> Result<Vec<u8>, BackendError> {
-    use nxpu_analysis::fusion::FusedActivation;
-
+pub fn build_fused_model(fp: &FusedPattern, extent: i32) -> Result<Vec<u8>, BackendError> {
     match fp {
-        FusedPattern::Single(p) => build_model(p),
+        FusedPattern::Single(p) => build_model(p, extent),
         FusedPattern::ConvBatchNorm { conv, norm } => {
             let desc = collect_conv_batchnorm_graph(conv, norm)?;
-            Ok(build_from_graph_desc(&desc))
+            Ok(build_from_graph_desc(&desc, extent))
         }
         FusedPattern::MatMulBias { matmul, bias_add } => {
             let desc = collect_matmul_bias_graph(matmul, bias_add)?;
-            Ok(build_from_graph_desc(&desc))
+            Ok(build_from_graph_desc(&desc, extent))
         }
         FusedPattern::WithActivation {
             base, activation, ..
         } => {
-            if matches!(activation, FusedActivation::None) {
-                return build_fused_model(base);
-            }
+            // `activation_opcode` returns None for exactly one variant, and
+            // it is the one this guard used to test for separately. Two places
+            // deciding "there is no activation to append" is one place too
+            // many: the second arm was unreachable, and an unreachable arm is
+            // a rule that cannot be checked.
             let act_opcode = match activation_opcode(activation) {
                 Some(c) => c,
-                None => return build_fused_model(base),
+                None => return build_fused_model(base, extent),
             };
 
             // Collect the base graph descriptor, then append the activation op.
@@ -1078,7 +1113,7 @@ pub fn build_fused_model(fp: &FusedPattern) -> Result<Vec<u8>, BackendError> {
                     Ok(d) => d,
                     // Fall back to build_model for complex single patterns
                     // (Attention, Split) and just return it without activation.
-                    Err(_) => return build_model(p),
+                    Err(_) => return build_model(p, extent),
                 },
                 FusedPattern::ConvBatchNorm { conv, norm } => {
                     collect_conv_batchnorm_graph(conv, norm)?
@@ -1088,12 +1123,12 @@ pub fn build_fused_model(fp: &FusedPattern) -> Result<Vec<u8>, BackendError> {
                 }
                 FusedPattern::WithActivation { .. } => {
                     // Nested WithActivation should not occur in practice.
-                    return build_fused_model(base);
+                    return build_fused_model(base, extent);
                 }
             };
 
             append_activation(&mut desc, activation, act_opcode);
-            Ok(build_from_graph_desc(&desc))
+            Ok(build_from_graph_desc(&desc, extent))
         }
     }
 }
@@ -1118,6 +1153,7 @@ fn build_tflite(
     shapes: &[Vec<i32>; 3],
     opcode: i32,
     graph_name: &str,
+    extent: i32,
 ) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::with_capacity(1024);
 
@@ -1128,7 +1164,10 @@ fn build_tflite(
     let sg_name = fbb.create_string(graph_name);
 
     // Shape vectors
-    let shape_vecs: Vec<_> = shapes.iter().map(|s| fbb.create_vector(s)).collect();
+    let shape_vecs: Vec<_> = shapes
+        .iter()
+        .map(|s| shape_vector(&mut fbb, s, extent))
+        .collect();
 
     // Operator input/output index vectors
     let input_indices: Vec<i32> = (0..inputs.len() as i32).collect();
@@ -1234,6 +1273,7 @@ fn build_tflite_unary(
     out_shape: &[i32],
     opcode: i32,
     graph_name: &str,
+    extent: i32,
 ) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::with_capacity(1024);
 
@@ -1242,8 +1282,8 @@ fn build_tflite_unary(
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string(graph_name);
 
-    let shape_in = fbb.create_vector(in_shape);
-    let shape_out = fbb.create_vector(out_shape);
+    let shape_in = shape_vector(&mut fbb, in_shape, extent);
+    let shape_out = shape_vector(&mut fbb, out_shape, extent);
 
     let op_inputs = fbb.create_vector(&[0i32]);
     let op_outputs = fbb.create_vector(&[1i32]);
@@ -1332,6 +1372,7 @@ fn build_tflite_batchnorm(
     scale: &TensorBinding,
     bias: &TensorBinding,
     output: &TensorBinding,
+    extent: i32,
 ) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::with_capacity(2048);
 
@@ -1345,8 +1386,8 @@ fn build_tflite_batchnorm(
     let sg_name = fbb.create_string("batchnorm");
 
     // Shapes
-    let shape_nd = fbb.create_vector(&[-1i32, -1, -1, -1]);
-    let shape_1d = fbb.create_vector(&[-1i32]);
+    let shape_nd = shape_vector(&mut fbb, &[-1i32, -1, -1, -1], extent);
+    let shape_1d = shape_vector(&mut fbb, &[-1i32], extent);
 
     // Buffers: sentinel + input(1) + scale(2) + bias(3) + mul_result(4) + output(5)
     let mut buffer_offsets = Vec::new();
@@ -1481,7 +1522,7 @@ fn build_tflite_batchnorm(
 ///
 /// Uses BUILTIN_OPTIONS to embed a SoftmaxOptions table so that the TFLite
 /// runtime picks up beta=1.0 instead of the default 0.0 (which is an identity).
-fn build_tflite_softmax(input: &TensorBinding, output: &TensorBinding) -> Vec<u8> {
+fn build_tflite_softmax(input: &TensorBinding, output: &TensorBinding, extent: i32) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::with_capacity(1024);
 
     let name_in = fbb.create_string(&input.name);
@@ -1489,8 +1530,8 @@ fn build_tflite_softmax(input: &TensorBinding, output: &TensorBinding) -> Vec<u8
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("softmax_1d");
 
-    let shape_in = fbb.create_vector(&[-1i32]);
-    let shape_out = fbb.create_vector(&[-1i32]);
+    let shape_in = shape_vector(&mut fbb, &[-1i32], extent);
+    let shape_out = shape_vector(&mut fbb, &[-1i32], extent);
 
     let op_inputs = fbb.create_vector(&[0i32]);
     let op_outputs = fbb.create_vector(&[1i32]);
@@ -1594,6 +1635,7 @@ fn build_tflite_conv2d(
     weight: &TensorBinding,
     output: &TensorBinding,
     shape: &Conv2DShape,
+    extent: i32,
 ) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::with_capacity(1024);
 
@@ -1603,7 +1645,7 @@ fn build_tflite_conv2d(
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("conv2d");
 
-    let shape_4d = fbb.create_vector(&[-1i32, -1, -1, -1]);
+    let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1], extent);
 
     let op_inputs = fbb.create_vector(&[0i32, 1]);
     let op_outputs = fbb.create_vector(&[2i32]);
@@ -1721,6 +1763,7 @@ fn build_tflite_pool(
     opcode: i32,
     shape: &PoolShape,
     graph_name: &str,
+    extent: i32,
 ) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::with_capacity(1024);
 
@@ -1729,7 +1772,7 @@ fn build_tflite_pool(
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string(graph_name);
 
-    let shape_4d = fbb.create_vector(&[-1i32, -1, -1, -1]);
+    let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1], extent);
 
     let op_inputs = fbb.create_vector(&[0i32]);
     let op_outputs = fbb.create_vector(&[1i32]);
@@ -1836,6 +1879,9 @@ fn build_tflite_pool(
 /// from the query tensor's shape, TFLite lacks dynamic shape operators. The sqrt(d_k)
 /// value is embedded as a compile-time constant. When d_k is symbolic (a param name
 /// rather than a number), the fallback value of sqrt(64) = 8.0 is used.
+// The extent joins seven existing parameters; the same allow is already used
+// in the ONNX and StableHLO lowerings for the same reason.
+#[allow(clippy::too_many_arguments)]
 fn build_tflite_attention(
     query: &TensorBinding,
     key: &TensorBinding,
@@ -1844,6 +1890,7 @@ fn build_tflite_attention(
     d_k: &str,
     num_heads: u32,
     causal: bool,
+    extent: i32,
 ) -> Vec<u8> {
     // Note: multi-head (num_heads > 1) would require additional Reshape operators
     // in the graph; causal mask would need a Where/Select op. Both are noted as
@@ -1871,7 +1918,7 @@ fn build_tflite_attention(
     let sg_name = fbb.create_string("attention");
 
     // Shapes
-    let shape_2d = fbb.create_vector(&[-1i32, -1]);
+    let shape_2d = shape_vector(&mut fbb, &[-1i32, -1], extent);
     let shape_scalar = fbb.create_vector(&[1i32]);
 
     let qtype = onnx_to_tflite_type(query.elem_type);
@@ -2113,7 +2160,12 @@ fn build_tflite_attention(
 }
 
 /// Build a TFLite model for Concatenation with axis embedded via ConcatenationOptions.
-fn build_tflite_concat(inputs: &[TensorBinding], output: &TensorBinding, axis: i64) -> Vec<u8> {
+fn build_tflite_concat(
+    inputs: &[TensorBinding],
+    output: &TensorBinding,
+    axis: i64,
+    extent: i32,
+) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::with_capacity(1024);
 
     let in_names: Vec<_> = inputs.iter().map(|i| fbb.create_string(&i.name)).collect();
@@ -2121,7 +2173,7 @@ fn build_tflite_concat(inputs: &[TensorBinding], output: &TensorBinding, axis: i
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("concat");
 
-    let shape_1d = fbb.create_vector(&[-1i32]);
+    let shape_1d = shape_vector(&mut fbb, &[-1i32], extent);
 
     let num_tensors = inputs.len() + 1; // inputs + output
     let mut buffer_offsets = Vec::new();
@@ -2235,7 +2287,12 @@ fn build_tflite_concat(inputs: &[TensorBinding], output: &TensorBinding, axis: i
 ///
 /// In TFLite the Split op expects input 0 = axis (scalar int32 constant)
 /// and input 1 = the tensor to split. SplitOptions carries `num_splits`.
-fn build_tflite_split(input: &TensorBinding, outputs: &[TensorBinding], axis: i64) -> Vec<u8> {
+fn build_tflite_split(
+    input: &TensorBinding,
+    outputs: &[TensorBinding],
+    axis: i64,
+    extent: i32,
+) -> Vec<u8> {
     let mut fbb = FlatBufferBuilder::with_capacity(1024);
 
     let name_in = fbb.create_string(&input.name);
@@ -2244,8 +2301,8 @@ fn build_tflite_split(input: &TensorBinding, outputs: &[TensorBinding], axis: i6
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("split");
 
-    let shape_in = fbb.create_vector(&[-1i32]);
-    let shape_out = fbb.create_vector(&[-1i32]);
+    let shape_in = shape_vector(&mut fbb, &[-1i32], extent);
+    let shape_out = shape_vector(&mut fbb, &[-1i32], extent);
     let shape_scalar = fbb.create_vector::<i32>(&[]);
 
     // Buffer for axis constant: little-endian i32
@@ -2397,6 +2454,7 @@ pub fn build_layout_transpose(
     input: &TensorBinding,
     output: &TensorBinding,
     perm: &[i64],
+    extent: i32,
 ) -> Option<Vec<u8>> {
     // Identity check
     let is_identity = perm.iter().enumerate().all(|(i, &p)| p as usize == i);
@@ -2415,7 +2473,32 @@ pub fn build_layout_transpose(
         &out_shape,
         builtin_op::TRANSPOSE,
         "layout_transpose",
+        extent,
     ))
+}
+
+#[cfg(test)]
+mod concrete_shape_tests {
+    use super::concrete_shape;
+
+    #[test]
+    fn symbolic_dimensions_take_the_extent() {
+        assert_eq!(concrete_shape(&[-1, -1], 1024), vec![1024, 1024]);
+    }
+
+    #[test]
+    fn known_dimensions_are_preserved() {
+        // Nothing lowers to this yet — every pattern is fully symbolic — but a
+        // shape that knows one of its dimensions must not have it overwritten.
+        assert_eq!(concrete_shape(&[-1, 3, -1, 224], 8), vec![8, 3, 8, 224]);
+    }
+
+    #[test]
+    fn zero_is_a_known_dimension_not_a_symbolic_one() {
+        // Only a negative value means "unknown"; 0 is a real, if useless,
+        // extent and must survive rather than being substituted.
+        assert_eq!(concrete_shape(&[0, -1], 4), vec![0, 4]);
+    }
 }
 
 #[cfg(test)]
@@ -2467,7 +2550,7 @@ mod tests {
                 k: "K".into(),
             },
         };
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert!(bytes.len() > 8);
         assert_eq!(&bytes[4..8], b"TFL3");
     }
@@ -2483,7 +2566,7 @@ mod tests {
             output: make_tensor("z", TensorRole::Output),
             dim_name: "N".into(),
         };
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert!(bytes.len() > 8);
         assert_eq!(&bytes[4..8], b"TFL3");
     }
@@ -2505,7 +2588,7 @@ mod tests {
                 output: make_tensor("c", TensorRole::Output),
                 dim_name: "N".into(),
             };
-            let bytes = build_model(&pattern).unwrap();
+            let bytes = build_model(&pattern, 1).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
         }
     }
@@ -2535,7 +2618,7 @@ mod tests {
                 dilation_w: 1,
             },
         };
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2552,7 +2635,7 @@ mod tests {
                 output: make_tensor("y", TensorRole::Output),
                 dim_name: "N".into(),
             };
-            let bytes = build_model(&pattern).unwrap();
+            let bytes = build_model(&pattern, 1).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
         }
     }
@@ -2571,7 +2654,7 @@ mod tests {
                     stride_w: 2,
                 },
             };
-            let bytes = build_model(&pattern).unwrap();
+            let bytes = build_model(&pattern, 1).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", kind);
         }
     }
@@ -2584,7 +2667,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             axis: 1,
         };
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2672,7 +2755,7 @@ mod tests {
             norm: Box::new(make_normalization("conv_out", "bn_out")),
         };
 
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert!(bytes.len() > 8);
         assert_eq!(&bytes[4..8], b"TFL3");
     }
@@ -2686,7 +2769,7 @@ mod tests {
             bias_add: Box::new(make_bias_add("mm_out", "out")),
         };
 
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert!(bytes.len() > 8);
         assert_eq!(&bytes[4..8], b"TFL3");
     }
@@ -2696,7 +2779,7 @@ mod tests {
         use nxpu_analysis::fusion::FusedPattern;
 
         let fused = FusedPattern::Single(make_matmul());
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2710,7 +2793,7 @@ mod tests {
             activation_pattern: Box::new(make_activation(ActivationOp::Relu, "mm_out", "relu_out")),
         };
 
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert!(bytes.len() > 8);
         assert_eq!(&bytes[4..8], b"TFL3");
     }
@@ -2735,7 +2818,7 @@ mod tests {
             activation_pattern: Box::new(make_activation(ActivationOp::Sigmoid, "c", "sig_out")),
         };
 
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2759,7 +2842,7 @@ mod tests {
             activation_pattern: Box::new(make_activation(ActivationOp::Tanh, "c", "tanh_out")),
         };
 
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2776,7 +2859,7 @@ mod tests {
             activation_pattern: Box::new(make_activation(ActivationOp::Relu, "bn_out", "relu_out")),
         };
 
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2797,7 +2880,7 @@ mod tests {
             )),
         };
 
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2811,7 +2894,7 @@ mod tests {
             activation_pattern: Box::new(make_activation(ActivationOp::Relu, "mm_out", "out")),
         };
 
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2836,7 +2919,7 @@ mod tests {
         };
 
         // Should not panic; the nested WithActivation causes a recursive call
-        let bytes = build_fused_model(&outer).unwrap();
+        let bytes = build_fused_model(&outer, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2846,7 +2929,7 @@ mod tests {
     fn fused_single_conv2d() {
         use nxpu_analysis::fusion::FusedPattern;
         let fused = FusedPattern::Single(make_conv2d());
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2864,7 +2947,7 @@ mod tests {
                 stride_w: 2,
             },
         });
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2882,7 +2965,7 @@ mod tests {
                 stride_w: 2,
             },
         });
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2890,7 +2973,7 @@ mod tests {
     fn fused_single_activation_relu() {
         use nxpu_analysis::fusion::FusedPattern;
         let fused = FusedPattern::Single(make_activation(ActivationOp::Relu, "x", "y"));
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2898,7 +2981,7 @@ mod tests {
     fn fused_single_activation_sigmoid() {
         use nxpu_analysis::fusion::FusedPattern;
         let fused = FusedPattern::Single(make_activation(ActivationOp::Sigmoid, "x", "y"));
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2906,7 +2989,7 @@ mod tests {
     fn fused_single_activation_tanh() {
         use nxpu_analysis::fusion::FusedPattern;
         let fused = FusedPattern::Single(make_activation(ActivationOp::Tanh, "x", "y"));
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2914,7 +2997,7 @@ mod tests {
     fn fused_single_activation_softmax() {
         use nxpu_analysis::fusion::FusedPattern;
         let fused = FusedPattern::Single(make_activation(ActivationOp::Softmax, "x", "y"));
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2928,7 +3011,7 @@ mod tests {
                 output: make_tensor("y", TensorRole::Output),
                 axis: 1,
             });
-            let bytes = build_fused_model(&fused).unwrap();
+            let bytes = build_fused_model(&fused, 1).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
         }
     }
@@ -2941,7 +3024,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             perm: vec![1, 0],
         });
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2952,7 +3035,7 @@ mod tests {
             input: make_tensor("x", TensorRole::Input),
             output: make_tensor("y", TensorRole::Output),
         });
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2960,7 +3043,7 @@ mod tests {
     fn fused_single_normalization() {
         use nxpu_analysis::fusion::FusedPattern;
         let fused = FusedPattern::Single(make_normalization("x", "y"));
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2975,7 +3058,7 @@ mod tests {
             output: make_tensor("c", TensorRole::Output),
             axis: 0,
         });
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -2997,7 +3080,7 @@ mod tests {
                 output: make_tensor("c", TensorRole::Output),
                 dim_name: "N".into(),
             });
-            let bytes = build_fused_model(&fused).unwrap();
+            let bytes = build_fused_model(&fused, 1).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
         }
     }
@@ -3116,7 +3199,7 @@ mod tests {
             conv: make_matmul(), // wrong: should be Conv2D
             norm: Box::new(make_normalization("x", "y")),
         };
-        assert!(build_fused_model(&fused).is_err());
+        assert!(build_fused_model(&fused, 1).is_err());
     }
 
     #[test]
@@ -3128,7 +3211,7 @@ mod tests {
             matmul: make_conv2d(), // wrong: should be MatMul
             bias_add: Box::new(make_bias_add("x", "y")),
         };
-        assert!(build_fused_model(&fused).is_err());
+        assert!(build_fused_model(&fused, 1).is_err());
     }
 
     // ---- collect_single_graph error cases ----
@@ -3200,7 +3283,7 @@ mod tests {
         };
 
         // Falls back to build_model which handles Attention
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3230,7 +3313,7 @@ mod tests {
             graph_outputs: vec![1],
             graph_name: "test".into(),
         };
-        let bytes = build_from_graph_desc(&desc);
+        let bytes = build_from_graph_desc(&desc, 1);
         assert!(bytes.len() > 8);
         assert_eq!(&bytes[4..8], b"TFL3");
     }
@@ -3272,7 +3355,7 @@ mod tests {
             graph_outputs: vec![2],
             graph_name: "dedup_test".into(),
         };
-        let bytes = build_from_graph_desc(&desc);
+        let bytes = build_from_graph_desc(&desc, 1);
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3349,7 +3432,7 @@ mod tests {
                 "relu_out",
             )),
         };
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3377,7 +3460,7 @@ mod tests {
                 "relu_out",
             )),
         };
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3400,7 +3483,7 @@ mod tests {
                 "sig_out",
             )),
         };
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3418,7 +3501,7 @@ mod tests {
             activation: FusedActivation::Tanh,
             activation_pattern: Box::new(make_activation(ActivationOp::Tanh, "t_out", "tanh_out")),
         };
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3435,7 +3518,7 @@ mod tests {
             activation: FusedActivation::Relu,
             activation_pattern: Box::new(make_activation(ActivationOp::Relu, "r_out", "relu_out")),
         };
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3448,7 +3531,7 @@ mod tests {
             activation: FusedActivation::Relu,
             activation_pattern: Box::new(make_activation(ActivationOp::Relu, "n_out", "relu_out")),
         };
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3473,7 +3556,7 @@ mod tests {
                 "sig_out",
             )),
         };
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3492,7 +3575,7 @@ mod tests {
                 "tanh_out",
             )),
         };
-        let bytes = build_fused_model(&fused).unwrap();
+        let bytes = build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3503,7 +3586,7 @@ mod tests {
         let pattern = KernelPattern::Unknown {
             reason: "test error".into(),
         };
-        let result = build_model(&pattern);
+        let result = build_model(&pattern, 1);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("cannot lower Unknown pattern"));
@@ -3517,7 +3600,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             dim_name: "N".into(),
         };
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3528,7 +3611,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             perm: vec![1, 0],
         };
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3538,14 +3621,14 @@ mod tests {
             input: make_tensor("x", TensorRole::Input),
             output: make_tensor("y", TensorRole::Output),
         };
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
     #[test]
     fn build_model_normalization() {
         let pattern = make_normalization("x", "y");
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3559,7 +3642,7 @@ mod tests {
             output: make_tensor("c", TensorRole::Output),
             axis: 0,
         };
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3573,7 +3656,7 @@ mod tests {
             ],
             axis: 0,
         };
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3590,7 +3673,7 @@ mod tests {
             num_kv_heads: 1,
             causal: false,
         };
-        let bytes = build_model(&pattern).unwrap();
+        let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -3603,7 +3686,7 @@ mod tests {
                 output: make_tensor("y", TensorRole::Output),
                 axis: 1,
             };
-            let bytes = build_model(&pattern).unwrap();
+            let bytes = build_model(&pattern, 1).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
         }
     }
@@ -3613,7 +3696,7 @@ mod tests {
         let input = make_tensor("input_nchw", TensorRole::Input);
         let output = make_tensor("input_nhwc", TensorRole::Output);
         let perm = [0i64, 2, 3, 1]; // NCHW -> NHWC
-        let bytes = build_layout_transpose(&input, &output, &perm);
+        let bytes = build_layout_transpose(&input, &output, &perm, 1);
         assert!(bytes.is_some());
         let bytes = bytes.unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
@@ -3624,13 +3707,13 @@ mod tests {
         let input = make_tensor("x", TensorRole::Input);
         let output = make_tensor("y", TensorRole::Output);
         let perm = [0i64, 1, 2, 3]; // identity
-        assert!(build_layout_transpose(&input, &output, &perm).is_none());
+        assert!(build_layout_transpose(&input, &output, &perm, 1).is_none());
     }
 
     #[test]
     fn build_layout_transpose_empty_returns_none() {
         let input = make_tensor("x", TensorRole::Input);
         let output = make_tensor("y", TensorRole::Output);
-        assert!(build_layout_transpose(&input, &output, &[]).is_none());
+        assert!(build_layout_transpose(&input, &output, &[], 1).is_none());
     }
 }

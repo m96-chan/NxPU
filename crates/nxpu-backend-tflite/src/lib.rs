@@ -17,6 +17,25 @@ mod schema;
 #[derive(Debug)]
 pub struct TfLiteBackend;
 
+/// The extent to write for dimensions the kernel leaves symbolic.
+///
+/// `None` means the caller did not say. One is the smallest value that
+/// produces a loadable model, which is the right default for a compiler that
+/// genuinely does not know the size: a WGSL kernel over `array<f32>` carries
+/// no length. It is also useless for measuring anything, so a caller who wants
+/// a model worth timing has to name a size.
+///
+/// TFLite has a place for a genuinely unknown dimension — `shape_signature` —
+/// but `shape` itself must be concrete: a negative value there makes
+/// `BytesRequired` overflow and no interpreter can be constructed, on any
+/// device, delegate or not.
+fn symbolic_extent(opts: &BackendOptions) -> i32 {
+    opts.symbolic_extent
+        .map(|e| e.max(1))
+        .unwrap_or(1)
+        .min(i32::MAX as u32) as i32
+}
+
 impl Backend for TfLiteBackend {
     fn name(&self) -> &str {
         "TFLite"
@@ -54,6 +73,7 @@ impl Backend for TfLiteBackend {
         let fused = fusion::fuse_patterns(patterns);
 
         // 3. Lower each fused pattern.
+        let extent = symbolic_extent(opts);
         let mut files = Vec::new();
         let mut diagnostics = Vec::new();
 
@@ -89,7 +109,10 @@ impl Backend for TfLiteBackend {
             // Emit warnings for unsupported attention features in the TFLite backend.
             emit_attention_diagnostics(fp, ep_name, &mut diagnostics);
 
-            let bytes = lower::build_fused_model(fp)?;
+            // A caller who did not say gets the smallest valid extent, which loads
+            // but measures nothing; `--symbolic-dim` is how you ask for a size
+            // worth timing.
+            let bytes = lower::build_fused_model(fp, extent)?;
 
             let filename = if fused.len() == 1 {
                 "output.tflite".into()
@@ -215,6 +238,36 @@ fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
         analyze::KernelPattern::Gather { .. } => "GATHER",
         analyze::KernelPattern::Scatter { .. } => "SCATTER_ND",
         analyze::KernelPattern::Unknown { .. } => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::*;
+
+    #[test]
+    fn unspecified_is_the_smallest_loadable_extent() {
+        assert_eq!(symbolic_extent(&BackendOptions::default()), 1);
+    }
+
+    #[test]
+    fn zero_is_raised_to_one() {
+        // A zero extent produces a zero-byte tensor, which loads and then
+        // fails on the first attempt to hand it any data.
+        let opts = BackendOptions {
+            symbolic_extent: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(symbolic_extent(&opts), 1);
+    }
+
+    #[test]
+    fn a_requested_extent_is_used() {
+        let opts = BackendOptions {
+            symbolic_extent: Some(1024),
+            ..Default::default()
+        };
+        assert_eq!(symbolic_extent(&opts), 1024);
     }
 }
 
@@ -369,7 +422,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             norm: Box::new(norm),
         };
 
-        let bytes = lower::build_fused_model(&fused).unwrap();
+        let bytes = lower::build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -405,7 +458,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             bias_add: Box::new(bias_add),
         };
 
-        let bytes = lower::build_fused_model(&fused).unwrap();
+        let bytes = lower::build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -436,7 +489,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             activation_pattern: Box::new(relu),
         };
 
-        let bytes = lower::build_fused_model(&fused).unwrap();
+        let bytes = lower::build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -492,7 +545,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             activation_pattern: Box::new(relu),
         };
 
-        let bytes = lower::build_fused_model(&fused).unwrap();
+        let bytes = lower::build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
@@ -538,7 +591,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             activation_pattern: Box::new(relu),
         };
 
-        let bytes = lower::build_fused_model(&fused).unwrap();
+        let bytes = lower::build_fused_model(&fused, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 

@@ -1,0 +1,241 @@
+name: Device TFLite
+
+# NxPU has emitted TFLite since it existed and has never executed one: the
+# suite asserts the file begins with `TFL3` and stops there. This runs an
+# emitted model on a real accelerator and compares the numbers against the
+# reference, which is the only place that check can happen at all.
+#
+# Exploratory on purpose. Nothing here gates anything until we know what the
+# device actually answers.
+on:
+  push:
+    branches: [feat/device-tflite-verification]
+  workflow_dispatch:
+    inputs:
+      example:
+        description: "WGSL example to compile (without .wgsl)"
+        required: true
+        default: vecadd
+      elements:
+        description: >-
+          Element count. Passed to the compiler as --symbolic-dim and used to
+          size the fixtures, so the two cannot drift: a mismatch is reported by
+          the device as a byte-count error naming the tensor.
+        required: true
+        default: "1024"
+
+permissions:
+  contents: read
+
+# `inputs` is null on push, so every reference goes through these.
+env:
+  EXAMPLE: ${{ inputs.example || 'vecadd' }}
+  ELEMENTS: ${{ inputs.elements || '1024' }}
+
+jobs:
+  # Cargo on a phone is a waste of the one resource a phone has that a cloud
+  # runner does not. Build here, execute there.
+  build:
+    name: Emit the model and the golden
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the CLI
+        run: cargo build --release -p nxpu-cli
+
+      - name: Compile WGSL to TFLite
+        run: |
+          mkdir -p out
+          ./target/release/nxpu "examples/${{ env.EXAMPLE }}.wgsl" \
+            --target tflite --precision keep \
+            --symbolic-dim "${{ env.ELEMENTS }}" \
+            -o "out/${{ env.EXAMPLE }}.tflite"
+          ls -l "out/${{ env.EXAMPLE }}.tflite"
+
+      - name: Inputs and expected output
+        run: |
+          python3 - <<'PY'
+          import os, struct
+          n = int(os.environ["N"])
+          a = [i * 0.5 for i in range(n)]
+          b = [1.0 - i * 0.25 for i in range(n)]
+          # Round-trip through f32 so the golden is what f32 arithmetic gives,
+          # not what Python's doubles give. Comparing against a more precise
+          # answer than the format can hold reports the format as an error.
+          f32 = lambda xs: struct.unpack(f"<{len(xs)}f", struct.pack(f"<{len(xs)}f", *xs))
+          a, b = f32(a), f32(b)
+          c = f32([x + y for x, y in zip(a, b)])
+          for name, xs in (("input-0", a), ("input-1", b), ("expected-0", c)):
+              with open(f"out/{name}.bin", "wb") as fh:
+                  fh.write(struct.pack(f"<{len(xs)}f", *xs))
+          print(f"{n} elements, {n * 4} bytes per tensor")
+          PY
+        env:
+          N: ${{ env.ELEMENTS }}
+
+      # The emitted tensors carry shape [-1]; whether TFLite can allocate that
+      # at all is the first thing the device run settles. Recorded here so the
+      # log says what was sent, not only what came back.
+      - name: What is in the model
+        run: |
+          echo "shape words (-1 == symbolic):"
+          od -An -tx4 -v "out/${{ env.EXAMPLE }}.tflite" | grep -c ffffffff || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: model
+          path: out/
+          if-no-files-found: error
+
+  device:
+    name: Execute on NX729J
+    needs: build
+    # soc-qti-sm8550-qcom means this handset. Two Snapdragons share the vendor
+    # labels, and one of them once served results from a stale build.
+    runs-on: [self-hosted, android, soc-qti-sm8550-qcom]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: model
+          path: model
+
+      # Makes the #82 prerequisite visible in the log rather than implied by a
+      # failure: the QNN runtime is fetched on the phone after a licence
+      # acceptance, and a reflashed device silently loses it.
+      - name: What the phone has
+        run: droidrunner-device capabilities
+
+      # upload-artifact uploads the contents of a directory, not the directory.
+      # Asserting the path before posting it is cheaper than a green run with
+      # an empty table.
+      - name: The model arrived
+        run: |
+          test -f "model/${{ env.EXAMPLE }}.tflite"
+          ls -l model/
+
+      # Two runs, both allowed to fail, because one device visit should answer
+      # as much as possible. The first asks whether the graph loads at all; the
+      # second asks whether the numbers are right.
+      - name: Latency only, no inputs
+        id: latency
+        continue-on-error: true
+        uses: m96-chan/DroidRunner/actions/run-model@main
+        with:
+          model: model/${{ env.EXAMPLE }}.tflite
+          device: qnn-htp
+          iterations: 50
+          results-path: latency.json
+
+      - name: With inputs, keeping the outputs
+        id: numeric
+        continue-on-error: true
+        uses: m96-chan/DroidRunner/actions/run-model@main
+        with:
+          model: model/${{ env.EXAMPLE }}.tflite
+          device: qnn-htp
+          iterations: 10
+          inputs: |
+            model/input-0.bin
+            model/input-1.bin
+          output-dir: device-out
+          results-path: numeric.json
+
+      - name: What came back
+        if: always()
+        run: |
+          echo "latency: executed=${{ steps.latency.outputs.executed }} by=${{ steps.latency.outputs.executed-by }} median=${{ steps.latency.outputs.median-us }}us stable=${{ steps.latency.outputs.stable }}"
+          echo "numeric: executed=${{ steps.numeric.outputs.executed }} by=${{ steps.numeric.outputs.executed-by }}"
+          ls -l device-out/ 2>/dev/null || echo "no outputs were written"
+          for f in latency.json numeric.json; do
+            echo "--- $f"; cat "$f" 2>/dev/null || echo "absent"; echo
+          done
+
+      # The two runs above are allowed to fail so that one visit to the phone
+      # answers as much as possible. That must not make the job green: a run
+      # that verified nothing has to say so.
+      - name: Verdict
+        if: always()
+        run: |
+          if [ -z "${{ steps.numeric.outputs.executed }}" ]; then
+            echo "::error::the model did not execute; see numeric.json above"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: device-result
+          path: |
+            device-out/
+            latency.json
+            numeric.json
+          if-no-files-found: warn
+
+  # The phone has no python3 and no jq, so the tolerance comparison happens
+  # where the golden was made.
+  compare:
+    name: Compare against the reference
+    needs: [build, device]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: model
+          path: model
+      - uses: actions/download-artifact@v8
+        with:
+          name: device-result
+          path: device
+        continue-on-error: true
+
+      - name: Numbers
+        run: |
+          if [ ! -f device/device-out/output-0.bin ]; then
+            echo "::error::the device wrote no outputs; nothing to compare"
+            ls -R device 2>/dev/null || true
+            exit 1
+          fi
+          python3 - <<'PY'
+          import struct, collections
+          read = lambda p: open(p, "rb").read()
+          floats = lambda b: struct.unpack(f"<{len(b)//4}f", b)
+          words = lambda b: struct.unpack(f"<{len(b)//4}I", b)
+          we, ge = read("model/expected-0.bin"), read("device/device-out/output-0.bin")
+          want, got = floats(we), floats(ge)
+          if len(want) != len(got):
+              raise SystemExit(f"length: expected {len(want)}, device returned {len(got)}")
+
+          # Compared in ULP rather than absolute difference. An absolute bound
+          # cannot work across magnitudes: the first version of this passed at
+          # 1.0 and failed at 256.75 for deviations that were the same size in
+          # the only unit that matters.
+          ulp = [g - w for w, g in zip(words(we), words(ge))]
+          histogram = dict(sorted(collections.Counter(ulp).items()))
+          worst = max(abs(u) for u in ulp)
+          print(f"{len(want)} elements, ULP difference histogram: {histogram}")
+          i = max(range(len(ulp)), key=lambda i: abs(ulp[i]))
+          print(f"worst at index {i}: expected {want[i]!r}, device {got[i]!r}")
+
+          # This accelerator is not bit-exact for f32, so the bound is a
+          # tolerance rather than equality. It is deliberately tight: 1 ULP is
+          # what these fixtures produce, and a looser bound would stop
+          # reporting the day it grows.
+          #
+          # It does grow. On operands finer than these — sums needing the full
+          # significand rather than multiples of 0.25 — the Qualcomm path
+          # discards the smaller addend entirely, and the error reaches
+          # hundreds of ULP. These fixtures are all well above the resolution
+          # where that begins, so 1 ULP is a fact about this input, not about
+          # the hardware. Widening the bound to accommodate a future fixture
+          # set would defeat the only check that has ever caught anything.
+          if worst > 1:
+              raise SystemExit(f"outside tolerance: {worst} ULP")
+          if any(u != 0 for u in ulp):
+              print(f"::notice::within tolerance, but not exact: "
+                    f"{sum(1 for u in ulp if u)} of {len(ulp)} elements differ by 1 ULP")
+          print("within tolerance")
+          PY
