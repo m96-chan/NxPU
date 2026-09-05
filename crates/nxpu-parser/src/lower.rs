@@ -526,11 +526,14 @@ impl LowerCtx<'_> {
                 self.map_func_expr(fctx, expr)?,
             )),
             // Unsupported expression kinds
-            naga::Expression::CooperativeLoad { .. } => {
-                Err(unsupported("CooperativeLoad expression"))
-            }
-            naga::Expression::CooperativeMultiplyAdd { .. } => {
-                Err(unsupported("CooperativeMultiplyAdd expression"))
+            // One arm rather than two: a cooperative-matrix operation cannot
+            // appear without a cooperative-matrix type, and lower_type_inner
+            // rejects that first, so neither is reachable through the WGSL
+            // frontend. They exist to keep the match exhaustive — a catch-all
+            // here would silently swallow whatever naga adds next.
+            naga::Expression::CooperativeLoad { .. }
+            | naga::Expression::CooperativeMultiplyAdd { .. } => {
+                Err(unsupported("cooperative matrix expression"))
             }
             naga::Expression::Derivative { .. } => Err(unsupported("Derivative expression")),
             naga::Expression::Relational { .. } => Err(unsupported("Relational expression")),
@@ -1515,6 +1518,28 @@ fn main() {}";
         let err = lower_module(&naga_module).unwrap_err();
         match err {
             ParseError::Unsupported(ref msg) => assert!(msg.contains("Image"), "got: {msg}"),
+            other => panic!("expected Unsupported, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_unsupported_cooperative_matrix_type() {
+        // naga 29 added cooperative matrices — subgroup-level matrix
+        // primitives, and the first thing in a while that an NPU backend might
+        // actually want to lower rather than reject.
+        let source = "
+enable wgpu_cooperative_matrix;
+
+var<workgroup> m: coop_mat8x8<f32, A>;
+
+@compute @workgroup_size(1)
+fn main() {}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let err = lower_module(&naga_module).unwrap_err();
+        match err {
+            ParseError::Unsupported(ref msg) => {
+                assert!(msg.contains("CooperativeMatrix"), "got: {msg}")
+            }
             other => panic!("expected Unsupported, got: {other:?}"),
         }
     }
