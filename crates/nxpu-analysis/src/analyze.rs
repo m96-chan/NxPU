@@ -776,17 +776,47 @@ pub fn classify_entry_point(
     if num_inputs == 1 {
         let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
 
-        // Split: 1 input + 2+ outputs + has If
-        if outputs.len() >= 2 && has_if_statement(&ep.function.body) {
-            let out_bindings: Vec<TensorBinding> = outputs
-                .iter()
-                .map(|(h, gv)| make_binding(module, *h, gv, TensorRole::Output))
-                .collect();
-            let axis = infer_split_axis(&ep.function.body, &ep.function.expressions, &shape_names);
-            return Ok(KernelPattern::Split {
-                input,
-                outputs: out_bindings,
-                axis,
+        // 1 input + 2 or more outputs: a Split, or nothing this compiler has.
+        //
+        // "One input, several outputs, and an If somewhere" was the whole
+        // test, and it asks about the kernel's shape rather than about what it
+        // computes. Three vendor kernels answered yes and none of them is a
+        // split: an activation quantizer emitting codes and per-row scales, a
+        // greedy CTC decode emitting labels and their lengths, and a
+        // mixture-of-experts router emitting expert indices and gate weights.
+        //
+        // What a Split is, and what every backend here emits for one, is a
+        // slice: each output element *is* an input element, moved. So that is
+        // what has to be found — a boundary test, and stores that copy rather
+        // than compute. The rest is refused by name below.
+        if outputs.len() >= 2 {
+            let output_handles: Vec<Handle<GlobalVariable>> =
+                outputs.iter().map(|(h, _)| *h).collect();
+            let (written, computed) = survey_output_stores(
+                &ep.function.body,
+                &ep.function.expressions,
+                inputs[0].0,
+                &output_handles,
+            );
+            let every_output_is_a_copy =
+                computed.is_empty() && written.len() == output_handles.len();
+
+            if every_output_is_a_copy && has_if_statement(&ep.function.body) {
+                let out_bindings: Vec<TensorBinding> = outputs
+                    .iter()
+                    .map(|(h, gv)| make_binding(module, *h, gv, TensorRole::Output))
+                    .collect();
+                let axis =
+                    infer_split_axis(&ep.function.body, &ep.function.expressions, &shape_names);
+                return Ok(KernelPattern::Split {
+                    input,
+                    outputs: out_bindings,
+                    axis,
+                });
+            }
+
+            return Ok(KernelPattern::Unknown {
+                reason: multi_output_refusal(module, &outputs, inputs[0].1, &written, &computed),
             });
         }
 
@@ -841,6 +871,34 @@ pub fn classify_entry_point(
             // No recognized activation — unknown pattern.
             return Ok(KernelPattern::Unknown {
                 reason: "single input, no loop, no recognized activation function".into(),
+            });
+        }
+
+        // A softmax, before the reduction arms get a look at it.
+        //
+        // The vendor softmax is the numerically stable three-pass one, and its
+        // first pass is a max over the row. That max is the only thing the
+        // reduce arm saw, so the op came back as `ReduceMax`: a graph that
+        // keeps one number per row and throws the distribution away.
+        //
+        // What is actually there is `exp(x - max) * (1 / Σ exp(x - max))`, and
+        // that is what is looked for — see `detect_softmax`. Recognised as an
+        // `Activation`, which both the ONNX and the TFLite backend already
+        // lower (`Softmax`, and `SOFTMAX` with beta = 1).
+        //
+        // `dim_name` is the *innermost* shape parameter, not the first. The
+        // reduction runs along the last axis — `D` of `[N, D]` — and the
+        // emitted graph is a single symbolic dimension, so naming it `N` would
+        // label the softmax's length with the batch count.
+        if outputs.len() == 1
+            && detect_softmax(&ep.function.body, &ep.function.expressions, outputs[0].0)
+        {
+            let dim_name = shape_names.last().cloned().unwrap_or_else(|| "N".into());
+            return Ok(KernelPattern::Activation {
+                op: ActivationOp::Softmax,
+                input,
+                output,
+                dim_name,
             });
         }
 
@@ -2140,6 +2198,296 @@ fn find_store_binary_divide(body: &[Statement], exprs: &Arena<Expression>) -> bo
                 body, continuing, ..
             } if find_store_binary_divide(body, exprs)
                 || find_store_binary_divide(continuing, exprs) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// What a kernel does with its outputs
+// ---------------------------------------------------------------------------
+
+/// The global a pointer expression ultimately addresses, following the
+/// `Access` / `AccessIndex` chain back to its base.
+///
+/// Bounded rather than unbounded so a malformed arena cannot spin here; the
+/// depth is the same 32 the index decomposition uses, and no real kernel
+/// subscripts anything that far.
+fn pointer_base_global(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+) -> Option<Handle<GlobalVariable>> {
+    let mut current = handle;
+    for _ in 0..32 {
+        match exprs.try_get(current)? {
+            Expression::GlobalVariable(g) => return Some(*g),
+            Expression::Access { base, .. } | Expression::AccessIndex { base, .. } => {
+                current = *base;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Which outputs a kernel writes, and which of them it *computes* rather than
+/// copies out of `input`.
+///
+/// A Split hands back slices of its input: every element it writes is an
+/// element it read, so every store into an output is a bare `Load` from the
+/// input and nothing else. Anything arithmetic in the stored value — a scale,
+/// a rounding, a cast to an index — means the kernel is producing a new tensor
+/// rather than partitioning the one it was given, whatever else it may be
+/// doing, and no `Split` describes that.
+///
+/// Returns `(written, computed)`, both in first-seen order. An output that is
+/// never written at all is absent from `written`, which is also disqualifying:
+/// a slice that stores nothing is not a slice.
+fn survey_output_stores(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    input: Handle<GlobalVariable>,
+    outputs: &[Handle<GlobalVariable>],
+) -> (Vec<Handle<GlobalVariable>>, Vec<Handle<GlobalVariable>>) {
+    fn walk(
+        body: &[Statement],
+        exprs: &Arena<Expression>,
+        input: Handle<GlobalVariable>,
+        outputs: &[Handle<GlobalVariable>],
+        written: &mut Vec<Handle<GlobalVariable>>,
+        computed: &mut Vec<Handle<GlobalVariable>>,
+    ) {
+        for stmt in body {
+            match stmt {
+                Statement::Store { pointer, value } => {
+                    let Some(target) = pointer_base_global(exprs, *pointer) else {
+                        continue;
+                    };
+                    if !outputs.contains(&target) {
+                        continue;
+                    }
+                    if !written.contains(&target) {
+                        written.push(target);
+                    }
+                    let copied = match exprs.try_get(*value) {
+                        Some(Expression::Load { pointer }) => {
+                            pointer_base_global(exprs, *pointer) == Some(input)
+                        }
+                        _ => false,
+                    };
+                    if !copied && !computed.contains(&target) {
+                        computed.push(target);
+                    }
+                }
+                Statement::If { accept, reject, .. } => {
+                    walk(accept, exprs, input, outputs, written, computed);
+                    walk(reject, exprs, input, outputs, written, computed);
+                }
+                Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    walk(body, exprs, input, outputs, written, computed);
+                    walk(continuing, exprs, input, outputs, written, computed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut written = Vec::new();
+    let mut computed = Vec::new();
+    walk(body, exprs, input, outputs, &mut written, &mut computed);
+    (written, computed)
+}
+
+/// Say, in the refusal, what was actually seen.
+///
+/// "Unrecognized pattern" tells the caller nothing about their kernel. These
+/// name the outputs that disqualified it and why, so the message is checkable
+/// against the source in front of them.
+fn multi_output_refusal(
+    module: &Module,
+    outputs: &[(Handle<GlobalVariable>, &GlobalVariable)],
+    input: &GlobalVariable,
+    written: &[Handle<GlobalVariable>],
+    computed: &[Handle<GlobalVariable>],
+) -> String {
+    let name_of = |handle: Handle<GlobalVariable>| -> String {
+        outputs
+            .iter()
+            .find(|(h, _)| *h == handle)
+            .and_then(|(_, gv)| gv.name.clone())
+            .unwrap_or_else(|| "an output".into())
+    };
+    let quoted = |handles: &[Handle<GlobalVariable>]| -> String {
+        handles
+            .iter()
+            .map(|h| format!("'{}'", name_of(*h)))
+            .collect::<Vec<_>>()
+            .join(" and ")
+    };
+
+    let unwritten: Vec<Handle<GlobalVariable>> = outputs
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| !written.contains(h))
+        .collect();
+
+    let mut reason = format!(
+        "1 input and {} outputs, but this does not slice its input: ",
+        outputs.len()
+    );
+    if !computed.is_empty() {
+        reason.push_str(&format!(
+            "{} {} written with a computed value rather than a copy of the input",
+            quoted(computed),
+            if computed.len() == 1 { "is" } else { "are" },
+        ));
+        if !unwritten.is_empty() {
+            reason.push_str(", and ");
+        }
+    }
+    if !unwritten.is_empty() {
+        reason.push_str(&format!(
+            "{} {} never stored to",
+            quoted(&unwritten),
+            if unwritten.len() == 1 { "is" } else { "are" },
+        ));
+    }
+    if computed.is_empty() && unwritten.is_empty() {
+        // Copies throughout, but no boundary test to split on.
+        reason.push_str("there is no comparison marking where one output ends and the next begins");
+    }
+
+    // A slice keeps its element type. When it changes, the kernel is
+    // converting, and saying so points at the half of the problem a Split
+    // could never have carried anyway.
+    let input_elem = resolve_array_elem_type(module, input.ty);
+    if outputs
+        .iter()
+        .any(|(_, gv)| resolve_array_elem_type(module, gv.ty) != input_elem)
+    {
+        reason.push_str(
+            ". The outputs do not all share the input's element type either, and a slice \
+             never changes it",
+        );
+    }
+
+    reason.push_str(
+        ". Splitting is the only single-input, multi-output op these backends lower, \
+         so there is nothing here for one to carry",
+    );
+    reason
+}
+
+// ---------------------------------------------------------------------------
+// Softmax recognition
+// ---------------------------------------------------------------------------
+
+/// Positive recognition of a softmax: `exp(x - max) / Σ exp(x - max)`.
+///
+/// Two facts have to hold together, and neither is enough on its own:
+///
+///   - the value written to the output is an `exp` over a division — the
+///     normalised numerator, whether it is spelled `exp(..) / sum` or
+///     `exp(..) * (1.0 / sum)`, which are the same expression tree with the
+///     `Divide` in a different place;
+///   - some store inside a loop adds an `exp` into a running total — the
+///     denominator being built, one element of the row at a time.
+///
+/// The second is what separates a softmax from a hand-written sigmoid,
+/// `1.0 / (1.0 + exp(-x))`, which also stores an `exp` over a `Divide`. A
+/// sigmoid accumulates no exponentials because it has nothing to sum over.
+/// The first is what separates it from a plain `ReduceSum` of exponentials,
+/// which builds the same total and then writes the total.
+///
+/// What is deliberately *not* required is the max subtraction. It is there in
+/// every stable softmax and in this vendor kernel, but it is an implementation
+/// choice about overflow rather than part of the operator, and a kernel that
+/// skips it is still a softmax.
+fn detect_softmax(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    output: Handle<GlobalVariable>,
+) -> bool {
+    stores_a_normalized_exp(body, exprs, output) && sums_exponentials_in_a_loop(body, exprs, false)
+}
+
+/// A store into `output` whose value contains both an `exp` and a division.
+fn stores_a_normalized_exp(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    output: Handle<GlobalVariable>,
+) -> bool {
+    for stmt in body {
+        match stmt {
+            Statement::Store { pointer, value } => {
+                if pointer_base_global(exprs, *pointer) == Some(output)
+                    && contains_math_fun(exprs, *value, MathFunction::Exp)
+                    && contains_binary_op(exprs, *value, BinaryOp::Divide)
+                {
+                    return true;
+                }
+            }
+            Statement::If { accept, reject, .. } => {
+                if stores_a_normalized_exp(accept, exprs, output)
+                    || stores_a_normalized_exp(reject, exprs, output)
+                {
+                    return true;
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } if stores_a_normalized_exp(body, exprs, output)
+                || stores_a_normalized_exp(continuing, exprs, output) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// An `acc = acc + exp(..)` — an add, containing an exponential, executed
+/// inside a loop. The target is not checked: a workgroup slot, a local and a
+/// storage scratch buffer are all the same accumulator here.
+fn sums_exponentials_in_a_loop(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    in_loop: bool,
+) -> bool {
+    for stmt in body {
+        match stmt {
+            Statement::Store { value, .. } => {
+                if in_loop
+                    && matches!(
+                        exprs.try_get(*value),
+                        Some(Expression::Binary {
+                            op: BinaryOp::Add,
+                            ..
+                        })
+                    )
+                    && contains_math_fun(exprs, *value, MathFunction::Exp)
+                {
+                    return true;
+                }
+            }
+            Statement::If { accept, reject, .. } => {
+                if sums_exponentials_in_a_loop(accept, exprs, in_loop)
+                    || sums_exponentials_in_a_loop(reject, exprs, in_loop)
+                {
+                    return true;
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } if sums_exponentials_in_a_loop(body, exprs, true)
+                || sums_exponentials_in_a_loop(continuing, exprs, true) =>
             {
                 return true;
             }
@@ -3980,22 +4328,45 @@ mod tests {
             right: load,
         });
 
-        let val = func
+        // `out_a[idx] = input[idx]` on one side of the boundary and
+        // `out_b[idx] = input[idx]` on the other. Both stores used to be a
+        // float literal written through a float literal, which addresses
+        // nothing and copies nothing; the classifier now asks whether the
+        // outputs are slices of the input, so the module has to be one.
+        let (input_gv, out_a_gv, out_b_gv) = {
+            let mut iter = module.global_variables.iter();
+            let input = iter.next().unwrap().0;
+            let out_a = iter.next().unwrap().0;
+            let out_b = iter.next().unwrap().0;
+            (input, out_a, out_b)
+        };
+        let input_expr = func
             .expressions
-            .append(Expression::Literal(Literal::F32(0.0)));
-        let ptr = func
-            .expressions
-            .append(Expression::Literal(Literal::F32(0.0)));
+            .append(Expression::GlobalVariable(input_gv));
+        let read = func.expressions.append(Expression::Access {
+            base: input_expr,
+            index: idx,
+        });
+        let val = func.expressions.append(Expression::Load { pointer: read });
+
+        let mut copy_into = |out: Handle<GlobalVariable>| {
+            let out_expr = func.expressions.append(Expression::GlobalVariable(out));
+            let ptr = func.expressions.append(Expression::Access {
+                base: out_expr,
+                index: idx,
+            });
+            Statement::Store {
+                pointer: ptr,
+                value: val,
+            }
+        };
+        let store_a = copy_into(out_a_gv);
+        let store_b = copy_into(out_b_gv);
+
         func.body.push(Statement::If {
             condition: cmp,
-            accept: vec![Statement::Store {
-                pointer: ptr,
-                value: val,
-            }],
-            reject: vec![Statement::Store {
-                pointer: ptr,
-                value: val,
-            }],
+            accept: vec![store_a],
+            reject: vec![store_b],
         });
 
         module.entry_points.push(EntryPoint {
