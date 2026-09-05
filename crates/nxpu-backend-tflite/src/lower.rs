@@ -31,11 +31,19 @@ fn shape_vector<'a>(
     dims: &[i32],
     extent: i32,
 ) -> flatbuffers::WIPOffset<flatbuffers::Vector<'a, i32>> {
-    let concrete: Vec<i32> = dims
-        .iter()
+    fbb.create_vector(&concrete_shape(dims, extent))
+}
+
+/// Substitute `extent` for every symbolic dimension, leaving known ones alone.
+///
+/// Separate from [`shape_vector`] so the rule can be asserted directly: every
+/// pattern this backend lowers today produces entirely symbolic shapes, so the
+/// branch that preserves a known dimension is never reached through them, and
+/// a rule nothing exercises is a rule nothing protects.
+fn concrete_shape(dims: &[i32], extent: i32) -> Vec<i32> {
+    dims.iter()
         .map(|&d| if d < 0 { extent } else { d })
-        .collect();
-    fbb.create_vector(&concrete)
+        .collect()
 }
 
 /// Build a TFLite FlatBuffer model from a classified kernel pattern.
@@ -2467,6 +2475,30 @@ pub fn build_layout_transpose(
         "layout_transpose",
         extent,
     ))
+}
+
+#[cfg(test)]
+mod concrete_shape_tests {
+    use super::concrete_shape;
+
+    #[test]
+    fn symbolic_dimensions_take_the_extent() {
+        assert_eq!(concrete_shape(&[-1, -1], 1024), vec![1024, 1024]);
+    }
+
+    #[test]
+    fn known_dimensions_are_preserved() {
+        // Nothing lowers to this yet — every pattern is fully symbolic — but a
+        // shape that knows one of its dimensions must not have it overwritten.
+        assert_eq!(concrete_shape(&[-1, 3, -1, 224], 8), vec![8, 3, 8, 224]);
+    }
+
+    #[test]
+    fn zero_is_a_known_dimension_not_a_symbolic_one() {
+        // Only a negative value means "unknown"; 0 is a real, if useless,
+        // extent and must survive rather than being substituted.
+        assert_eq!(concrete_shape(&[0, -1], 4), vec![0, 4]);
+    }
 }
 
 #[cfg(test)]
