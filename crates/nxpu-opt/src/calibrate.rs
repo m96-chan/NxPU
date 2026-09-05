@@ -105,6 +105,11 @@ impl CalibrationDataset {
                 });
             }
 
+            // clippy::chunks_exact_to_as_chunks, new in the 1.98 toolchain,
+            // suggests `as_chunks::<4>()`. That is newer than the rust-version
+            // this workspace declares, so the suggestion cannot be taken until
+            // the MSRV moves; then this allow should go with it.
+            #[allow(clippy::chunks_exact_to_as_chunks)]
             let floats: Vec<f32> = data
                 .chunks_exact(4)
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))

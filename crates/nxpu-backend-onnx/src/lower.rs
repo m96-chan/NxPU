@@ -1899,6 +1899,9 @@ mod tests {
         assert_eq!(init.raw_data.len(), 24); // 6 * 4 bytes
 
         // Verify raw_data decodes back to original floats
+        // See the note in nxpu-opt's calibrate.rs: the lint's suggested
+        // `as_chunks` is newer than this workspace's rust-version.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         let decoded: Vec<f32> = init
             .raw_data
             .chunks_exact(4)

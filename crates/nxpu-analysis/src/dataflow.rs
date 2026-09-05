@@ -770,8 +770,8 @@ mod tests {
         // The shared read of `val` means no WAR/WAW between them
         // unless the expressions overlap. Since val is read by both,
         // and neither writes val, there is no dependency beyond shared reads.
-        assert!(dfg.nodes()[0].kind == DfgNodeKind::Store);
-        assert!(dfg.nodes()[1].kind == DfgNodeKind::Store);
+        assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Store);
+        assert_eq!(dfg.nodes()[1].kind, DfgNodeKind::Store);
     }
 
     #[test]
