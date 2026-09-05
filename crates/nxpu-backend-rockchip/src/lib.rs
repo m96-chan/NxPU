@@ -156,11 +156,11 @@ mod tests {
     #[test]
     fn compile_conv2d() {
         let output = load_and_compile("conv2d", &BackendOptions::default());
-        assert!(!output.files.is_empty());
+        assert_ne!(output.files.len(), 0);
         for file in &output.files {
             match &file.content {
-                OutputContent::Binary(b) => assert!(!b.is_empty()),
-                OutputContent::Text(t) => assert!(!t.is_empty()),
+                OutputContent::Binary(b) => assert_ne!(b.len(), 0),
+                OutputContent::Text(t) => assert_ne!(t.len(), 0),
             }
         }
     }
@@ -168,11 +168,11 @@ mod tests {
     #[test]
     fn compile_relu() {
         let output = load_and_compile("relu", &BackendOptions::default());
-        assert!(!output.files.is_empty());
+        assert_ne!(output.files.len(), 0);
         for file in &output.files {
             match &file.content {
-                OutputContent::Binary(b) => assert!(!b.is_empty()),
-                OutputContent::Text(t) => assert!(!t.is_empty()),
+                OutputContent::Binary(b) => assert_ne!(b.len(), 0),
+                OutputContent::Text(t) => assert_ne!(t.len(), 0),
             }
         }
     }
@@ -180,11 +180,11 @@ mod tests {
     #[test]
     fn compile_attention() {
         let output = load_and_compile("attention", &BackendOptions::default());
-        assert!(!output.files.is_empty());
+        assert_ne!(output.files.len(), 0);
         for file in &output.files {
             match &file.content {
-                OutputContent::Binary(b) => assert!(!b.is_empty()),
-                OutputContent::Text(t) => assert!(!t.is_empty()),
+                OutputContent::Binary(b) => assert_ne!(b.len(), 0),
+                OutputContent::Text(t) => assert_ne!(t.len(), 0),
             }
         }
     }

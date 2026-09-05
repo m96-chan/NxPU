@@ -117,7 +117,7 @@ mod tests {
         };
         if let Statement::If { accept, reject, .. } = &stmt {
             assert_eq!(accept.len(), 1);
-            assert!(reject.is_empty());
+            assert_eq!(reject.len(), 0);
         } else {
             panic!("expected If");
         }
@@ -135,7 +135,7 @@ mod tests {
         } = &stmt
         {
             assert_eq!(body.len(), 1);
-            assert!(continuing.is_empty());
+            assert_eq!(continuing.len(), 0);
         } else {
             panic!("expected Loop");
         }

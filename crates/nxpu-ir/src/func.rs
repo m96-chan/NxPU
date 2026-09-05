@@ -94,10 +94,10 @@ mod tests {
     fn function_new() {
         let f = Function::new("test");
         assert_eq!(f.name.as_deref(), Some("test"));
-        assert!(f.arguments.is_empty());
+        assert_eq!(f.arguments.len(), 0);
         assert!(f.result.is_none());
-        assert!(f.body.is_empty());
-        assert!(f.expressions.is_empty());
+        assert_eq!(f.body.len(), 0);
+        assert_eq!(f.expressions.len(), 0);
     }
 
     #[test]

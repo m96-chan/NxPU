@@ -939,7 +939,7 @@ mod tests {
         let func = Function::new("empty");
         let dfg = DataflowGraph::build(&func);
         let order = dfg.topological_sort().unwrap();
-        assert!(order.is_empty());
+        assert_eq!(order.len(), 0);
     }
 
     #[test]
@@ -1082,7 +1082,7 @@ mod tests {
         let dfg = DataflowGraph::build(&func);
         let cp = dfg.critical_path();
         assert_eq!(cp.critical_path_length, 0);
-        assert!(cp.critical_path.is_empty());
+        assert_eq!(cp.critical_path.len(), 0);
     }
 
     #[test]
@@ -1405,15 +1405,15 @@ mod tests {
 
         // Node 0 should have successors to 1 and 2.
         let succs_0 = dfg.successors(0);
-        assert!(!succs_0.is_empty());
+        assert_ne!(succs_0.len(), 0);
 
         // Node 2 should have predecessors from 0 and/or 1.
         let preds_2 = dfg.predecessors(2);
-        assert!(!preds_2.is_empty());
+        assert_ne!(preds_2.len(), 0);
 
         // Node 0 should have no predecessors.
         let preds_0 = dfg.predecessors(0);
-        assert!(preds_0.is_empty());
+        assert_eq!(preds_0.len(), 0);
     }
 
     // ===== Break / Continue statement classification =====
@@ -1442,8 +1442,8 @@ mod tests {
         let dfg = DataflowGraph::build(&func);
         assert_eq!(dfg.node_count(), 1);
         assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Return);
-        assert!(dfg.nodes()[0].reads.is_empty());
-        assert!(dfg.nodes()[0].writes.is_empty());
+        assert_eq!(dfg.nodes()[0].reads.len(), 0);
+        assert_eq!(dfg.nodes()[0].writes.len(), 0);
     }
 
     // ===== Return with value =====
@@ -1460,7 +1460,7 @@ mod tests {
         assert_eq!(dfg.node_count(), 1);
         assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Return);
         assert!(dfg.nodes()[0].reads.contains(&val));
-        assert!(dfg.nodes()[0].writes.is_empty());
+        assert_eq!(dfg.nodes()[0].writes.len(), 0);
     }
 
     // ===== If statement classification =====
@@ -1651,7 +1651,7 @@ mod tests {
         let dfg = DataflowGraph::build(&func);
         assert_eq!(dfg.node_count(), 1);
         assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Call);
-        assert!(dfg.nodes()[0].writes.is_empty());
+        assert_eq!(dfg.nodes()[0].writes.len(), 0);
     }
 
     // ===== Atomic statement classification =====
@@ -1778,8 +1778,8 @@ mod tests {
         let dfg = DataflowGraph::build(&func);
         assert_eq!(dfg.node_count(), 1);
         assert_eq!(dfg.nodes()[0].kind, DfgNodeKind::Barrier);
-        assert!(dfg.nodes()[0].reads.is_empty());
-        assert!(dfg.nodes()[0].writes.is_empty());
+        assert_eq!(dfg.nodes()[0].reads.len(), 0);
+        assert_eq!(dfg.nodes()[0].writes.len(), 0);
     }
 
     // ===== Barrier to barrier control edge =====
@@ -1947,7 +1947,7 @@ mod tests {
         let func = Function::new("empty");
         let dfg = DataflowGraph::build(&func);
         let groups = dfg.parallel_groups();
-        assert!(groups.is_empty());
+        assert_eq!(groups.len(), 0);
     }
 
     // ===== Critical path multi-path diamond graph =====
@@ -2293,7 +2293,7 @@ mod tests {
         let groups = dfg.parallel_groups();
 
         // First group should have at least 2 independent ops.
-        assert!(!groups.is_empty());
+        assert_ne!(groups.len(), 0);
         let first_group = &groups[0];
         assert!(
             first_group.len() >= 2,

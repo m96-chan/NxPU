@@ -2693,7 +2693,7 @@ mod tests {
             break_if: None,
         }];
         let bounds = extract_loop_bound_literals(&body, &func.expressions);
-        assert!(bounds.is_empty());
+        assert_eq!(bounds.len(), 0);
     }
 
     /// naga 28 lowers `for (var kh = 0u; kh < 5u; ...)` as:
@@ -2768,7 +2768,7 @@ mod tests {
             right: one,
         });
         let strides = extract_multiply_literals(&func.expressions);
-        assert!(strides.is_empty());
+        assert_eq!(strides.len(), 0);
     }
 
     #[test]
@@ -3228,7 +3228,7 @@ mod tests {
         });
 
         let weights = extract_embedded_weights(&module);
-        assert!(weights.is_empty());
+        assert_eq!(weights.len(), 0);
     }
 
     // --- Concat/Split axis inference tests ---

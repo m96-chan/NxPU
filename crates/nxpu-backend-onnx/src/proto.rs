@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(decoded.dims, vec![2, 3]);
         assert_eq!(decoded.name, "weights");
         assert_eq!(decoded.raw_data, raw);
-        assert!(decoded.float_data.is_empty());
+        assert_eq!(decoded.float_data.len(), 0);
     }
 
     #[test]
@@ -427,6 +427,6 @@ mod tests {
         let bytes = tensor.encode_to_vec();
         let decoded = TensorProto::decode(bytes.as_slice()).unwrap();
         assert_eq!(decoded.float_data, vec![0.1, 0.2]);
-        assert!(decoded.raw_data.is_empty());
+        assert_eq!(decoded.raw_data.len(), 0);
     }
 }

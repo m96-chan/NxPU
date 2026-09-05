@@ -441,7 +441,7 @@ mod tests {
     fn empty_module_no_shapes() {
         let module = Module::default();
         let shapes = infer_shapes(&module);
-        assert!(shapes.is_empty());
+        assert_eq!(shapes.len(), 0);
     }
 
     #[test]

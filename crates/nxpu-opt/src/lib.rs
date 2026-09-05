@@ -172,7 +172,7 @@ mod tests {
         let mut module = Module::default();
         optimize(&mut module);
         // Should not panic; module remains empty.
-        assert!(module.entry_points.is_empty());
+        assert_eq!(module.entry_points.len(), 0);
     }
 
     #[test]
@@ -180,7 +180,7 @@ mod tests {
         let pm = PassManager::for_level(OptLevel::O0);
         let mut module = Module::default();
         pm.run(&mut module);
-        assert!(module.entry_points.is_empty());
+        assert_eq!(module.entry_points.len(), 0);
     }
 
     #[test]

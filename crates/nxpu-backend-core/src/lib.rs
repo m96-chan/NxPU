@@ -675,13 +675,13 @@ mod tests {
     #[test]
     fn registry_empty_list_targets() {
         let reg = BackendRegistry::new();
-        assert!(reg.list_targets().is_empty());
+        assert_eq!(reg.list_targets().len(), 0);
     }
 
     #[test]
     fn registry_default_is_empty() {
         let reg = BackendRegistry::default();
-        assert!(reg.list_targets().is_empty());
+        assert_eq!(reg.list_targets().len(), 0);
     }
 
     #[test]
@@ -770,7 +770,7 @@ mod tests {
     #[test]
     fn memory_plan_default() {
         let plan = MemoryPlan::default();
-        assert!(plan.allocations.is_empty());
+        assert_eq!(plan.allocations.len(), 0);
         assert_eq!(plan.peak_bytes, 0);
     }
 
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn per_channel_param_default_empty() {
         let opts = BackendOptions::default();
-        assert!(opts.per_channel_params.is_empty());
+        assert_eq!(opts.per_channel_params.len(), 0);
         let s = format!("{opts}");
         assert!(!s.contains("per_channel"));
     }

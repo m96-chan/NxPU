@@ -512,7 +512,7 @@ mod tests {
     fn compute_schedules_empty_module() {
         let module = Module::default();
         let schedules = compute_schedules(&module);
-        assert!(schedules.is_empty());
+        assert_eq!(schedules.len(), 0);
     }
 
     #[test]
