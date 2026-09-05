@@ -1538,7 +1538,7 @@ fn main() {}";
         let err = lower_module(&naga_module).unwrap_err();
         match err {
             ParseError::Unsupported(ref msg) => {
-                assert!(msg.contains("CooperativeMatrix"), "got: {msg}")
+                assert!(msg.contains("CooperativeMatrix"), "got: {msg}");
             }
             other => panic!("expected Unsupported, got: {other:?}"),
         }
