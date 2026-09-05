@@ -1084,6 +1084,92 @@ pub fn classify_entry_point(
     let input_b = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
     let output_c = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
 
+    // Addresses that were loaded rather than computed.
+    //
+    // Every pattern below reads and writes at positions built from the thread
+    // id. A kernel that takes an address out of a second buffer is a gather or
+    // a scatter whatever its loop structure looks like, so the evidence is
+    // weighed here, once, ahead of the loop/no-loop split — the alternative is
+    // a scatter with a loop reported as a matmul, which is what happened.
+    let input_handles = [inputs[0].0, inputs[1].0];
+    let output_handles: Vec<Handle<GlobalVariable>> = outputs.iter().map(|(h, _)| *h).collect();
+
+    // Writes that accumulate. An atomic output means several invocations
+    // reach the same slot and their contributions are summed there; the
+    // read-modify-write is the operator, not an implementation detail of it.
+    if outputs
+        .iter()
+        .any(|(_, gv)| is_atomic_buffer(module, gv.ty))
+    {
+        return Ok(KernelPattern::Unknown {
+            reason: "the output is an array of atomics, so writes to the same slot \
+                     accumulate instead of overwriting — an accumulating scatter. \
+                     Scatter has no reduction mode and takes the tensor it writes \
+                     into as an input; here the destination is the output itself, \
+                     zeroed by the caller"
+                .into(),
+        });
+    }
+
+    // Writes whose position comes out of a buffer.
+    if detect_indexed_write(
+        &ep.function.body,
+        &ep.function.expressions,
+        &input_handles,
+        &output_handles,
+    ) {
+        let also = if outputs.len() > 1 {
+            ", and it writes two output tensors where every pattern here writes one"
+        } else {
+            ""
+        };
+        return Ok(KernelPattern::Unknown {
+            reason: format!(
+                "the address written to is loaded from an input buffer — a \
+                 data-dependent placement, where the input data decides where each \
+                 element lands{also}. Scatter takes three inputs, a destination to \
+                 write into as well as the indices and the updates, and there are two"
+            ),
+        });
+    }
+
+    // Reads whose position comes out of a buffer. Either input can be the one
+    // holding the addresses; nothing says the index tensor is bound second.
+    let indexed_read = [(0usize, 1usize), (1, 0)].into_iter().find_map(|(d, i)| {
+        detect_indexed_read(
+            &ep.function.body,
+            &ep.function.expressions,
+            inputs[d].0,
+            inputs[i].0,
+            outputs[0].0,
+        )
+        .map(|kind| (d, i, kind))
+    });
+    if let Some((d, i, kind)) = indexed_read {
+        let data = make_binding(module, inputs[d].0, inputs[d].1, TensorRole::Input);
+        let indices = make_binding(module, inputs[i].0, inputs[i].1, TensorRole::Input);
+        return Ok(match kind {
+            IndexedRead::Element => KernelPattern::Gather {
+                data,
+                indices,
+                output: output_c,
+                axis: 0,
+            },
+            // A row gather. Every backend lowers `Gather` over a flat buffer —
+            // one element per index — so emitting one here would select single
+            // elements out of a table whose rows are `D` wide, which is a
+            // different tensor of a different size. The row width is the thing
+            // missing, and nothing in `Gather` can carry it.
+            IndexedRead::Block => KernelPattern::Unknown {
+                reason: "a row gather: the index is scaled by a row width before it \
+                         becomes an address, so each index names a block rather than \
+                         an element. Gather indexes a flat buffer and carries no row \
+                         width"
+                    .into(),
+            },
+        });
+    }
+
     if !has_loop {
         let has_structural_if = has_non_guard_if(&ep.function.body);
 
@@ -2147,6 +2233,252 @@ fn find_store_binary_divide(body: &[Statement], exprs: &Arena<Expression>) -> bo
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Data-dependent addressing
+// ---------------------------------------------------------------------------
+//
+// Every pattern this file recognises reads and writes at positions computed
+// from the thread id: a matmul's `row * K + k`, a convolution's window, an
+// element-wise op's `idx`. The kernels that do not are the ones that take an
+// address *out of a buffer* — a gather on the read side, a scatter on the
+// write side — and that is visible in the expression graph without counting
+// anything.
+
+/// What an index-dependent read addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexedRead {
+    /// `out[i] = data[idx[i]]` — the loaded index *is* the address, so each
+    /// index names one element. This is what `KernelPattern::Gather` lowers
+    /// to: a flat buffer, one element per index.
+    Element,
+    /// `out[i] = data[idx[n] * W + d]` — the loaded index is scaled by a width
+    /// before it becomes an address, so each index names a whole block.
+    Block,
+}
+
+/// Walk a pointer expression down to the global variable it addresses.
+fn access_base_global(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+) -> Option<Handle<GlobalVariable>> {
+    let mut handle = handle;
+    for _ in 0..32 {
+        match exprs.try_get(handle)? {
+            Expression::GlobalVariable(g) => return Some(*g),
+            Expression::Access { base, .. } | Expression::AccessIndex { base, .. } => {
+                handle = *base;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Peel the type casts off a value. `u32(indices[n])` is the index it loaded.
+fn strip_casts(exprs: &Arena<Expression>, handle: Handle<Expression>) -> Handle<Expression> {
+    let mut handle = handle;
+    for _ in 0..8 {
+        match exprs.try_get(handle) {
+            Some(Expression::As { expr, .. }) => handle = *expr,
+            _ => break,
+        }
+    }
+    handle
+}
+
+/// If `handle` is a load out of `global`, the index expression it loaded from.
+fn load_address(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    global: Handle<GlobalVariable>,
+) -> Option<Handle<Expression>> {
+    let Expression::Load { pointer } = exprs.try_get(handle)? else {
+        return None;
+    };
+    let Expression::Access { base, index } = exprs.try_get(*pointer)? else {
+        return None;
+    };
+    (access_base_global(exprs, *base) == Some(global)).then_some(*index)
+}
+
+/// Does any of `roots` load, anywhere inside it, from one of `wanted`?
+///
+/// Iterative with a visited set rather than the depth-limited recursion used
+/// elsewhere in this file: an expression arena is a DAG, and an address built
+/// from shared subexpressions is walked exponentially by the naive spelling.
+fn reads_global(
+    exprs: &Arena<Expression>,
+    roots: &[Handle<Expression>],
+    wanted: &[Handle<GlobalVariable>],
+) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<Handle<Expression>> = roots.to_vec();
+    while let Some(handle) = stack.pop() {
+        if !seen.insert(handle.index()) {
+            continue;
+        }
+        let Some(expr) = exprs.try_get(handle) else {
+            continue;
+        };
+        if let Expression::Load { pointer } = expr
+            && access_base_global(exprs, *pointer).is_some_and(|g| wanted.contains(&g))
+        {
+            return true;
+        }
+        push_operands(expr, &mut stack);
+    }
+    false
+}
+
+/// Push every sub-expression of `expr` onto `stack`.
+fn push_operands(expr: &Expression, stack: &mut Vec<Handle<Expression>>) {
+    match expr {
+        Expression::Load { pointer } => stack.push(*pointer),
+        Expression::Access { base, index } => {
+            stack.push(*base);
+            stack.push(*index);
+        }
+        Expression::AccessIndex { base, .. } => stack.push(*base),
+        Expression::Unary { expr, .. } => stack.push(*expr),
+        Expression::Binary { left, right, .. } => {
+            stack.push(*left);
+            stack.push(*right);
+        }
+        Expression::Select {
+            condition,
+            accept,
+            reject,
+        } => {
+            stack.push(*condition);
+            stack.push(*accept);
+            stack.push(*reject);
+        }
+        Expression::Math {
+            arg,
+            arg1,
+            arg2,
+            arg3,
+            ..
+        } => {
+            stack.push(*arg);
+            stack.extend([*arg1, *arg2, *arg3].into_iter().flatten());
+        }
+        Expression::As { expr, .. } => stack.push(*expr),
+        Expression::Splat { value, .. } => stack.push(*value),
+        Expression::Swizzle { vector, .. } => stack.push(*vector),
+        Expression::Compose { components, .. } => stack.extend(components.iter().copied()),
+        Expression::ArrayLength(handle) => stack.push(*handle),
+        _ => {}
+    }
+}
+
+/// Recognise a store into `output` whose value was loaded from `data` at an
+/// address that was itself loaded from `indices` — a gather.
+///
+/// The two shapes are told apart because only one of them is representable:
+/// `Gather` indexes a flat buffer and carries no row width, so a read whose
+/// index is scaled by one is a different operator wearing the same name.
+fn detect_indexed_read(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    data: Handle<GlobalVariable>,
+    indices: Handle<GlobalVariable>,
+    output: Handle<GlobalVariable>,
+) -> Option<IndexedRead> {
+    for stmt in body {
+        match stmt {
+            Statement::Store { pointer, value } => {
+                if access_base_global(exprs, *pointer) != Some(output) {
+                    continue;
+                }
+                let Some(address) = load_address(exprs, strip_casts(exprs, *value), data) else {
+                    continue;
+                };
+                if !reads_global(exprs, &[address], &[indices]) {
+                    continue;
+                }
+                return Some(
+                    if load_address(exprs, strip_casts(exprs, address), indices).is_some() {
+                        IndexedRead::Element
+                    } else {
+                        IndexedRead::Block
+                    },
+                );
+            }
+            Statement::If { accept, reject, .. } => {
+                if let Some(kind) = detect_indexed_read(accept, exprs, data, indices, output)
+                    .or_else(|| detect_indexed_read(reject, exprs, data, indices, output))
+                {
+                    return Some(kind);
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                if let Some(kind) = detect_indexed_read(body, exprs, data, indices, output)
+                    .or_else(|| detect_indexed_read(continuing, exprs, data, indices, output))
+                {
+                    return Some(kind);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Does a store into one of `outputs` write to an address that was loaded out
+/// of one of `sources` — a scatter?
+fn detect_indexed_write(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    sources: &[Handle<GlobalVariable>],
+    outputs: &[Handle<GlobalVariable>],
+) -> bool {
+    for stmt in body {
+        match stmt {
+            Statement::Store { pointer, .. } => {
+                let Some(Expression::Access { base, index }) = exprs.try_get(*pointer) else {
+                    continue;
+                };
+                if !access_base_global(exprs, *base).is_some_and(|g| outputs.contains(&g)) {
+                    continue;
+                }
+                if reads_global(exprs, &[*index], sources) {
+                    return true;
+                }
+            }
+            Statement::If { accept, reject, .. }
+                if detect_indexed_write(accept, exprs, sources, outputs)
+                    || detect_indexed_write(reject, exprs, sources, outputs) =>
+            {
+                return true;
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } if detect_indexed_write(body, exprs, sources, outputs)
+                || detect_indexed_write(continuing, exprs, sources, outputs) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Is this buffer an array of atomics (or an atomic scalar)?
+///
+/// An atomic output is a statement about the operator: several invocations
+/// reach the same slot and their contributions are combined there.
+fn is_atomic_buffer(module: &Module, ty: Handle<Type>) -> bool {
+    match &module.types[ty].inner {
+        TypeInner::Atomic(_) => true,
+        TypeInner::Array { base, .. } => matches!(&module.types[*base].inner, TypeInner::Atomic(_)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
