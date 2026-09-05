@@ -146,6 +146,11 @@ impl LowerCtx<'_> {
                     span,
                 })
             }
+            // naga 29 added cooperative matrices — subgroup-level matrix
+            // primitives. They map onto the same hardware an NPU backend
+            // targets, so this is a rejection worth revisiting rather than a
+            // permanent one.
+            naga::TypeInner::CooperativeMatrix { .. } => Err(unsupported("CooperativeMatrix type")),
             naga::TypeInner::Image { .. } => Err(unsupported("Image type")),
             naga::TypeInner::Sampler { .. } => Err(unsupported("Sampler type")),
             naga::TypeInner::AccelerationStructure { .. } => {
@@ -521,6 +526,15 @@ impl LowerCtx<'_> {
                 self.map_func_expr(fctx, expr)?,
             )),
             // Unsupported expression kinds
+            // One arm rather than two: a cooperative-matrix operation cannot
+            // appear without a cooperative-matrix type, and lower_type_inner
+            // rejects that first, so neither is reachable through the WGSL
+            // frontend. They exist to keep the match exhaustive — a catch-all
+            // here would silently swallow whatever naga adds next.
+            naga::Expression::CooperativeLoad { .. }
+            | naga::Expression::CooperativeMultiplyAdd { .. } => {
+                Err(unsupported("cooperative matrix expression"))
+            }
             naga::Expression::Derivative { .. } => Err(unsupported("Derivative expression")),
             naga::Expression::Relational { .. } => Err(unsupported("Relational expression")),
             naga::Expression::ImageSample { .. } => Err(unsupported("ImageSample expression")),
@@ -760,6 +774,12 @@ impl LowerCtx<'_> {
             }
             // Unsupported statements
             naga::Statement::Switch { .. } => return Err(unsupported("Switch statement")),
+            naga::Statement::CooperativeStore { .. } => {
+                return Err(unsupported("CooperativeStore statement"));
+            }
+            naga::Statement::RayPipelineFunction(_) => {
+                return Err(unsupported("RayPipelineFunction statement"));
+            }
             naga::Statement::Kill => return Err(unsupported("Kill statement")),
             naga::Statement::ImageStore { .. } => return Err(unsupported("ImageStore statement")),
             naga::Statement::ImageAtomic { .. } => {
@@ -1500,6 +1520,26 @@ fn main() {}";
             ParseError::Unsupported(ref msg) => assert!(msg.contains("Image"), "got: {msg}"),
             other => panic!("expected Unsupported, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn error_unsupported_cooperative_matrix_type() {
+        // naga 29 added cooperative matrices — subgroup-level matrix
+        // primitives, and the first thing in a while that an NPU backend might
+        // actually want to lower rather than reject.
+        let source = "
+enable wgpu_cooperative_matrix;
+
+var<workgroup> m: coop_mat8x8<f32, A>;
+
+@compute @workgroup_size(1)
+fn main() {}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let err = lower_module(&naga_module).unwrap_err();
+        assert!(
+            matches!(&err, ParseError::Unsupported(msg) if msg.contains("CooperativeMatrix")),
+            "expected Unsupported(CooperativeMatrix), got: {err:?}"
+        );
     }
 
     #[test]
