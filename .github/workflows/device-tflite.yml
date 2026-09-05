@@ -148,6 +148,17 @@ jobs:
             echo "--- $f"; cat "$f" 2>/dev/null || echo "absent"; echo
           done
 
+      # The two runs above are allowed to fail so that one visit to the phone
+      # answers as much as possible. That must not make the job green: a run
+      # that verified nothing has to say so.
+      - name: Verdict
+        if: always()
+        run: |
+          if [ -z "${{ steps.numeric.outputs.executed }}" ]; then
+            echo "::error::the model did not execute; see numeric.json above"
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -179,9 +190,9 @@ jobs:
       - name: Numbers
         run: |
           if [ ! -f device/device-out/output-0.bin ]; then
-            echo "::warning::the device wrote no outputs; nothing to compare"
+            echo "::error::the device wrote no outputs; nothing to compare"
             ls -R device 2>/dev/null || true
-            exit 0
+            exit 1
           fi
           python3 - <<'PY'
           import struct
