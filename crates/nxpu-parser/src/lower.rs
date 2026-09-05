@@ -1536,12 +1536,10 @@ var<workgroup> m: coop_mat8x8<f32, A>;
 fn main() {}";
         let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
         let err = lower_module(&naga_module).unwrap_err();
-        match err {
-            ParseError::Unsupported(ref msg) => {
-                assert!(msg.contains("CooperativeMatrix"), "got: {msg}");
-            }
-            other => panic!("expected Unsupported, got: {other:?}"),
-        }
+        assert!(
+            matches!(&err, ParseError::Unsupported(msg) if msg.contains("CooperativeMatrix")),
+            "expected Unsupported(CooperativeMatrix), got: {err:?}"
+        );
     }
 
     #[test]
