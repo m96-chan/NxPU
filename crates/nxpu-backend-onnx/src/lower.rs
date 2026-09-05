@@ -34,7 +34,8 @@ pub fn build_model(
             weight,
             output,
             shape,
-        } => build_conv2d_graph(input, weight, output, shape, ep_name),
+            bias,
+        } => build_conv2d_graph(input, weight, bias.as_ref(), output, shape, ep_name),
         KernelPattern::Pool {
             kind,
             input,
@@ -548,6 +549,7 @@ fn build_elementwise_graph(
 fn build_conv2d_graph(
     input: &TensorBinding,
     weight: &TensorBinding,
+    bias: Option<&TensorBinding>,
     output: &TensorBinding,
     shape: &Conv2DShape,
     ep_name: &str,
@@ -585,7 +587,11 @@ fn build_conv2d_graph(
             NodeProto::with_attrs(
                 "Conv",
                 "conv_0",
-                vec![input.name.clone(), weight.name.clone()],
+                // ONNX Conv takes B as an optional third input.
+                match bias {
+                    Some(b) => vec![input.name.clone(), weight.name.clone(), b.name.clone()],
+                    None => vec![input.name.clone(), weight.name.clone()],
+                },
                 vec![output.name.clone()],
                 attrs,
             )
@@ -611,7 +617,18 @@ fn build_conv2d_graph(
                     TensorShapeDimension::symbolic(&shape.kernel_w),
                 ],
             ),
-        ],
+        ]
+        .into_iter()
+        // A node input that the graph does not declare makes the model
+        // invalid, so the bias has to appear here as well as on the node.
+        .chain(bias.map(|b| {
+            ValueInfoProto::tensor(
+                &b.name,
+                b.elem_type,
+                vec![TensorShapeDimension::symbolic(&shape.channels_out)],
+            )
+        }))
+        .collect(),
         output: vec![ValueInfoProto::tensor(
             &output.name,
             output.elem_type,
@@ -1797,6 +1814,7 @@ mod tests {
                 dilation_h: 1,
                 dilation_w: 1,
             },
+            bias: None,
         };
         let model = build_model(&pattern, "conv2d", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
@@ -1997,6 +2015,7 @@ mod tests {
             weight: make_tensor("w", TensorRole::Input),
             output: make_tensor("y", TensorRole::Output),
             shape: make_conv2d_shape(),
+            bias: None,
         };
         let fused = FusedPattern::Single(pattern);
         let model = build_fused_model(&fused, "single_conv", &[]).unwrap();
@@ -2013,6 +2032,7 @@ mod tests {
             weight: make_tensor("w", TensorRole::Input),
             output: make_tensor("conv_out", TensorRole::Output),
             shape: make_conv2d_shape(),
+            bias: None,
         };
         let norm = KernelPattern::Normalization {
             input: make_tensor("conv_out", TensorRole::Input),
@@ -2331,6 +2351,7 @@ mod tests {
             weight: make_tensor("w", TensorRole::Input),
             output: make_tensor("conv_out", TensorRole::Output),
             shape: make_conv2d_shape(),
+            bias: None,
         };
         let norm = KernelPattern::Normalization {
             input: make_tensor("conv_out", TensorRole::Input),
@@ -2497,6 +2518,7 @@ mod tests {
             weight: make_tensor("w", TensorRole::Input),
             output: make_tensor("conv_out", TensorRole::Output),
             shape: make_conv2d_shape(),
+            bias: None,
         };
         let norm = KernelPattern::Normalization {
             input: make_tensor("conv_out", TensorRole::Input),

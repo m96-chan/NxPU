@@ -313,6 +313,12 @@ pub enum KernelPattern {
         input: TensorBinding,
         weight: TensorBinding,
         output: TensorBinding,
+        /// Per-output-channel bias, when the kernel has one.
+        ///
+        /// Optional because a convolution need not have a bias, not because
+        /// dropping it is acceptable: a backend that cannot emit one must
+        /// refuse rather than silently compute a convolution without it.
+        bias: Option<TensorBinding>,
         shape: Conv2DShape,
     },
     /// Pooling: nested loops + reduction over spatial window.
@@ -986,6 +992,72 @@ pub fn classify_entry_point(
             });
         }
 
+        // Conv with a bias. Convolution detection lived in the two-input arm,
+        // so every conv that adds a per-channel bias — which is most of them —
+        // arrived here with three inputs and was refused for want of a
+        // recogniser rather than for want of a lowering.
+        //
+        // The evidence is the kernel window itself, named in the params. A
+        // parameter count is not evidence and was tried: it swallowed
+        // attention scores, GQA, MoE dispatch and an inverse STFT, all
+        // reported as CONV_2D — the same guessing this recogniser replaces,
+        // moved to a different arm.
+        //
+        // KH and KW without a KD is exactly two spatial dimensions. A 1-D
+        // conv names one extent, a 3-D conv names three, and a transposed
+        // conv is a different operator; none of them is a Conv2D and each is
+        // refused below rather than rounded to one.
+        let names_kernel = |n: &str| {
+            shape_names.iter().any(|s| {
+                s.eq_ignore_ascii_case(n) || s.eq_ignore_ascii_case(&format!("kernel_{n}"))
+            })
+        };
+        if num_inputs == 3
+            && outputs.len() == 1
+            && has_loop
+            && names_kernel("kh")
+            && names_kernel("kw")
+            && !names_kernel("kd")
+        {
+            let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
+            let weight = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
+            let bias = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
+            let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
+            let conv_shape = extract_conv2d_shape(
+                &shape_names,
+                Some(&ep.function.body),
+                Some(&ep.function.expressions),
+            );
+            return Ok(KernelPattern::Conv2D {
+                input,
+                weight,
+                output,
+                bias: Some(bias),
+                shape: conv_shape,
+            });
+        }
+
+        // The convolutions this compiler has no operator for. Each is a real
+        // shape, recognised, and declined by name — which is worth more than
+        // a CONV_2D that computes something else.
+        if num_inputs == 3 && outputs.len() == 1 && has_loop {
+            let names = |n: &str| shape_names.iter().any(|s| s.eq_ignore_ascii_case(n));
+            if names("kd") {
+                return Ok(KernelPattern::Unknown {
+                    reason: "3-D convolution — the kernel window has three \
+                             spatial extents and Conv2D has two"
+                        .into(),
+                });
+            }
+            if names("lout") && names("k") {
+                return Ok(KernelPattern::Unknown {
+                    reason: "1-D or transposed convolution — one spatial \
+                             extent, which Conv2D cannot represent"
+                        .into(),
+                });
+            }
+        }
+
         // Scatter: 3 inputs + 1 output + no loop (simple scatter write)
         if num_inputs == 3 && outputs.len() == 1 && !has_loop {
             let data = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
@@ -1106,14 +1178,18 @@ pub fn classify_entry_point(
         });
     }
 
-    // 2 inputs + loop: Conv2D (many params) vs MatMul (3 params)
+    // 2 inputs + loop: a convolution without a bias.
     //
-    // The parameter count is the only evidence left here and it is not much:
-    // it separates conv from matmul by how many numbers the kernel was handed.
-    // Requiring literal loop bounds was tried and is wrong — a conv whose
-    // kernel size comes from params has none. Distinguishing what remains
-    // needs the recogniser to look at what the kernel computes.
-    if shape_names.len() > 3 {
+    // Same evidence as the three-input arm — the kernel window named in the
+    // params. The parameter count that used to stand in for it reported
+    // attention's context half, GQA's, and MoE dispatch as CONV_2D.
+    let names_kernel_2d = shape_names
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case("kh") || s.eq_ignore_ascii_case("kernel_h"))
+        && shape_names
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("kw") || s.eq_ignore_ascii_case("kernel_w"));
+    if names_kernel_2d {
         let conv_shape = extract_conv2d_shape(
             &shape_names,
             Some(&ep.function.body),
@@ -1124,6 +1200,7 @@ pub fn classify_entry_point(
             weight: input_b,
             output: output_c,
             shape: conv_shape,
+            bias: None,
         });
     }
 

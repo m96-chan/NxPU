@@ -1042,6 +1042,7 @@ mod tests {
                 dilation_h: 1,
                 dilation_w: 1,
             },
+            bias: None,
         };
         let mlir = build_mlir(&pattern, "conv2d").unwrap();
         assert!(mlir.contains("stablehlo.convolution"));
