@@ -53,6 +53,16 @@ struct Cli {
     #[arg(long)]
     dynamic_batch: bool,
 
+    /// Concrete extent for tensor dimensions the kernel leaves symbolic
+    ///
+    /// A WGSL kernel over `array<f32>` carries no length, so most dimensions
+    /// have no size at compile time. ONNX names them and lets the runtime
+    /// resolve them; TFLite requires a concrete extent and will not load a
+    /// model without one. Without this flag the smallest valid extent (1) is
+    /// used, which loads but measures nothing.
+    #[arg(long, value_name = "N")]
+    symbolic_dim: Option<u32>,
+
     /// Directory containing calibration data (.bin files with f32 values)
     #[arg(long)]
     calibration_data: Option<PathBuf>,
@@ -399,6 +409,7 @@ fn run() -> miette::Result<()> {
         per_channel_params,
         tiling_plans,
         vectorization_hints,
+        symbolic_extent: cli.symbolic_dim,
     };
 
     let output = backend

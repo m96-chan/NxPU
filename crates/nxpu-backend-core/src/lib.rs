@@ -89,6 +89,18 @@ pub trait Backend: Debug + Send + Sync {
 pub struct BackendOptions {
     /// Optimization level (0 = none, 1 = basic, 2 = aggressive).
     pub opt_level: u8,
+    /// Concrete extent to substitute for tensor dimensions the kernel leaves
+    /// symbolic.
+    ///
+    /// A WGSL kernel over `array<f32>` carries no length, so the emitted graph
+    /// has no size for most dimensions. Formats differ on what to do about
+    /// that: ONNX names them and resolves later, while TFLite requires a
+    /// concrete extent and cannot load a model without one. `None` means the
+    /// caller did not say, and the backend picks the smallest valid extent.
+    ///
+    /// The type forbids a negative value on purpose: writing `-1` here is the
+    /// bug that made every TFLite model this project emitted unloadable.
+    pub symbolic_extent: Option<u32>,
     /// Precision policy for quantization.
     ///
     /// The CLI applies the corresponding quantization pass to the IR before

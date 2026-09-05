@@ -267,3 +267,28 @@ fn no_example_carries_a_negative_extent() {
         "these models cannot be loaded by any interpreter: {offenders:?}"
     );
 }
+
+#[test]
+fn the_requested_extent_reaches_the_model() {
+    use nxpu_backend_core::{Backend, BackendOptions};
+    let source = common::load_example("vecadd");
+    let compile = |extent: Option<u32>| {
+        let mut module = nxpu_parser::parse(&source).expect("WGSL parse failed");
+        nxpu_opt::PassManager::for_level(nxpu_opt::OptLevel::O1).run(&mut module);
+        let output = TfLiteBackend
+            .compile(
+                &module,
+                &BackendOptions {
+                    opt_level: 1,
+                    symbolic_extent: extent,
+                    ..Default::default()
+                },
+            )
+            .expect("backend compilation failed");
+        common::first_binary(&output).to_vec()
+    };
+    // Same graph, different extents: if the flag did not reach the tensors the
+    // two would be byte-identical, which is how the first attempt failed.
+    assert_ne!(compile(None), compile(Some(1024)));
+    assert!(!has_negative_dim_word(&compile(Some(1024))));
+}
