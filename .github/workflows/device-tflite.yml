@@ -17,9 +17,13 @@ on:
         required: true
         default: vecadd
       elements:
-        description: "Element count for the input tensors"
+        description: >-
+          Element count for the input tensors. Must match the extent the
+          backend emitted, which is SYMBOLIC_EXTENT (1) for every dimension a
+          WGSL kernel leaves symbolic. A mismatch is reported by the device as
+          a byte-count error naming the tensor, not as a wrong answer.
         required: true
-        default: "1024"
+        default: "1"
 
 permissions:
   contents: read
@@ -27,7 +31,7 @@ permissions:
 # `inputs` is null on push, so every reference goes through these.
 env:
   EXAMPLE: ${{ inputs.example || 'vecadd' }}
-  ELEMENTS: ${{ inputs.elements || '1024' }}
+  ELEMENTS: ${{ inputs.elements || '1' }}
 
 jobs:
   # Cargo on a phone is a waste of the one resource a phone has that a cloud
