@@ -220,10 +220,18 @@ jobs:
           i = max(range(len(ulp)), key=lambda i: abs(ulp[i]))
           print(f"worst at index {i}: expected {want[i]!r}, device {got[i]!r}")
 
-          # This accelerator is not bit-exact for f32 and the deviation has a
-          # direction, so the bound is a tolerance rather than equality. It is
-          # deliberately tight: 1 ULP is what has been observed, and a looser
-          # bound would stop reporting the day it grows.
+          # This accelerator is not bit-exact for f32, so the bound is a
+          # tolerance rather than equality. It is deliberately tight: 1 ULP is
+          # what these fixtures produce, and a looser bound would stop
+          # reporting the day it grows.
+          #
+          # It does grow. On operands finer than these — sums needing the full
+          # significand rather than multiples of 0.25 — the Qualcomm path
+          # discards the smaller addend entirely, and the error reaches
+          # hundreds of ULP. These fixtures are all well above the resolution
+          # where that begins, so 1 ULP is a fact about this input, not about
+          # the hardware. Widening the bound to accommodate a future fixture
+          # set would defeat the only check that has ever caught anything.
           if worst > 1:
               raise SystemExit(f"outside tolerance: {worst} ULP")
           if any(u != 0 for u in ulp):
