@@ -519,6 +519,18 @@ fn type_dims(ty_handle: Handle<Type>, types: &UniqueArena<Type>) -> Vec<i64> {
     }
 }
 
+/// Whether a params-struct member is an integer scalar, and so plausibly a
+/// tensor dimension rather than a tuning constant like `eps`.
+fn is_integer_member(module: &Module, m: &nxpu_ir::StructMember) -> bool {
+    matches!(
+        module.types[m.ty].inner,
+        TypeInner::Scalar(Scalar {
+            kind: ScalarKind::Uint | ScalarKind::Sint,
+            ..
+        })
+    )
+}
+
 /// Detect number of attention heads from shape_names or literal divisions.
 fn detect_num_heads(shape_names: &[String], exprs: &Arena<Expression>) -> u32 {
     // Look for param named "num_heads", "n_head", "H", "n_heads", "nhead"
@@ -737,8 +749,18 @@ pub fn classify_entry_point(
         ));
     }
 
+    // Shape parameters only. A params struct routinely carries scalars that
+    // are not dimensions — `eps` is the common one — and counting them made
+    // LayerNorm, whose struct is (N, D, eps), look like it had three shape
+    // names and report itself as BatchNorm.
     let shape_names: Vec<String> = params_members
-        .map(|members| members.iter().filter_map(|m| m.name.clone()).collect())
+        .map(|members| {
+            members
+                .iter()
+                .filter(|m| is_integer_member(module, m))
+                .filter_map(|m| m.name.clone())
+                .collect()
+        })
         .unwrap_or_default();
 
     let has_loop = has_loop(&ep.function.body);
@@ -885,12 +907,21 @@ pub fn classify_entry_point(
             });
         }
 
-        // Normalization: 3 inputs (input, scale, bias) + 1 output + loop + Sqrt, no Exp.
+        // Normalization: 3 inputs (input, scale, bias) + 1 output + loop, a
+        // reciprocal square root in either spelling, and no Exp.
         // Distinguishes LayerNorm (2 shape params: N, C) from BatchNorm (3+: N, C, HW).
+        //
+        // `inverseSqrt` is the spelling a kernel written for speed uses, and
+        // requiring `sqrt` rejected real LayerNorm and GroupNorm kernels for a
+        // difference that is not one.
         if num_inputs == 3
             && outputs.len() == 1
             && has_loop
-            && has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sqrt)
+            && (has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sqrt)
+                || has_math_function_in_expressions(
+                    &ep.function.expressions,
+                    MathFunction::InverseSqrt,
+                ))
             && !has_math_function_in_expressions(&ep.function.expressions, MathFunction::Exp)
         {
             let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
@@ -3741,6 +3772,45 @@ mod tests {
         let names: Vec<String> = vec!["N".into()];
         let result = find_if_comparison_axis(&body, &func.expressions, &names);
         assert_eq!(result, None);
+    }
+
+    /// A params struct that mixes dimensions with a tolerance constant is the
+    /// normal case, not an edge one: LayerNorm's is (N, D, eps), and counting
+    /// eps as a third dimension is what made it report as BatchNorm.
+    #[test]
+    fn eps_is_not_a_dimension() {
+        let mut module = Module::default();
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let members = [
+            StructMember {
+                name: Some("N".into()),
+                ty: u32_ty,
+                offset: 0,
+            },
+            StructMember {
+                name: Some("D".into()),
+                ty: u32_ty,
+                offset: 4,
+            },
+            StructMember {
+                name: Some("eps".into()),
+                ty: f32_ty,
+                offset: 8,
+            },
+        ];
+        let dims: Vec<String> = members
+            .iter()
+            .filter(|m| is_integer_member(&module, m))
+            .filter_map(|m| m.name.clone())
+            .collect();
+        assert_eq!(dims, vec!["N".to_string(), "D".to_string()]);
     }
 
     // --- Multi-head & causal attention classification tests ---

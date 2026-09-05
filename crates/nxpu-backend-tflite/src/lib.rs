@@ -231,7 +231,13 @@ fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
         analyze::KernelPattern::Reduce { op, .. } => op.op_name(),
         analyze::KernelPattern::Transpose { .. } => "TRANSPOSE",
         analyze::KernelPattern::Reshape { .. } => "RESHAPE",
-        analyze::KernelPattern::Normalization { .. } => "BatchNormalization",
+        // The kind matters: reporting every normalization as BatchNormalization
+        // hid a LayerNorm being classified correctly and described wrongly,
+        // which is worse than either mistake alone.
+        analyze::KernelPattern::Normalization { norm_type, .. } => match norm_type {
+            analyze::NormType::Batch => "BatchNormalization",
+            analyze::NormType::Layer => "LayerNormalization",
+        },
         analyze::KernelPattern::Concat { .. } => "CONCATENATION",
         analyze::KernelPattern::Split { .. } => "SPLIT",
         analyze::KernelPattern::Attention { .. } => "Attention",
