@@ -179,10 +179,7 @@ mod tests {
         let output = load_and_compile("conv2d", &BackendOptions::default());
         assert_ne!(output.files.len(), 0);
         for file in &output.files {
-            match &file.content {
-                OutputContent::Binary(b) => assert_ne!(b.len(), 0),
-                OutputContent::Text(t) => assert_ne!(t.len(), 0),
-            }
+            assert_ne!(file.content.len(), 0);
         }
     }
 
@@ -191,10 +188,7 @@ mod tests {
         let output = load_and_compile("relu", &BackendOptions::default());
         assert_ne!(output.files.len(), 0);
         for file in &output.files {
-            match &file.content {
-                OutputContent::Binary(b) => assert_ne!(b.len(), 0),
-                OutputContent::Text(t) => assert_ne!(t.len(), 0),
-            }
+            assert_ne!(file.content.len(), 0);
         }
     }
 
@@ -203,10 +197,7 @@ mod tests {
         let output = load_and_compile("attention", &BackendOptions::default());
         assert_ne!(output.files.len(), 0);
         for file in &output.files {
-            match &file.content {
-                OutputContent::Binary(b) => assert_ne!(b.len(), 0),
-                OutputContent::Text(t) => assert_ne!(t.len(), 0),
-            }
+            assert_ne!(file.content.len(), 0);
         }
     }
 

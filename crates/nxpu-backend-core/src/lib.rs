@@ -244,6 +244,28 @@ pub enum OutputContent {
     Binary(Vec<u8>),
 }
 
+impl OutputContent {
+    /// Size of the content in bytes — UTF-8 bytes for text, raw bytes for
+    /// binary.
+    ///
+    /// Exists so a caller that only wants to know whether a backend produced
+    /// anything does not have to match on the variant. Five backend test
+    /// suites were each carrying the same two-arm match, and in every one of
+    /// them the text arm was unreachable, because those backends emit binary
+    /// only.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Text(s) => s.len(),
+            Self::Binary(b) => b.len(),
+        }
+    }
+
+    /// Whether the content is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 impl fmt::Display for OutputContent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -507,6 +529,30 @@ impl Backend for IrDumpBackend {
             }],
             diagnostics: vec![],
         })
+    }
+}
+
+#[cfg(test)]
+mod output_content_tests {
+    use super::*;
+
+    #[test]
+    fn text_length_is_utf8_bytes() {
+        // Not chars: a caller sizing a buffer needs bytes.
+        assert_eq!(OutputContent::Text("hello".into()).len(), 5);
+        assert_eq!(OutputContent::Text("日本語".into()).len(), 9);
+    }
+
+    #[test]
+    fn binary_length_is_bytes() {
+        assert_eq!(OutputContent::Binary(vec![0u8; 7]).len(), 7);
+    }
+
+    #[test]
+    fn both_variants_report_empty() {
+        assert!(OutputContent::Text(String::new()).is_empty());
+        assert!(OutputContent::Binary(Vec::new()).is_empty());
+        assert!(!OutputContent::Binary(vec![1]).is_empty());
     }
 }
 
