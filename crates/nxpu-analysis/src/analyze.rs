@@ -816,6 +816,22 @@ pub fn classify_entry_point(
                 });
             }
 
+            // A reindexing kernel: it moves values without computing on
+            // them, so there is no activation to find and it used to fall
+            // through to Unknown. Every backend already lowers Transpose.
+            if let Some(perm) = detect_permutation(
+                &ep.function.body,
+                &ep.function.expressions,
+                inputs[0].0,
+                outputs[0].0,
+            ) {
+                return Ok(KernelPattern::Transpose {
+                    input,
+                    output: make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output),
+                    perm,
+                });
+            }
+
             // No recognized activation — unknown pattern.
             return Ok(KernelPattern::Unknown {
                 reason: "single input, no loop, no recognized activation function".into(),
@@ -1790,6 +1806,193 @@ fn contains_math_fun(
         Some(Expression::Unary { expr, .. }) => contains_math_fun(exprs, *expr, target),
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Permutation recognition
+// ---------------------------------------------------------------------------
+
+/// How many divisions were applied to the flat invocation id to produce this
+/// value, or `None` if it is not derived from the id by the usual
+/// decomposition.
+///
+/// A kernel that reindexes a tensor peels dimensions off the flat id from the
+/// fastest-varying end: `d = id % D`, `rest = id / D`, `i = rest % N`, and so
+/// on. The number of divisions on the path is therefore the axis's distance
+/// from the fastest end, which is all that is needed to place it.
+fn id_division_depth(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    depth: u32,
+) -> Option<u32> {
+    if depth == 0 {
+        return None;
+    }
+    match exprs.try_get(handle)? {
+        // The flat id itself: `gid.x`.
+        Expression::AccessIndex { base, index: 0 } => {
+            matches!(exprs.try_get(*base)?, Expression::FunctionArgument(_)).then_some(0)
+        }
+        Expression::Binary { op, left, .. } => match op {
+            BinaryOp::Modulo => id_division_depth(exprs, *left, depth - 1),
+            BinaryOp::Divide => id_division_depth(exprs, *left, depth - 1).map(|d| d + 1),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Decompose a store index built as `((c_n * f_n + c_n-1) * f_n-1 + …) + c_0`
+/// into its components, fastest-varying first.
+///
+/// Both spellings are accepted: the multiply-add as written, and the `fma`
+/// the optimizer rewrites it into. Missing the second cost a whole pass's
+/// worth of kernels once already.
+fn flatten_index_components(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    out: &mut Vec<Handle<Expression>>,
+    depth: u32,
+) {
+    if depth == 0 {
+        return;
+    }
+    match exprs.try_get(handle) {
+        Some(Expression::Math {
+            fun: MathFunction::Fma,
+            arg,
+            arg2: Some(addend),
+            ..
+        }) => {
+            out.push(*addend);
+            flatten_index_components(exprs, *arg, out, depth - 1);
+        }
+        Some(Expression::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        }) => {
+            // `a * f + c`: the addend is the component, the product carries
+            // the rest.
+            let (product, addend) = match exprs.try_get(*left) {
+                Some(Expression::Binary {
+                    op: BinaryOp::Multiply,
+                    ..
+                }) => (*left, *right),
+                _ => (*right, *left),
+            };
+            out.push(addend);
+            if let Some(Expression::Binary {
+                op: BinaryOp::Multiply,
+                left: inner,
+                ..
+            }) = exprs.try_get(product)
+            {
+                flatten_index_components(exprs, *inner, out, depth - 1);
+            }
+        }
+        _ => out.push(handle),
+    }
+}
+
+/// Recognise a kernel that copies `input[id]` to a position built by taking
+/// the flat id apart and putting it back together in a different order.
+///
+/// Every backend already lowers `KernelPattern::Transpose`; until now nothing
+/// produced one, so `permute` was refused for want of a recogniser rather
+/// than for want of a lowering.
+fn detect_permutation(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    input: Handle<GlobalVariable>,
+    output: Handle<GlobalVariable>,
+) -> Option<Vec<i64>> {
+    fn find_store(
+        body: &[Statement],
+        exprs: &Arena<Expression>,
+        input: Handle<GlobalVariable>,
+        output: Handle<GlobalVariable>,
+    ) -> Option<(Handle<Expression>, Handle<Expression>)> {
+        for stmt in body {
+            match stmt {
+                Statement::Store { pointer, value } => {
+                    let store_index = match exprs.try_get(*pointer) {
+                        Some(Expression::Access { base, index })
+                            if matches!(
+                                exprs.try_get(*base),
+                                Some(Expression::GlobalVariable(g)) if *g == output
+                            ) =>
+                        {
+                            *index
+                        }
+                        _ => continue,
+                    };
+                    let load_index = match exprs.try_get(*value) {
+                        Some(Expression::Load { pointer }) => match exprs.try_get(*pointer) {
+                            Some(Expression::Access { base, index })
+                                if matches!(
+                                    exprs.try_get(*base),
+                                    Some(Expression::GlobalVariable(g)) if *g == input
+                                ) =>
+                            {
+                                *index
+                            }
+                            _ => continue,
+                        },
+                        _ => continue,
+                    };
+                    return Some((store_index, load_index));
+                }
+                Statement::If { accept, reject, .. } => {
+                    if let Some(found) = find_store(accept, exprs, input, output)
+                        .or_else(|| find_store(reject, exprs, input, output))
+                    {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    let (store_index, load_index) = find_store(body, exprs, input, output)?;
+
+    // The read has to be the plain flat id; anything else is a gather, not a
+    // permutation, and calling it Transpose would be the same kind of
+    // confident guess this recogniser exists to replace.
+    if id_division_depth(exprs, load_index, 32)? != 0 {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    flatten_index_components(exprs, store_index, &mut components, 32);
+    if components.len() < 2 {
+        return None;
+    }
+
+    // Components come out fastest-first; a permutation is stated slowest-first.
+    let rank = components.len();
+    let mut perm = Vec::with_capacity(rank);
+    for handle in components.iter().rev() {
+        let depth = id_division_depth(exprs, *handle, 32)?;
+        if depth as usize >= rank {
+            return None;
+        }
+        perm.push((rank - 1 - depth as usize) as i64);
+    }
+
+    // A genuine permutation uses each axis exactly once, and one that is the
+    // identity is a copy rather than a transpose.
+    let mut seen = perm.clone();
+    seen.sort_unstable();
+    if seen != (0..rank as i64).collect::<Vec<_>>() {
+        return None;
+    }
+    if perm.iter().enumerate().all(|(i, p)| i as i64 == *p) {
+        return None;
+    }
+    Some(perm)
 }
 
 /// Check if a block contains a Store whose value (or sub-expr) uses a specific Math function.
