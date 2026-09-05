@@ -1084,8 +1084,6 @@ fn append_activation(
 /// activation fusion.  All fused combinations now emit proper multi-operator
 /// subgraphs instead of delegating to the unfused single-op builder.
 pub fn build_fused_model(fp: &FusedPattern, extent: i32) -> Result<Vec<u8>, BackendError> {
-    use nxpu_analysis::fusion::FusedActivation;
-
     match fp {
         FusedPattern::Single(p) => build_model(p, extent),
         FusedPattern::ConvBatchNorm { conv, norm } => {
@@ -1099,9 +1097,11 @@ pub fn build_fused_model(fp: &FusedPattern, extent: i32) -> Result<Vec<u8>, Back
         FusedPattern::WithActivation {
             base, activation, ..
         } => {
-            if matches!(activation, FusedActivation::None) {
-                return build_fused_model(base, extent);
-            }
+            // `activation_opcode` returns None for exactly one variant, and
+            // it is the one this guard used to test for separately. Two places
+            // deciding "there is no activation to append" is one place too
+            // many: the second arm was unreachable, and an unreachable arm is
+            // a rule that cannot be checked.
             let act_opcode = match activation_opcode(activation) {
                 Some(c) => c,
                 None => return build_fused_model(base, extent),
