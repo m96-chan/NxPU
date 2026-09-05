@@ -57,6 +57,8 @@ fn run_onnx_1d(wgsl_source: &str, inputs: Vec<Vec<f32>>) -> Vec<f32> {
 
     let result = model.run(tract_inputs.into()).expect("inference failed");
     let output_tensor = result[0]
+        .try_as_plain()
+        .expect("tensor is not plainly stored")
         .to_array_view::<f32>()
         .expect("failed to get f32 output");
     output_tensor.iter().copied().collect()
@@ -95,6 +97,8 @@ fn run_onnx_matmul(wgsl_source: &str, a: Array2<f32>, b: Array2<f32>) -> Array2<
         .run(tvec![a_tensor, b_tensor])
         .expect("matmul inference failed");
     let out = result[0]
+        .try_as_plain()
+        .expect("tensor is not plainly stored")
         .to_array_view::<f32>()
         .expect("failed to get f32 output");
     out.to_owned()
@@ -151,6 +155,8 @@ fn run_onnx(wgsl_source: &str, inputs: Vec<(Vec<f32>, Vec<usize>)>) -> Vec<f32> 
 
     let result = model.run(tract_inputs.into()).expect("inference failed");
     result[0]
+        .try_as_plain()
+        .expect("tensor is not plainly stored")
         .to_array_view::<f32>()
         .expect("failed to get f32 output")
         .iter()
