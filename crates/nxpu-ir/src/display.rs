@@ -181,6 +181,8 @@ impl fmt::Display for MathFunction {
             Self::Step => "step",
             Self::SmoothStep => "smoothStep",
             Self::Fma => "fma",
+            Self::ExtractBits => "extractBits",
+            Self::InsertBits => "insertBits",
         };
         write!(f, "{name}")
     }
