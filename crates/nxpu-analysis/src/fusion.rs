@@ -9,6 +9,7 @@ use crate::analyze::KernelPattern;
 pub fn output_tensor_names(pattern: &KernelPattern) -> Vec<&str> {
     match pattern {
         KernelPattern::MatMul { output, .. }
+        | KernelPattern::QuantizedMatMul { output, .. }
         | KernelPattern::ElementWise { output, .. }
         | KernelPattern::Conv2D { output, .. }
         | KernelPattern::Pool { output, .. }
@@ -31,6 +32,20 @@ pub fn output_tensor_names(pattern: &KernelPattern) -> Vec<&str> {
 pub fn input_tensor_names(pattern: &KernelPattern) -> Vec<&str> {
     match pattern {
         KernelPattern::MatMul { inputs, .. } => inputs.iter().map(|t| t.name.as_str()).collect(),
+        // The scale and the addend are inputs of the graph like any other:
+        // both arrive per dispatch, so either could be the output of a kernel
+        // that ran before this one.
+        KernelPattern::QuantizedMatMul {
+            input,
+            weight,
+            scale,
+            bias,
+            ..
+        } => [input, weight, scale]
+            .into_iter()
+            .chain(bias.as_ref())
+            .map(|t| t.name.as_str())
+            .collect(),
         KernelPattern::ElementWise { inputs, .. } => {
             inputs.iter().map(|t| t.name.as_str()).collect()
         }

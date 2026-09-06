@@ -107,6 +107,19 @@ pub fn build_mlir(pattern: &KernelPattern, ep_name: &str) -> Result<String, Back
                 nxpu_analysis::analyze::chain_summary(*cast, steps)
             )));
         }
+        // The scale is rank 1 against a rank-2 weight, so dequantizing it
+        // needs a `broadcast_in_dim` this backend does not emit — the same gap
+        // the chain above names. StableHLO's own quantized element type
+        // carries its scales in the type, which would mean writing the values
+        // into the module, and here they arrive per dispatch.
+        KernelPattern::QuantizedMatMul { .. } => {
+            return Err(BackendError::Unsupported(
+                "cannot lower a quantized matmul to StableHLO: the per-channel \
+                 scale is rank 1 against a rank-2 weight and this backend emits \
+                 no broadcast_in_dim"
+                    .into(),
+            ));
+        }
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
                 "cannot lower Unknown pattern to StableHLO: {reason}"

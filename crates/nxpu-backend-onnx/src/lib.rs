@@ -145,6 +145,16 @@ fn pattern_summary(pattern: &analyze::KernelPattern) -> std::borrow::Cow<'static
             return Cow::Owned(analyze::chain_summary(*cast, steps));
         }
         analyze::KernelPattern::MatMul { .. } => "MatMul",
+        // The whole graph, not its last node: there is no quantized matmul
+        // operator here, and "MatMul" alone would hide the dequantization
+        // that makes the answer right.
+        analyze::KernelPattern::QuantizedMatMul { bias, .. } => {
+            if bias.is_some() {
+                "Transpose+DequantizeLinear+MatMul+Add (int8 weights, per-channel scale)"
+            } else {
+                "Transpose+DequantizeLinear+MatMul (int8 weights, per-channel scale)"
+            }
+        }
         analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
         analyze::KernelPattern::Conv2D { .. } => "Conv",
         analyze::KernelPattern::Pool { kind, .. } => kind.op_name(),

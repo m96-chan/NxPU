@@ -24,6 +24,22 @@ pub fn build_model(
             output,
             shape,
         } => build_matmul_graph(inputs, output, shape, ep_name),
+        KernelPattern::QuantizedMatMul {
+            input,
+            weight,
+            scale,
+            bias,
+            output,
+            shape,
+        } => build_quantized_matmul_graph(
+            input,
+            weight,
+            scale,
+            bias.as_ref(),
+            output,
+            shape,
+            ep_name,
+        ),
         KernelPattern::ElementWise {
             op,
             inputs,
@@ -510,6 +526,130 @@ fn build_matmul_graph(
                 TensorShapeDimension::symbolic(&shape.m),
                 TensorShapeDimension::symbolic(&shape.n),
             ],
+        )],
+    }
+}
+
+/// `Transpose → DequantizeLinear → MatMul → Add`.
+///
+/// The weight is a graph input of type INT8 shaped `[n, k]`, and the scale one
+/// of type FLOAT shaped `[n]`. Both are graph inputs rather than initializers
+/// because the kernel binds them per dispatch: `inject_per_channel_qdq` writes
+/// the other shape, where the values are known when the model is written, and
+/// these are not.
+///
+/// No zero point. The corpus quantizes by row absmax, so the codes are
+/// symmetric around zero, and `DequantizeLinear`'s optional third input
+/// defaults to exactly the zero this needs. Passing a zero tensor would say
+/// the same thing in one more initializer.
+///
+/// The transpose is not bookkeeping: `MatMul` contracts the right operand's
+/// second-to-last axis, and the weight's rows are output channels, so the axis
+/// to contract is its last one. After the transpose the output channels are
+/// axis 1, which is why `DequantizeLinear` is given `axis = 1` — per-axis
+/// dequantization along the axis the scales are per.
+///
+/// **The order of those two is load-bearing, and was found by loading it.**
+/// Dequantizing first and transposing the f32 result is the same arithmetic
+/// and produces a model onnxruntime refuses: its transpose optimizer pushes
+/// the transpose back through the `DequantizeLinear`, re-introduces a
+/// `QuantizeLinear` beside it, and types that one `uint8` against an `int8`
+/// input. Transposing the codes moves a quarter of the bytes and sidesteps it.
+/// `Gemm` with `transB = 1` also loads and would fold the transpose and the
+/// bias into one node; it is not used so that this graph and the TFLite one
+/// contain the same operators, which is what `pattern_op_names` reports and
+/// what a vendor support matrix is then asked about.
+fn build_quantized_matmul_graph(
+    input: &TensorBinding,
+    weight: &TensorBinding,
+    scale: &TensorBinding,
+    bias: Option<&TensorBinding>,
+    output: &TensorBinding,
+    shape: &MatMulShape,
+    ep_name: &str,
+) -> GraphProto {
+    // A matvec is a matmul over one row, and the classifier names that row
+    // count `1` rather than a dispatch parameter; a fixed dimension says more
+    // than a symbol nothing else refers to.
+    let rows = || match shape.m.as_str() {
+        "1" => TensorShapeDimension::fixed(1),
+        m => TensorShapeDimension::symbolic(m),
+    };
+    let contraction_major = format!("{}_contraction_major", weight.name);
+    let dequantized = format!("{}_dequantized", weight.name);
+    let contracted = if bias.is_some() {
+        format!("{}_unbiased", output.name)
+    } else {
+        output.name.clone()
+    };
+
+    let mut node = vec![
+        NodeProto::with_attrs(
+            "Transpose",
+            "transpose_weight",
+            vec![weight.name.clone()],
+            vec![contraction_major.clone()],
+            vec![AttributeProto::ints("perm", vec![1, 0])],
+        ),
+        NodeProto::with_attrs(
+            "DequantizeLinear",
+            "dequantize_weight",
+            vec![contraction_major, scale.name.clone()],
+            vec![dequantized.clone()],
+            vec![AttributeProto::int("axis", 1)],
+        ),
+        NodeProto::simple(
+            "MatMul",
+            "matmul_0",
+            vec![input.name.clone(), dequantized],
+            vec![contracted.clone()],
+        ),
+    ];
+
+    let mut graph_input = vec![
+        ValueInfoProto::tensor(
+            &input.name,
+            input.elem_type,
+            vec![rows(), TensorShapeDimension::symbolic(&shape.k)],
+        ),
+        ValueInfoProto::tensor(
+            &weight.name,
+            weight.elem_type,
+            vec![
+                TensorShapeDimension::symbolic(&shape.n),
+                TensorShapeDimension::symbolic(&shape.k),
+            ],
+        ),
+        ValueInfoProto::tensor(
+            &scale.name,
+            scale.elem_type,
+            vec![TensorShapeDimension::symbolic(&shape.n)],
+        ),
+    ];
+
+    if let Some(bias) = bias {
+        graph_input.push(ValueInfoProto::tensor(
+            &bias.name,
+            bias.elem_type,
+            vec![TensorShapeDimension::symbolic(&shape.n)],
+        ));
+        node.push(NodeProto::simple(
+            "Add",
+            "add_bias",
+            vec![contracted, bias.name.clone()],
+            vec![output.name.clone()],
+        ));
+    }
+
+    GraphProto {
+        name: ep_name.into(),
+        initializer: vec![],
+        node,
+        input: graph_input,
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vec![rows(), TensorShapeDimension::symbolic(&shape.n)],
         )],
     }
 }
