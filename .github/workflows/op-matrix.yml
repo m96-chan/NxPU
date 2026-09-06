@@ -45,6 +45,17 @@ on:
           mtk-dsp_shim nnapi-reference`.
         required: true
         default: "qnn-htp"
+      iterations:
+        description: >-
+          Timed iterations per model. 0 asks only whether the graph was
+          accepted, which is answered once tensors are allocated and is what
+          the support matrix wants -- timing every model on every driver turns
+          a two-minute sweep into a long one. Set it when the question is
+          which engine is faster, which is a different question and the one
+          that decides whether routing operators between them is worth
+          anything at all.
+        required: true
+        default: "0"
       symbolic-dim:
         description: >-
           Concrete extent for the dimensions an NxPU kernel leaves symbolic. A
@@ -61,6 +72,7 @@ permissions:
 # the script and a value with a quote in it becomes a command.
 env:
   SYMBOLIC_DIM: ${{ inputs.symbolic-dim || '64' }}
+  ITERATIONS: ${{ inputs.iterations || '0' }}
   DRIVERS: ${{ inputs.drivers || 'qnn-htp' }}
   PHONE: ${{ inputs.phone || 'soc-qti-sm8550-qcom' }}
 
@@ -173,16 +185,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          # One entry per model, `iterations: 0` throughout: the question is
+          # One entry per model. `iterations: 0` by default: the question is
           # whether the graph was accepted, and that is answered once tensors
           # are allocated. Timing every model on every driver turns a two-minute
-          # sweep into an evening, for numbers nobody asked for.
+          # sweep into a long one, so it is asked for rather than assumed.
           manifest() {  # manifest [device]
             local separator=""
             printf '['
             while IFS=$'\t' read -r id file operator precision source; do
-              printf '%s{"id":"%s","path":"%s/models/%s","iterations":0' \
-                "$separator" "$id" "$PWD" "$file"
+              printf '%s{"id":"%s","path":"%s/models/%s","iterations":%s' \
+                "$separator" "$id" "$PWD" "$file" "$ITERATIONS"
               if [ -n "${1:-}" ]; then printf ',"device":"%s"' "$1"; fi
               printf '}'
               separator=","

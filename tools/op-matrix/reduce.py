@@ -142,11 +142,28 @@ def device_of(capabilities_path):
     ) if value is not None}
 
 
+def mark_of(cell):
+    """The cell as one field: the mark, and the time when there is one.
+
+    A timed sweep answers a different question from an untimed one -- not
+    whether an engine will take the operator but which engine is faster -- and
+    the second question is the one that decides whether routing operators
+    between two engines is worth anything. Both belong in the same cell,
+    because a time without an attribution is a number about the CPU as often
+    as not.
+    """
+    mark = MARK[cell["status"]]
+    median = cell.get("medianUs")
+    if median is None:
+        return mark
+    return f"{mark} {median / 1000:.2f}ms"
+
+
 def table(lines, rows, drivers, first_column, cell_of):
     lines += ["| " + first_column + " | precision | " + " | ".join(drivers) + " |",
               "| --- | --- | " + " | ".join("---" for _ in drivers) + " |"]
     for row in rows:
-        marks = " | ".join(MARK[row["drivers"][d]["status"]] for d in drivers)
+        marks = " | ".join(mark_of(row["drivers"][d]) for d in drivers)
         lines.append(f"| {cell_of(row)} | {row['precision']} | {marks} |")
 
 
@@ -194,6 +211,13 @@ def main():
             stable = (row or {}).get("conditions", {}).get("stable")
             if stable is not None:
                 cell["stable"] = stable
+            # Absent unless the sweep asked for iterations. Carried but never
+            # compared: `compare.py` keys on status, because a median that
+            # moved is a phone that got warm and a status that moved is a
+            # driver that changed its mind.
+            median = (row or {}).get("medianUs")
+            if median is not None:
+                cell["medianUs"] = median
             cells[driver] = cell
         rows.append({"operator": row_name(model), "precision": model["precision"],
                      "id": model["id"], "usable": usable,
