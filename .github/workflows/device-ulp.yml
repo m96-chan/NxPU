@@ -12,32 +12,34 @@ on:
   push:
     branches: [feat/device-numerics]
   workflow_dispatch:
-    inputs:
-      set:
-        description: "Fixture set: baseline, signed, odd or resolution"
-        required: true
-        default: baseline
 
 permissions:
   contents: read
 
 env:
-  # Pinned rather than tracking their default branch: a fixture that changes
-  # under us turns a comparison into a coincidence.
-  DROIDRUNNER_REF: main
-  SET: ${{ inputs.set || 'baseline' }}
+  # Pinned to a tag, not a branch: a fixture that changes under us turns a
+  # comparison into a coincidence. The hashes below are checked too, because a
+  # tag can be moved.
+  DROIDRUNNER_REF: v0.10.0
 
 jobs:
   fetch:
-    name: Fetch the fixtures
+    name: Fetch ${{ matrix.set }}
     runs-on: ubuntu-latest
+    # All four sets, because the first one alone misled the people who built
+    # them: on `baseline` every expected value is a multiple of 0.25, so its
+    # low mantissa bit is already clear and "+1 to the word" and "set the low
+    # bit" produce identical output. `odd` is what separates them.
+    strategy:
+      matrix:
+        set: [baseline, signed, odd, resolution]
     steps:
       - name: Download
         run: |
           set -euo pipefail
           base="https://raw.githubusercontent.com/m96-chan/DroidRunner/${DROIDRUNNER_REF}/tools/ulp/fixtures"
           mkdir -p fixtures
-          case "$SET" in
+          case "${{ matrix.set }}" in
             baseline)   prefix="" ;;
             signed)     prefix="signed-" ;;
             odd)        prefix="odd-" ;;
@@ -49,24 +51,58 @@ jobs:
             curl -fsSL -o "fixtures/$f.bin" "$base/${prefix}${f}.bin"
           done
           ls -l fixtures/
-          # A fixture that silently came back as an HTML error page would make
-          # the comparison meaningless rather than failing it.
-          test "$(stat -c%s fixtures/input-0.bin)" -ge 1024
+
+          # Checked against the hashes DroidRunner published for this tag. A
+          # fixture that arrived as an HTML error page, or from a moved tag,
+          # would make the comparison meaningless rather than failing it — and
+          # "identical bytes" is the entire reason to fetch theirs instead of
+          # generating our own.
+          cat > expected.sha256 <<'SUMS'
+          de28ea6c8299b7b03bd3dbb7fd0db03981f60998b2f3cc7edadf15d8490aa6fd  add-f32.tflite
+          938d5a1eba4e7cdc474be2900bae10603ea13ba9012c68d324fb2549b7904011  baseline-input-0.bin
+          012b2194f5a578b969d981c062db771f383e2b3aa3d8c9a3ab733f9aa6a6de67  baseline-input-1.bin
+          4d01c1d7df42641d284145617099566c84912f314283b66a62844b17ecd37b6f  baseline-expected.bin
+          ad3d7b572a6e3b99ded4520333e4136d3c273af6e26301574e21514b39d41e2b  odd-input-0.bin
+          e2b7bec7a3806df824f0f9c8dfcb5fa3003e0bdea6036326126437b600f33e17  odd-input-1.bin
+          58861abc5c7283e548cb3d71076b9da47b8efb5ecc45c561f3574acff1b1cf38  odd-expected.bin
+          e9bac255f4adc7cb4ada9298e193a5ff66b434d15afabd458505325f29c398c7  resolution-input-0.bin
+          e5f111ed3b3216f923f9dc39e403e5bbac3d354eefd81aa540cc204f03251946  resolution-input-1.bin
+          317b8534a96889fbe0642b5090e3a588930bb1fdc127ba32ca5c739dd42a150d  resolution-expected.bin
+          5f3fa5dbcc710fac746e3f10ff98fb037e44406c010f59689f13a8dd5cca2eea  signed-input-0.bin
+          51cb01a83e22c5aaed11a86f40db4a30433bf88b20db9d1d45551920cf5ff5ad  signed-input-1.bin
+          68db9bbe4ca190ab891e68721845e12e367c76c0ef6fdad1611450409d05af4a  signed-expected.bin
+          SUMS
+          sed -i 's/^ *//' expected.sha256
+          for f in input-0 input-1 expected; do
+            want=$(grep " ${{ matrix.set }}-$f.bin$" expected.sha256 | cut -d' ' -f1)
+            got=$(sha256sum "fixtures/$f.bin" | cut -d' ' -f1)
+            [ "$want" = "$got" ] || { echo "::error::${{ matrix.set }}/$f.bin hash mismatch"; exit 1; }
+          done
+          want=$(grep ' add-f32.tflite$' expected.sha256 | cut -d' ' -f1)
+          got=$(sha256sum fixtures/add-f32.tflite | cut -d' ' -f1)
+          [ "$want" = "$got" ] || { echo "::error::add-f32.tflite hash mismatch"; exit 1; }
+          echo "fixtures verified against ${DROIDRUNNER_REF}"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ulp-fixtures
+          name: ulp-fixtures-${{ matrix.set }}
           path: fixtures/
           if-no-files-found: error
 
   device:
-    name: Run on V73
+    name: Run ${{ matrix.set }} on V73
     needs: fetch
+    # One at a time: the phone is one device, and two jobs racing for it would
+    # measure each other's thermal state.
+    strategy:
+      max-parallel: 1
+      matrix:
+        set: [baseline, signed, odd, resolution]
     runs-on: [self-hosted, android, soc-qti-sm8550-qcom]
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: ulp-fixtures
+          name: ulp-fixtures-${{ matrix.set }}
           path: fixtures
 
       - name: What the phone has
@@ -125,7 +161,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: ulp-result
+          name: ulp-result-${{ matrix.set }}
           path: |
             out-cpu/
             out-htp/
@@ -145,7 +181,7 @@ jobs:
           path: fixtures
       - uses: actions/download-artifact@v8
         with:
-          name: ulp-result
+          name: ulp-result-${{ matrix.set }}
           path: result
         continue-on-error: true
 
