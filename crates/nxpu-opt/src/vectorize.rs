@@ -329,6 +329,7 @@ mod tests {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         };
         let hints = analyze_vectorization(&pattern, 128);
         assert_eq!(hints.len(), 1);

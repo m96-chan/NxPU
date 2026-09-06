@@ -100,6 +100,10 @@ fn build_pattern_layers(
             output,
             shape,
             bias: None,
+            // Dropped here, and it does not go unnoticed: this backend also
+            // emits ONNX, which refuses a convolution carrying one, and that
+            // refusal reaches the caller as a warning rather than silence.
+            activation: _,
         } => {
             let input_ids = create_parameter_layers(&[input, weight], layer_id, layers);
             let compute = IrLayer {
@@ -519,6 +523,7 @@ mod tests {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         }];
 
         let xml = build_ir_xml(&patterns, "test_conv2d");

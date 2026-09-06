@@ -115,6 +115,23 @@ pub mod softmax_options {
     pub const BETA: u16 = 4;
 }
 
+/// `ActivationFunctionType`, the activation a convolution or a pool can carry
+/// in its own options table rather than as a following operator.
+///
+/// Worth fusing rather than appending: the operator matrix excludes a model
+/// that lowers to two operators, because a refusal cannot be attributed to one
+/// of them, and a partitioned graph pays a memory round trip at every boundary.
+/// Sigmoid is deliberately absent -- TFLite has no fused form for it.
+#[allow(dead_code)]
+pub mod activation_function {
+    pub const NONE: i32 = 0;
+    pub const RELU: i32 = 1;
+    pub const RELU_N1_TO_1: i32 = 2;
+    pub const RELU6: i32 = 3;
+    pub const TANH: i32 = 4;
+    pub const SIGN_BIT: i32 = 5;
+}
+
 /// `Padding`, which is an enum and not a flag.
 ///
 /// SAME comes first, so it is zero and VALID is one. Both the convolution and

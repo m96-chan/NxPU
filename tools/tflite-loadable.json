@@ -8,6 +8,7 @@
     "conv2d",
     "conv2d_3x3",
     "conv2d_5x5",
+    "conv2d_relu",
     "depthwise_conv",
     "gather",
     "gelu",

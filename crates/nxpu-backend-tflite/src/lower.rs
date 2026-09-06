@@ -13,8 +13,8 @@ use nxpu_analysis::fusion::FusedPattern;
 use nxpu_backend_core::BackendError;
 
 use crate::schema::{
-    builtin_op, builtin_options_type, concatenation_options, conv2d_options, padding,
-    pool2d_options, softmax_options, split_options, tensor_type, vt,
+    activation_function, builtin_op, builtin_options_type, concatenation_options, conv2d_options,
+    padding, pool2d_options, softmax_options, split_options, tensor_type, vt,
 };
 
 /// File identifier for TFLite FlatBuffer files.
@@ -95,7 +95,16 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
             output,
             shape,
             bias,
-        } => build_tflite_conv2d(input, weight, bias.as_ref(), output, shape, extent),
+            activation,
+        } => build_tflite_conv2d(
+            input,
+            weight,
+            bias.as_ref(),
+            output,
+            shape,
+            *activation,
+            extent,
+        ),
         KernelPattern::Pool {
             kind,
             input,
@@ -353,6 +362,11 @@ enum OpOptions {
         stride_h: i32,
         dilation_w: i32,
         dilation_h: i32,
+        /// Folded into the convolution rather than appended after it. A kernel
+        /// writing `max(sum, 0.0)` is a convolution and a ReLU, and emitting
+        /// only the convolution is a graph that runs and returns unclipped
+        /// values.
+        activation: i32,
     },
     Pool2D {
         padding: i8,
@@ -508,6 +522,7 @@ fn build_from_graph_desc(desc: &GraphDesc, extent: i32) -> Vec<u8> {
                 stride_h,
                 dilation_w,
                 dilation_h,
+                activation,
             } => {
                 let start = fbb.start_table();
                 // Every default here is the value that must not be written
@@ -515,7 +530,11 @@ fn build_from_graph_desc(desc: &GraphDesc, extent: i32) -> Vec<u8> {
                 fbb.push_slot::<i8>(conv2d_options::PADDING, *pad, padding::SAME);
                 fbb.push_slot::<i32>(conv2d_options::STRIDE_W, (*stride_w).max(1), 0);
                 fbb.push_slot::<i32>(conv2d_options::STRIDE_H, (*stride_h).max(1), 0);
-                fbb.push_slot::<i32>(conv2d_options::ACTIVATION, 0, 0);
+                fbb.push_slot::<i32>(
+                    conv2d_options::ACTIVATION,
+                    *activation,
+                    activation_function::NONE,
+                );
                 fbb.push_slot::<i32>(conv2d_options::DILATION_W, (*dilation_w).max(1), 1);
                 fbb.push_slot::<i32>(conv2d_options::DILATION_H, (*dilation_h).max(1), 1);
                 Some((builtin_options_type::CONV_2D, fbb.end_table(start)))
@@ -1246,12 +1265,14 @@ fn collect_single_graph(pattern: &KernelPattern, extent: i32) -> Result<GraphDes
             output,
             shape,
             bias,
+            activation,
         } => Ok(conv2d_graph(
             input,
             weight,
             bias.as_ref(),
             output,
             shape,
+            *activation,
             extent,
         )),
         KernelPattern::Pool {
@@ -2497,16 +2518,18 @@ fn build_tflite_softmax(input: &TensorBinding, output: &TensorBinding, extent: i
 /// neither mode reproduces it, and emitting the nearer one would be a model
 /// that runs and computes something else. A PAD operator says exactly what the
 /// kernel says, and the convolution after it is VALID.
+#[allow(clippy::too_many_arguments)]
 fn build_tflite_conv2d(
     input: &TensorBinding,
     weight: &TensorBinding,
     bias: Option<&TensorBinding>,
     output: &TensorBinding,
     shape: &Conv2DShape,
+    activation: Option<ActivationOp>,
     extent: i32,
 ) -> Vec<u8> {
     build_from_graph_desc(
-        &conv2d_graph(input, weight, bias, output, shape, extent),
+        &conv2d_graph(input, weight, bias, output, shape, activation, extent),
         extent,
     )
 }
@@ -2518,14 +2541,26 @@ fn build_tflite_conv2d(
 /// options and one shape vector for every tensor -- so a convolution followed
 /// by an activation, which is the shape most real ones have, went out with a
 /// stride of 0 and a missing bias and was refused by TFLite's own kernel.
+#[allow(clippy::too_many_arguments)]
 fn conv2d_graph(
     input: &TensorBinding,
     weight: &TensorBinding,
     bias: Option<&TensorBinding>,
     output: &TensorBinding,
     shape: &Conv2DShape,
+    activation: Option<ActivationOp>,
     extent: i32,
 ) -> GraphDesc {
+    // TFLite carries an activation inside the convolution's own options, and
+    // has a form for exactly these. Sigmoid and the multiply-shaped ones
+    // (GELU, SiLU, Mish) have none, and the classifier does not report them
+    // here for that reason -- see `store_value_activation`.
+    let fused_activation = match activation {
+        None => activation_function::NONE,
+        Some(ActivationOp::Relu) => activation_function::RELU,
+        Some(ActivationOp::Tanh) => activation_function::TANH,
+        Some(_) => activation_function::NONE,
+    };
     // A convolution's tensors do not share a shape, and one vector used to be
     // written to all of them. At `--symbolic-dim 64` every tensor came out
     // [64, 64, 64, 64]: a 64x64 window with 64 channels each way over a 64x64
@@ -2661,6 +2696,7 @@ fn conv2d_graph(
             stride_h: shape.stride_h as i32,
             dilation_w: shape.dilation_w as i32,
             dilation_h: shape.dilation_h as i32,
+            activation: fused_activation,
         },
     });
 
@@ -3527,6 +3563,7 @@ mod tests {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         };
         let bytes = build_model(&pattern, 8).unwrap();
         assert!(has_shape(&bytes, &[8, 8, 8, 8]), "no input shape");
@@ -3573,6 +3610,7 @@ mod tests {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         };
         let bytes = build_model(&pattern, 16).unwrap();
         assert!(has_shape(&bytes, &[16, 16, 16, 16]), "no input shape");
@@ -3630,6 +3668,7 @@ mod tests {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         };
         let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
@@ -3710,6 +3749,7 @@ mod tests {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         }
     }
 
