@@ -5,7 +5,7 @@ use clap::Parser;
 use miette::{Context, IntoDiagnostic};
 
 use nxpu_backend_core::{
-    BackendOptions, BackendRegistry, OutputContent, Precision, PrecisionPolicy,
+    BackendOptions, BackendRegistry, ConstantTensor, OutputContent, Precision, PrecisionPolicy,
 };
 use nxpu_opt::{OptLevel, PassManager};
 
@@ -63,6 +63,25 @@ struct Cli {
     #[arg(long, value_name = "N")]
     symbolic_dim: Option<u32>,
 
+    /// Directory of tensor contents, one `<tensor-name>.bin` per tensor
+    ///
+    /// A WGSL kernel takes its weights through `var<storage, read>`, so the
+    /// source says nothing about what they are — the host binds them per
+    /// dispatch. An NNAPI driver will not take a convolution on those terms.
+    /// Measured on a MediaTek MT6899: `mtk-neuron_shim` accelerates a
+    /// convolution whose filter is a compile-time constant and refuses the
+    /// identical convolution, at the same shapes, whose filter is a graph
+    /// input. Naming a tensor here emits it as a constant instead.
+    ///
+    /// Raw little-endian, in the tensor's own element type. A file whose size
+    /// does not match the tensor is an error rather than a truncation.
+    ///
+    /// Not needed for the GPU: TFLite's own delegate takes a convolution with
+    /// a runtime filter, and on that phone it accelerates more of what this
+    /// compiler emits than any NNAPI driver does.
+    #[arg(long, value_name = "DIR")]
+    weights: Option<PathBuf>,
+
     /// Directory containing calibration data (.bin files with f32 values)
     #[arg(long)]
     calibration_data: Option<PathBuf>,
@@ -82,6 +101,44 @@ struct Cli {
     /// List all available target backends and exit
     #[arg(long)]
     list_targets: bool,
+}
+
+/// Read `<tensor-name>.bin` for every tensor the caller supplied.
+///
+/// The naming follows `--calibration-data`, which is the convention this
+/// project already has for feeding a directory of external data in. Only the
+/// file stem is used, so `weight.bin` supplies the tensor a WGSL kernel binds
+/// as `weight`.
+///
+/// Nothing is invented here. A tensor with no file stays a graph input, and
+/// the backend says what that costs; filling one with zeros to win an
+/// acceleration would produce a model that runs, is attributed to the
+/// accelerator, and computes the wrong thing.
+fn load_constant_tensors(dir: &std::path::Path) -> miette::Result<Vec<ConstantTensor>> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| miette::miette!("cannot read the weights directory {}: {e}", dir.display()))?;
+    let mut tensors = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| miette::miette!("cannot read the weights directory: {e}"))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let data = std::fs::read(&path)
+            .map_err(|e| miette::miette!("cannot read {}: {e}", path.display()))?;
+        tensors.push(ConstantTensor {
+            name: name.to_string(),
+            data,
+        });
+    }
+    // Deterministic order, so two runs over the same directory produce the
+    // same bytes and a comparison between them means something.
+    tensors.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(tensors)
 }
 
 fn parse_calibration_method(s: &str) -> Result<nxpu_opt::CalibrationMethod, String> {
@@ -397,6 +454,13 @@ fn run() -> miette::Result<()> {
         }
     }
 
+    // Read before compiling, so a missing or unreadable file is reported here
+    // rather than after the work.
+    let constant_tensors = match &cli.weights {
+        None => Vec::new(),
+        Some(dir) => load_constant_tensors(dir)?,
+    };
+
     let opts = BackendOptions {
         opt_level: match cli.opt_level {
             OptLevel::O0 => 0,
@@ -410,6 +474,7 @@ fn run() -> miette::Result<()> {
         tiling_plans,
         vectorization_hints,
         symbolic_extent: cli.symbolic_dim,
+        constant_tensors,
     };
 
     let output = backend

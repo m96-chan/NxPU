@@ -135,6 +135,30 @@ pub struct BackendOptions {
     /// Backends may use these to emit SIMD annotations or select
     /// vector instruction widths.
     pub vectorization_hints: Vec<VectorizationHintInfo>,
+    /// Contents for tensors the kernel receives as buffers, by name.
+    ///
+    /// A WGSL kernel takes its weights through `var<storage, read>` and there
+    /// is nothing in the source to say what they are — the host binds them per
+    /// dispatch. An NNAPI driver will not accept a convolution on those terms:
+    /// measured on a MediaTek MT6899, `mtk-neuron_shim` accelerates a
+    /// convolution whose filter is a compile-time constant and refuses the
+    /// identical convolution, at the same shapes, whose filter is a graph
+    /// input.
+    ///
+    /// A tensor named here is emitted as a constant and stops being a graph
+    /// input. Empty is not "fill it with zeros": a model that accelerated
+    /// because its weights were invented would run, be attributed to the
+    /// accelerator, and compute the wrong thing.
+    pub constant_tensors: Vec<ConstantTensor>,
+}
+
+/// Contents for one tensor, supplied by the caller rather than by the kernel.
+#[derive(Clone, Debug)]
+pub struct ConstantTensor {
+    /// The tensor's name, as the WGSL binding spells it.
+    pub name: String,
+    /// Raw little-endian contents, in the tensor's own element type.
+    pub data: Vec<u8>,
 }
 
 /// A per-tensor quantization parameter entry.

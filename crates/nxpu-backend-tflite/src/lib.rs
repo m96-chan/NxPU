@@ -108,11 +108,18 @@ impl Backend for TfLiteBackend {
 
             // Emit warnings for unsupported attention features in the TFLite backend.
             emit_attention_diagnostics(fp, ep_name, &mut diagnostics);
+            emit_runtime_filter_diagnostic(fp, ep_name, opts, &mut diagnostics);
 
             // A caller who did not say gets the smallest valid extent, which loads
             // but measures nothing; `--symbolic-dim` is how you ask for a size
             // worth timing.
-            let bytes = lower::build_fused_model(fp, extent)?;
+            let bytes = lower::build_fused_model(
+                fp,
+                lower::Lowering {
+                    extent,
+                    constants: &opts.constant_tensors,
+                },
+            )?;
 
             let filename = if fused.len() == 1 {
                 "output.tflite".into()
@@ -181,6 +188,42 @@ impl Backend for TfLiteBackend {
 
 /// Emit diagnostic warnings when the TFLite backend encounters attention patterns
 /// with features it does not yet support (multi-head splitting, causal masking).
+/// Say when a convolution will not be accelerated, and why.
+///
+/// An NNAPI driver requires a convolution's filter to be a compile-time
+/// constant. A MediaTek MT6899 accelerates a convolution whose filter is one
+/// and refuses the identical convolution, at the same shapes, whose filter is
+/// a graph input — and reports the refusal as `unsupported`, which reads as a
+/// statement about CONV_2D and is a statement about this model. Four device
+/// sweeps and a byte-level diff went into learning that from the outside.
+///
+/// So it is said here instead. Not an error: TFLite's own GPU delegate takes
+/// the convolution either way, and on that phone the GPU accepts more of what
+/// this compiler emits than any NNAPI driver does.
+fn emit_runtime_filter_diagnostic(
+    fp: &fusion::FusedPattern,
+    ep_name: &str,
+    opts: &BackendOptions,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let analyze::KernelPattern::Conv2D { weight, .. } = fp.primary_pattern() else {
+        return;
+    };
+    if opts.constant_tensors.iter().any(|c| c.name == weight.name) {
+        return;
+    }
+    diagnostics.push(Diagnostic {
+        level: DiagnosticLevel::Warning,
+        message: format!(
+            "entry point '{ep_name}': `{}` is a graph input, so an NNAPI driver will \
+             refuse this convolution and it will run on the CPU. TFLite's GPU delegate \
+             takes it as it is. To reach an NPU, supply the contents with \
+             --weights <DIR>/{}.bin",
+            weight.name, weight.name
+        ),
+    });
+}
+
 fn emit_attention_diagnostics(
     fp: &fusion::FusedPattern,
     ep_name: &str,
