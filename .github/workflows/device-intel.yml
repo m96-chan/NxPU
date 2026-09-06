@@ -5,6 +5,21 @@ name: Device Intel NPU
 # Same order as the Hexagon and XDNA work: measure before designing. This one
 # runs under WSL2, where device passthrough is its own question — an NPU that
 # the host can see is not automatically one this kernel can.
+#
+# Answered, 2026-09-06, and the runner cannot reach the NPU at all:
+#
+#   The job runs in a *container* (its hostname is a Docker id) inside WSL2, so
+#   a device would have to be passed through twice. Neither hop happened:
+#   /dev/accel is absent and no intel_vpu module is listed.
+#
+#   There is no level-zero library, no npu-smi, and no python3 — the container
+#   has no userspace to run OpenVINO with even if the device appeared.
+#
+#   Locked memory is unlimited here, which is the one thing the XDNA host got
+#   wrong and this one gets right.
+#
+# Nothing downstream can be built here yet, and what is missing is the runner's
+# environment rather than anything in this repository.
 on:
   push:
     branches: [feat/device-intel-npu]
