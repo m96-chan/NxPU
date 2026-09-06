@@ -610,36 +610,40 @@ fn build_from_graph_desc(desc: &GraphDesc, extent: i32) -> Vec<u8> {
 
 // ---- FusedPattern graph collectors ----
 
-/// Build a [`GraphDesc`] for `ConvBatchNorm`: CONV_2D → MUL(scale) → ADD(bias).
+/// Build a [`GraphDesc`] for `ConvBatchNorm`: an optional `PAD`, then
+/// CONV_2D → MUL(scale) → ADD(shift).
 ///
-/// Tensor layout:
-/// - 0: input  (4-D)
-/// - 1: weight (4-D)
-/// - 2: scale  (1-D)
-/// - 3: bias   (1-D)
-/// - 4: conv_out (4-D, intermediate)
-/// - 5: bn_mul   (4-D, intermediate)
-/// - 6: output   (4-D)
+/// Graph inputs are the convolution's input and weight, its bias when the
+/// kernel has one, then the normalization's scale and shift; the graph output
+/// is the ADD's result. Everything else is an intermediate or a constant, and
+/// a constant is not a graph input.
 ///
-/// Graph inputs: [0,1,2,3]  Graph outputs: [6]
+/// The three defects [`conv2d_graph`] was written to fix all lived here too,
+/// because the fused path builds its own convolution: no `Conv2DOptions`, two
+/// inputs where the kernel demands three, and one `[-1,-1,-1,-1]` written to
+/// the input, the weight and the output alike. The tests said `TFL3` and
+/// passed throughout.
 fn collect_conv_batchnorm_graph(
     conv: &KernelPattern,
     norm: &KernelPattern,
+    extent: i32,
 ) -> Result<GraphDesc, BackendError> {
-    let (input, weight, conv_shape) = match conv {
+    let (input, weight, conv_bias, conv_out, conv_shape, conv_activation) = match conv {
         KernelPattern::Conv2D {
             input,
             weight,
+            bias,
+            output,
             shape,
-            ..
-        } => (input, weight, shape),
+            activation,
+        } => (input, weight, bias.as_ref(), output, shape, *activation),
         _ => {
             return Err(BackendError::Other(
                 "ConvBatchNorm: conv slot is not Conv2D".into(),
             ));
         }
     };
-    let (scale, bias, output) = match norm {
+    let (scale, shift, output) = match norm {
         KernelPattern::Normalization {
             scale,
             bias,
@@ -653,42 +657,198 @@ fn collect_conv_batchnorm_graph(
         }
     };
 
-    let _ = conv_shape; // shape info not needed for symbolic dims
-    let shape_4d = vec![-1i32, -1, -1, -1];
-    let shape_1d = vec![-1i32];
+    // The same derivation [`conv2d_graph`] makes, and it has to stay the same
+    // one: a fused convolution and a standalone convolution that disagree
+    // about the output's size are two models for one kernel. TFLite reads
+    // these as NHWC with the weight as [out, kh, kw, in].
+    let n = extent.max(1);
+    let channels_in = extent.max(1);
+    let channels_out = extent.max(1);
+    let in_h = extent.max(1);
+    let in_w = extent.max(1);
+
+    // A window the kernel states as a literal is known exactly; one supplied
+    // through the params struct is not, and falls back to the extent.
+    let window = |literal: i64| {
+        if literal > 0 {
+            (literal as i32).max(1)
+        } else {
+            extent.max(1)
+        }
+    };
+    let kernel_h = window(conv_shape.kernel_h_val);
+    let kernel_w = window(conv_shape.kernel_w_val);
+
+    let pad_h = conv_shape.pad_h.max(0) as i32;
+    let pad_w = conv_shape.pad_w.max(0) as i32;
+    let padded_h = in_h + 2 * pad_h;
+    let padded_w = in_w + 2 * pad_w;
+
+    // floor((in - reach) / stride) + 1, which is what TFLite's own kernel
+    // computes for VALID, over the padded extent because that is what the
+    // convolution now sees.
+    let valid_out = |input: i32, k: i32, stride: i32, dilation: i32| {
+        let reach = dilation.max(1) * (k - 1) + 1;
+        ((input - reach) / stride.max(1) + 1).max(1)
+    };
+    let out_h = valid_out(
+        padded_h,
+        kernel_h,
+        conv_shape.stride_h as i32,
+        conv_shape.dilation_h as i32,
+    );
+    let out_w = valid_out(
+        padded_w,
+        kernel_w,
+        conv_shape.stride_w as i32,
+        conv_shape.dilation_w as i32,
+    );
+    let conv_out_shape = vec![n, out_h, out_w, channels_out];
+
+    let mut tensors = vec![TensorInfo::input(
+        input.name.clone(),
+        input.elem_type,
+        vec![n, in_h, in_w, channels_in],
+    )];
+    let mut ops = Vec::new();
+
+    // The tensor the convolution reads: the input itself, or the padded copy.
+    let conv_input = if pad_h > 0 || pad_w > 0 {
+        let amounts: [i32; 8] = [0, 0, pad_h, pad_h, pad_w, pad_w, 0, 0];
+        tensors.push(TensorInfo::constant(
+            format!("{}_paddings", input.name),
+            data_type::INT32,
+            vec![4, 2],
+            amounts.iter().flat_map(|d| d.to_le_bytes()).collect(),
+        ));
+        tensors.push(TensorInfo::input(
+            format!("{}_padded", input.name),
+            input.elem_type,
+            vec![n, padded_h, padded_w, channels_in],
+        ));
+        ops.push(OpDesc {
+            opcode: builtin_op::PAD,
+            inputs: vec![0, 1],
+            outputs: vec![2],
+            options: OpOptions::Pad,
+        });
+        2
+    } else {
+        0
+    };
+
+    let weight_index = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        weight.name.clone(),
+        weight.elem_type,
+        vec![channels_out, kernel_h, kernel_w, channels_in],
+    ));
+
+    // TFLite's CONV_2D kernel requires three inputs — `has_bias was not true`
+    // is a hard failure — so a convolution whose source has no bias still gets
+    // one, as a constant of zeros. Folding a batch norm onto a convolution
+    // does not remove the convolution's own bias: it is added before the scale
+    // multiplies, so dropping it is a different function, not a cheaper one.
+    let bias_index = tensors.len() as i32;
+    match conv_bias {
+        Some(b) => tensors.push(TensorInfo::input(
+            b.name.clone(),
+            b.elem_type,
+            vec![channels_out],
+        )),
+        None => tensors.push(TensorInfo::constant(
+            "bias",
+            data_type::FLOAT,
+            vec![channels_out],
+            vec![0u8; (channels_out as usize) * 4],
+        )),
+    }
+
+    let conv_out_index = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        conv_out.name.clone(),
+        conv_out.elem_type,
+        conv_out_shape.clone(),
+    ));
+
+    ops.push(OpDesc {
+        opcode: builtin_op::CONV_2D,
+        inputs: vec![conv_input, weight_index, bias_index],
+        outputs: vec![conv_out_index],
+        options: OpOptions::Conv2D {
+            // VALID, because the padding is the PAD operator's business.
+            padding: padding::VALID,
+            stride_w: conv_shape.stride_w as i32,
+            stride_h: conv_shape.stride_h as i32,
+            dilation_w: conv_shape.dilation_w as i32,
+            dilation_h: conv_shape.dilation_h as i32,
+            // The kernel applies it to what the convolution stores, so it
+            // belongs on the convolution and ahead of the normalisation that
+            // reads that tensor -- not after the whole chain.
+            activation: match conv_activation {
+                Some(ActivationOp::Relu) => activation_function::RELU,
+                Some(ActivationOp::Tanh) => activation_function::TANH,
+                _ => activation_function::NONE,
+            },
+        },
+    });
+
+    // Scale and shift are per output channel, so they broadcast over NHWC.
+    // They were [-1] here, which the extent turns into the same length as
+    // every other dimension — right only when the channel count happens to be
+    // the extent, and silently wrong the moment the window is a literal.
+    let scale_index = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        scale.name.clone(),
+        scale.elem_type,
+        vec![channels_out],
+    ));
+    let scaled_index = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        format!("{}_scaled", conv_out.name),
+        conv_out.elem_type,
+        conv_out_shape.clone(),
+    ));
+    ops.push(OpDesc {
+        opcode: builtin_op::MUL,
+        inputs: vec![conv_out_index, scale_index],
+        outputs: vec![scaled_index],
+        options: OpOptions::None,
+    });
+
+    let shift_index = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        shift.name.clone(),
+        shift.elem_type,
+        vec![channels_out],
+    ));
+    let output_index = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        output.name.clone(),
+        output.elem_type,
+        conv_out_shape,
+    ));
+    ops.push(OpDesc {
+        opcode: builtin_op::ADD,
+        inputs: vec![scaled_index, shift_index],
+        outputs: vec![output_index],
+        options: OpOptions::None,
+    });
+
+    // A constant is not a graph input; the synthesised bias and the paddings
+    // are constants, and listing either here makes the model invalid.
+    let mut graph_inputs = vec![0, weight_index];
+    if conv_bias.is_some() {
+        graph_inputs.push(bias_index);
+    }
+    graph_inputs.push(scale_index);
+    graph_inputs.push(shift_index);
 
     Ok(GraphDesc {
-        tensors: vec![
-            TensorInfo::input(input.name.clone(), input.elem_type, shape_4d.clone()), // 0
-            TensorInfo::input(weight.name.clone(), weight.elem_type, shape_4d.clone()), // 1
-            TensorInfo::input(scale.name.clone(), scale.elem_type, shape_1d.clone()), // 2
-            TensorInfo::input(bias.name.clone(), bias.elem_type, shape_1d.clone()),   // 3
-            TensorInfo::input("conv_out", input.elem_type, shape_4d.clone()),         // 4
-            TensorInfo::input("bn_mul", input.elem_type, shape_4d.clone()),           // 5
-            TensorInfo::input(output.name.clone(), output.elem_type, shape_4d),       // 6
-        ],
-        ops: vec![
-            OpDesc {
-                opcode: builtin_op::CONV_2D,
-                inputs: vec![0, 1],
-                outputs: vec![4],
-                options: OpOptions::None,
-            },
-            OpDesc {
-                opcode: builtin_op::MUL,
-                inputs: vec![4, 2],
-                outputs: vec![5],
-                options: OpOptions::None,
-            },
-            OpDesc {
-                opcode: builtin_op::ADD,
-                inputs: vec![5, 3],
-                outputs: vec![6],
-                options: OpOptions::None,
-            },
-        ],
-        graph_inputs: vec![0, 1, 2, 3],
-        graph_outputs: vec![6],
+        tensors,
+        ops,
+        graph_inputs,
+        graph_outputs: vec![output_index],
         graph_name: "conv_batchnorm".into(),
     })
 }
@@ -1411,7 +1571,7 @@ pub fn build_fused_model(fp: &FusedPattern, extent: i32) -> Result<Vec<u8>, Back
     match fp {
         FusedPattern::Single(p) => build_model(p, extent),
         FusedPattern::ConvBatchNorm { conv, norm } => {
-            let desc = collect_conv_batchnorm_graph(conv, norm)?;
+            let desc = collect_conv_batchnorm_graph(conv, norm, extent)?;
             Ok(build_from_graph_desc(&desc, extent))
         }
         FusedPattern::MatMulBias { matmul, bias_add } => {
@@ -1440,7 +1600,7 @@ pub fn build_fused_model(fp: &FusedPattern, extent: i32) -> Result<Vec<u8>, Back
                     Err(_) => return build_model(p, extent),
                 },
                 FusedPattern::ConvBatchNorm { conv, norm } => {
-                    collect_conv_batchnorm_graph(conv, norm)?
+                    collect_conv_batchnorm_graph(conv, norm, extent)?
                 }
                 FusedPattern::MatMulBias { matmul, bias_add } => {
                     collect_matmul_bias_graph(matmul, bias_add)?
@@ -3663,6 +3823,197 @@ mod tests {
         assert_eq!(&bytes[4..8], b"TFL3");
     }
 
+    /// The shape a tensor was given, by name, so a test can name the tensor it
+    /// means instead of the index it happens to have.
+    fn shape_of(desc: &GraphDesc, name: &str) -> Vec<i32> {
+        desc.tensors
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("no tensor named {name}"))
+            .shape
+            .clone()
+    }
+
+    #[test]
+    fn a_fused_convolution_carries_its_options_its_bias_and_its_own_shapes() {
+        // The three defects the standalone convolution had, asserted for the
+        // fused one, which kept all three: no `Conv2DOptions` is read as
+        // stride 0 and refused with `params->stride_height > 0 was not true`,
+        // two inputs is refused with `has_bias was not true`, and one shape
+        // vector for every tensor made a 3x3 window an 8x8 one.
+        let desc = collect_conv_batchnorm_graph(
+            &make_conv2d(),
+            &make_normalization("conv_out", "bn_out"),
+            8,
+        )
+        .unwrap();
+
+        let conv = desc
+            .ops
+            .iter()
+            .find(|o| o.opcode == builtin_op::CONV_2D)
+            .expect("no convolution in the fused graph");
+        assert_eq!(conv.inputs.len(), 3, "the convolution has no bias input");
+        assert!(
+            matches!(
+                conv.options,
+                OpOptions::Conv2D {
+                    padding: padding::VALID,
+                    stride_w: 1,
+                    stride_h: 1,
+                    dilation_w: 1,
+                    dilation_h: 1,
+                    // This fixture's convolution stores its accumulator
+                    // directly, so there is nothing to fuse.
+                    activation: activation_function::NONE,
+                }
+            ),
+            "the convolution has no options table"
+        );
+
+        assert_eq!(shape_of(&desc, "x"), vec![8, 8, 8, 8], "the input is NHWC");
+        assert_eq!(
+            shape_of(&desc, "w"),
+            vec![8, 3, 3, 8],
+            "the weight is not [out, kh, kw, in]"
+        );
+        // 8 - 3 + 1 = 6, which is what the convolution computes for VALID and
+        // the assertion that separates it from a SAME written under a comment
+        // claiming VALID.
+        assert_eq!(shape_of(&desc, "conv_out"), vec![8, 6, 6, 8]);
+        assert_eq!(shape_of(&desc, "bn_out"), vec![8, 6, 6, 8]);
+        // Per output channel, so they broadcast over NHWC. At this extent the
+        // channel count and the spatial extent differ, so a scale that took
+        // the whole shape would not go unnoticed.
+        assert_eq!(shape_of(&desc, "gamma"), vec![8]);
+        assert_eq!(shape_of(&desc, "beta"), vec![8]);
+
+        // The synthesised bias is a constant, and a constant is not a graph
+        // input; listing it makes the model invalid.
+        let bias_index = conv.inputs[2];
+        assert!(
+            desc.tensors[bias_index as usize].data.is_some(),
+            "the synthesised bias has no contents"
+        );
+        assert!(
+            !desc.graph_inputs.contains(&bias_index),
+            "the synthesised bias is listed as a graph input"
+        );
+    }
+
+    #[test]
+    fn a_fused_convolution_that_pads_writes_the_pad_and_narrows_its_output() {
+        // Padding is the PAD operator's business here, as it is for the
+        // standalone convolution, so the output has to be sized for the padded
+        // extent rather than the input's: 8 + 2 -> 10, a 3-wide reach at
+        // stride 2 leaves 4.
+        let mut conv = make_conv2d();
+        if let KernelPattern::Conv2D { shape, .. } = &mut conv {
+            shape.pad_h = 1;
+            shape.pad_w = 1;
+            shape.stride_h = 2;
+            shape.stride_w = 2;
+        }
+        let desc =
+            collect_conv_batchnorm_graph(&conv, &make_normalization("conv_out", "bn_out"), 8)
+                .unwrap();
+
+        assert!(
+            desc.ops.iter().any(|o| o.opcode == builtin_op::PAD),
+            "the padding was never written"
+        );
+        assert_eq!(shape_of(&desc, "x_padded"), vec![8, 10, 10, 8]);
+        assert_eq!(shape_of(&desc, "conv_out"), vec![8, 4, 4, 8]);
+        assert_eq!(shape_of(&desc, "bn_out"), vec![8, 4, 4, 8]);
+    }
+
+    #[test]
+    fn a_fused_convolutions_own_bias_survives_the_fusion() {
+        // The convolution's bias is added before the normalization's scale
+        // multiplies, so dropping it computes a different function. It used to
+        // be dropped: the fused builder never looked at the field.
+        let mut conv = make_conv2d();
+        if let KernelPattern::Conv2D { bias, .. } = &mut conv {
+            *bias = Some(make_tensor("conv_bias", TensorRole::Input));
+        }
+        let desc =
+            collect_conv_batchnorm_graph(&conv, &make_normalization("conv_out", "bn_out"), 8)
+                .unwrap();
+
+        assert_eq!(shape_of(&desc, "conv_bias"), vec![8]);
+        let conv_op = desc
+            .ops
+            .iter()
+            .find(|o| o.opcode == builtin_op::CONV_2D)
+            .expect("no convolution in the fused graph");
+        let bias_index = conv_op.inputs[2];
+        assert_eq!(desc.tensors[bias_index as usize].name, "conv_bias");
+        assert!(
+            desc.graph_inputs.contains(&bias_index),
+            "a bias the kernel supplies is a graph input"
+        );
+    }
+
+    /// Hand the fused model to a real interpreter.
+    ///
+    /// `TFL3` in the header is what this backend asserted for as long as it
+    /// had a fused convolution, and it is true of a model no interpreter will
+    /// load. Nothing in this workspace links TFLite, so the bytes go to a file
+    /// and the interpreter runs outside it; set `NXPU_TFLITE_DUMP_DIR` and the
+    /// models this test builds appear there.
+    #[test]
+    fn the_fused_models_can_be_handed_to_an_interpreter() {
+        use nxpu_analysis::fusion::FusedPattern;
+
+        let mut padded = make_conv2d();
+        if let KernelPattern::Conv2D { shape, .. } = &mut padded {
+            shape.pad_h = 1;
+            shape.pad_w = 1;
+            shape.stride_h = 2;
+            shape.stride_w = 2;
+        }
+        let mut biased = make_conv2d();
+        if let KernelPattern::Conv2D { bias, .. } = &mut biased {
+            *bias = Some(make_tensor("conv_bias", TensorRole::Input));
+        }
+
+        let conv_bn = |conv| FusedPattern::ConvBatchNorm {
+            conv,
+            norm: Box::new(make_normalization("conv_out", "bn_out")),
+        };
+        let cases = [
+            ("conv_batchnorm", conv_bn(make_conv2d())),
+            ("conv_batchnorm_padded", conv_bn(padded)),
+            ("conv_batchnorm_biased", conv_bn(biased)),
+            // The activation is appended onto this graph rather than built
+            // with it, so it is the one composition that can go wrong without
+            // any of the assertions above noticing.
+            (
+                "conv_batchnorm_relu",
+                FusedPattern::WithActivation {
+                    base: Box::new(conv_bn(make_conv2d())),
+                    activation: nxpu_analysis::fusion::FusedActivation::Relu,
+                    activation_pattern: Box::new(make_activation(
+                        ActivationOp::Relu,
+                        "bn_out",
+                        "relu_out",
+                    )),
+                },
+            ),
+        ];
+        let dir = std::env::var_os("NXPU_TFLITE_DUMP_DIR");
+        for (name, fused) in cases {
+            let bytes = build_fused_model(&fused, 8).unwrap();
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    std::path::Path::new(dir).join(format!("{name}.tflite")),
+                    &bytes,
+                )
+                .unwrap();
+            }
+        }
+    }
+
     #[test]
     fn fused_model_matmul_bias() {
         use nxpu_analysis::fusion::FusedPattern;
@@ -4022,8 +4373,11 @@ mod tests {
     #[test]
     fn conv_batchnorm_wrong_conv_slot() {
         // Pass a MatMul in the conv slot - should error
-        let result =
-            collect_conv_batchnorm_graph(&make_matmul(), &make_normalization("conv_out", "bn_out"));
+        let result = collect_conv_batchnorm_graph(
+            &make_matmul(),
+            &make_normalization("conv_out", "bn_out"),
+            1,
+        );
         match result {
             Err(e) => {
                 let err_msg = format!("{e}");
@@ -4039,7 +4393,7 @@ mod tests {
     #[test]
     fn conv_batchnorm_wrong_norm_slot() {
         // Pass a MatMul in the norm slot - should error
-        let result = collect_conv_batchnorm_graph(&make_conv2d(), &make_matmul());
+        let result = collect_conv_batchnorm_graph(&make_conv2d(), &make_matmul(), 1);
         match result {
             Err(e) => {
                 let err_msg = format!("{e}");
