@@ -91,10 +91,10 @@ impl Backend for TfLiteBackend {
                     base, activation, ..
                 } => {
                     let base_name = match base.as_ref() {
-                        fusion::FusedPattern::Single(p) => pattern_summary(p),
-                        fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",
-                        fusion::FusedPattern::MatMulBias { .. } => "Gemm",
-                        _ => "fused",
+                        fusion::FusedPattern::Single(p) => pattern_summary(p).into_owned(),
+                        fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm".to_string(),
+                        fusion::FusedPattern::MatMulBias { .. } => "Gemm".to_string(),
+                        _ => "fused".to_string(),
                     };
                     format!("{base_name}+{activation:?}")
                 }
@@ -221,8 +221,18 @@ fn emit_attention_diagnostics(
     }
 }
 
-fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
-    match pattern {
+/// Name the operators a pattern lowers to, for the `classified as …`
+/// diagnostic.
+///
+/// Returns an owned string because a chain has no fixed name: it reports the
+/// operator sequence it emits — `Mul+Add`, `Cast+Mul+Mul` — since a category
+/// label like "chain" would say nothing about what the kernel computes.
+fn pattern_summary(pattern: &analyze::KernelPattern) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
+    Cow::Borrowed(match pattern {
+        analyze::KernelPattern::ElementWiseChain { cast, steps, .. } => {
+            return Cow::Owned(analyze::chain_summary(*cast, steps));
+        }
         analyze::KernelPattern::MatMul { .. } => "BATCH_MATMUL",
         analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
         analyze::KernelPattern::Conv2D { .. } => "CONV_2D",
@@ -244,7 +254,7 @@ fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
         analyze::KernelPattern::Gather { .. } => "GATHER",
         analyze::KernelPattern::Scatter { .. } => "SCATTER_ND",
         analyze::KernelPattern::Unknown { .. } => "Unknown",
-    }
+    })
 }
 
 #[cfg(test)]
@@ -668,10 +678,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 base, activation, ..
             } => {
                 let base_name = match base.as_ref() {
-                    FusedPattern::Single(p) => pattern_summary(p),
-                    FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",
-                    FusedPattern::MatMulBias { .. } => "Gemm",
-                    _ => "fused",
+                    FusedPattern::Single(p) => pattern_summary(p).into_owned(),
+                    FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm".to_string(),
+                    FusedPattern::MatMulBias { .. } => "Gemm".to_string(),
+                    _ => "fused".to_string(),
                 };
                 format!("{base_name}+{activation:?}")
             }
@@ -727,10 +737,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 base, activation, ..
             } => {
                 let base_name = match base.as_ref() {
-                    FusedPattern::Single(p) => pattern_summary(p),
-                    FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",
-                    FusedPattern::MatMulBias { .. } => "Gemm",
-                    _ => "fused",
+                    FusedPattern::Single(p) => pattern_summary(p).into_owned(),
+                    FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm".to_string(),
+                    FusedPattern::MatMulBias { .. } => "Gemm".to_string(),
+                    _ => "fused".to_string(),
                 };
                 format!("{base_name}+{activation:?}")
             }

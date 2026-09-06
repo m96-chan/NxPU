@@ -6,8 +6,8 @@
 use flatbuffers::FlatBufferBuilder;
 use nxpu_analysis::analyze::data_type;
 use nxpu_analysis::analyze::{
-    ActivationOp, Conv2DShape, ElementWiseOp, KernelPattern, PoolKind, PoolShape, ReduceOp,
-    TensorBinding,
+    ActivationOp, ChainOperand, ChainStep, Conv2DShape, ElementWiseOp, KernelPattern, PoolKind,
+    PoolShape, ReduceOp, TensorBinding,
 };
 use nxpu_analysis::fusion::FusedPattern;
 use nxpu_backend_core::BackendError;
@@ -82,6 +82,12 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
                 &format!("{}_1d", op.op_name().to_lowercase()),
                 extent,
             )
+        }
+        // Several operators, so it goes through the multi-op builder rather
+        // than through `build_tflite`, which emits exactly one.
+        KernelPattern::ElementWiseChain { .. } => {
+            let desc = collect_single_graph(pattern)?;
+            build_from_graph_desc(&desc, extent)
         }
         KernelPattern::Conv2D {
             input,
@@ -621,6 +627,109 @@ fn collect_matmul_bias_graph(
     })
 }
 
+/// Build a [`GraphDesc`] for an element-wise chain: an optional `CAST`,
+/// then one binary operator per step.
+///
+/// The scalars get rank-0 tensors — a shape of no dimensions, not a length-one
+/// vector — because that is what they are, and TFLite broadcasts them over the
+/// other operand. Giving them `[1]` would be a claim about a dimension the
+/// kernel does not have.
+fn collect_elementwise_chain_graph(
+    base: &TensorBinding,
+    cast: Option<i32>,
+    steps: &[ChainStep],
+    output: &TensorBinding,
+) -> Result<GraphDesc, BackendError> {
+    let vector = vec![-1i32];
+    let scalar: Vec<i32> = Vec::new();
+
+    let mut tensors = vec![TensorInfo {
+        name: base.name.clone(),
+        elem_type: base.elem_type,
+        shape: vector.clone(),
+    }];
+    let mut graph_inputs = vec![0i32];
+    let mut ops: Vec<OpDesc> = Vec::new();
+    let mut acc = 0i32;
+    // The type the accumulator carries: the base's, until a cast changes it.
+    let mut acc_type = base.elem_type;
+
+    if let Some(to) = cast {
+        acc_type = to;
+        let idx = tensors.len() as i32;
+        tensors.push(TensorInfo {
+            name: format!("{}_cast", base.name),
+            elem_type: to,
+            shape: vector.clone(),
+        });
+        ops.push(OpDesc {
+            opcode: builtin_op::CAST,
+            inputs: vec![acc],
+            outputs: vec![idx],
+        });
+        acc = idx;
+    }
+
+    for (i, step) in steps.iter().enumerate() {
+        let opcode = match step.op {
+            ElementWiseOp::Add => builtin_op::ADD,
+            ElementWiseOp::Sub => builtin_op::SUB,
+            ElementWiseOp::Mul => builtin_op::MUL,
+            ElementWiseOp::Div => builtin_op::DIV,
+        };
+        let operand_idx = tensors.len() as i32;
+        match &step.operand {
+            ChainOperand::Tensor(t) => tensors.push(TensorInfo {
+                name: t.name.clone(),
+                elem_type: t.elem_type,
+                shape: vector.clone(),
+            }),
+            ChainOperand::Scalar(s) => tensors.push(TensorInfo {
+                name: s.name.clone(),
+                elem_type: s.elem_type,
+                shape: scalar.clone(),
+            }),
+        }
+        graph_inputs.push(operand_idx);
+
+        let last = i + 1 == steps.len();
+        let result_idx = tensors.len() as i32;
+        tensors.push(if last {
+            TensorInfo {
+                name: output.name.clone(),
+                elem_type: output.elem_type,
+                shape: vector.clone(),
+            }
+        } else {
+            TensorInfo {
+                name: format!("{}_step{i}", output.name),
+                elem_type: acc_type,
+                shape: vector.clone(),
+            }
+        });
+        ops.push(OpDesc {
+            opcode,
+            inputs: vec![acc, operand_idx],
+            outputs: vec![result_idx],
+        });
+        acc = result_idx;
+    }
+
+    if ops.is_empty() {
+        return Err(BackendError::Other(
+            "element-wise chain with no steps".into(),
+        ));
+    }
+
+    Ok(GraphDesc {
+        tensors,
+        ops,
+        graph_inputs,
+        graph_outputs: vec![acc],
+        graph_name: nxpu_analysis::analyze::chain_summary(cast, steps).to_lowercase(),
+    })
+}
+
 /// Build a [`GraphDesc`] for a single [`KernelPattern`].
 ///
 /// Handles the patterns that can be represented as a simple 1-op (or
@@ -1052,6 +1161,13 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                 graph_name: "scatter_nd".into(),
             })
         }
+        KernelPattern::ElementWiseChain {
+            base,
+            cast,
+            steps,
+            output,
+            ..
+        } => collect_elementwise_chain_graph(base, *cast, steps, output),
         // Patterns that are complex (Attention, Split) fall back to build_model.
         KernelPattern::Attention { .. } | KernelPattern::Split { .. } => Err(BackendError::Other(
             "complex pattern: use build_model fallback".into(),

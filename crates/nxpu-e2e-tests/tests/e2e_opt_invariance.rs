@@ -53,6 +53,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// `y[i] += a * x[i]` — vendor/web-xpu-ops `ops/axpy/inplace.wgsl`. The same
+/// arithmetic as `AXPY` with `y` bound `read_write`, so it is both read and
+/// written and the classifier sees one input rather than two. FMA fusion
+/// rewrites it identically, and it has to classify identically too.
+const AXPY_INPLACE: &str = r#"
+struct Params { N: u32, a: f32 }
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.N) { return; }
+  y[idx] = y[idx] + params.a * x[idx];
+}
+"#;
+
+/// `out[i] = f32(input[i]) * s1 * s2` — vendor/web-xpu-ops `ops/dequantize`.
+/// Two multiplies over dispatch-time scalars with a conversion under them; no
+/// multiply-add, but the same chain matcher reads it, so it belongs in the
+/// same table.
+const DEQUANTIZE: &str = r#"
+struct Params { N: u32 }
+@group(0) @binding(0) var<storage, read> input: array<i32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> weight_scale: f32;
+@group(0) @binding(3) var<uniform> input_scale: f32;
+@group(0) @binding(4) var<uniform> params: Params;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.N) { return; }
+  output[idx] = f32(input[idx]) * weight_scale * input_scale;
+}
+"#;
+
 /// `out = scores + slope * distance` — vendor/web-xpu-ops `ops/alibi`. Same
 /// shape as axpy but with the coefficient read from a second storage buffer.
 const ALIBI: &str = r#"
@@ -274,6 +310,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 const KERNELS: &[(&str, &str)] = &[
     ("axpy", AXPY),
+    ("axpy_inplace", AXPY_INPLACE),
+    ("dequantize", DEQUANTIZE),
     ("alibi", ALIBI),
     ("snake", SNAKE),
     ("shared_multiply", SHARED_MULTIPLY),
@@ -311,12 +349,19 @@ fn classification_is_invariant_across_opt_levels() {
 ///
 /// `y + a * x` is not an add. Classifying it as `ElementWise(Add)` — which is
 /// what `-O0` did before this — drops the multiply on the floor and hands the
-/// backend a kernel that computes something else. Until there is a real
-/// three-operand pattern to lower it to, the honest answer is `Unknown`, with a
-/// reason that names what was found.
+/// backend a kernel that computes something else. `axpy` is now read as an
+/// element-wise chain instead; the two below are multiply-adds that are *not*
+/// chains, and the honest answer for them is still `Unknown` with a reason
+/// that names what was found.
+///
+/// `alibi` multiplies a slope read at `slopes[head]` — a subscript derived
+/// from the thread id, not the id — by a distance computed from the id and
+/// read out of no buffer at all. `snake` multiplies a reciprocal by a squared
+/// sine, two subtrees neither of which is a leaf. Both would need operands a
+/// chain cannot carry.
 #[test]
 fn multiply_add_is_unknown_and_says_why() {
-    for (name, source) in [("axpy", AXPY), ("alibi", ALIBI), ("snake", SNAKE)] {
+    for (name, source) in [("alibi", ALIBI), ("snake", SNAKE)] {
         for level in [OptLevel::O0, OptLevel::O2] {
             let patterns = classify_at(source, level);
             assert_eq!(patterns.len(), 1, "{name}: expected one entry point");
@@ -328,6 +373,31 @@ fn multiply_add_is_unknown_and_says_why() {
             assert!(
                 p.contains("multiply-add"),
                 "{name} at {level:?}: reason should name the multiply-add, got {p}"
+            );
+        }
+    }
+}
+
+/// And this says what the answer for the chains now is, at every level.
+///
+/// `-O1` rewrites `y + a * x` into `fma(a, x, y)`, which is why the chain
+/// matcher reads `Math { fun: Fma }` as well as `Binary { op: Add }`. Pinning
+/// the variant here rather than only its agreement with itself is what stops a
+/// future rewrite from making both levels agree on `Unknown` again.
+#[test]
+fn a_chain_is_recognized_at_every_level() {
+    for (name, source) in [
+        ("axpy", AXPY),
+        ("axpy_inplace", AXPY_INPLACE),
+        ("dequantize", DEQUANTIZE),
+    ] {
+        for level in [OptLevel::O0, OptLevel::O1, OptLevel::O2] {
+            let patterns = classify_at(source, level);
+            assert_eq!(patterns.len(), 1, "{name}: expected one entry point");
+            let p = &patterns[0];
+            assert!(
+                p.contains("ElementWiseChain"),
+                "{name} at {level:?}: expected a chain, got {p}"
             );
         }
     }

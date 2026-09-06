@@ -72,6 +72,58 @@ impl fmt::Display for TensorBinding {
     }
 }
 
+/// A scalar the host supplies at dispatch time.
+///
+/// Either a whole uniform (`var<uniform> input_scale: f32`) or one member of a
+/// uniform params struct (`params.a`). It is deliberately *not* a constant:
+/// the value is written per dispatch, so it lowers to a rank-0 graph input,
+/// not to an initializer folded into the graph. `axpy`'s own comment is
+/// explicit that `a` changes every diffusion step.
+#[derive(Debug, Clone)]
+pub struct ScalarBinding {
+    /// Name to give the rank-0 graph input.
+    pub name: String,
+    /// ONNX element data type (see [`data_type`]).
+    pub elem_type: i32,
+}
+
+impl fmt::Display for ScalarBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} (Scalar)", self.name)
+    }
+}
+
+/// One operand of a [`KernelPattern::ElementWiseChain`] step.
+#[derive(Debug, Clone)]
+pub enum ChainOperand {
+    /// A whole tensor, read at the same index the result is stored at.
+    Tensor(TensorBinding),
+    /// A dispatch-time scalar, broadcast over every element.
+    Scalar(ScalarBinding),
+}
+
+impl fmt::Display for ChainOperand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tensor(t) => write!(f, "{t}"),
+            Self::Scalar(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// One step of a [`KernelPattern::ElementWiseChain`]: `acc = acc <op> operand`.
+///
+/// The accumulator is always on the *left*. A kernel that writes the
+/// accumulator on the right of a `Sub` or a `Div` computes something this
+/// cannot say, and the matcher refuses it rather than reordering the operands.
+#[derive(Debug, Clone)]
+pub struct ChainStep {
+    /// The operation applied at this step.
+    pub op: ElementWiseOp,
+    /// The right-hand operand.
+    pub operand: ChainOperand,
+}
+
 /// Symbolic dimension names for matrix multiplication.
 #[derive(Debug, Clone)]
 pub struct MatMulShape {
@@ -113,6 +165,16 @@ impl ElementWiseOp {
             Self::Mul => "Mul",
             Self::Div => "Div",
         }
+    }
+
+    /// Whether swapping the operands leaves the result unchanged.
+    ///
+    /// [`KernelPattern::ElementWiseChain`] applies every step as
+    /// `acc = acc <op> operand`, so a chain may only be read out of an
+    /// expression that put the accumulator on the left — unless the operation
+    /// does not care, which is what this answers.
+    pub fn is_commutative(self) -> bool {
+        matches!(self, Self::Add | Self::Mul)
     }
 }
 
@@ -308,6 +370,38 @@ pub enum KernelPattern {
         output: TensorBinding,
         dim_name: String,
     },
+    /// A per-element expression one level deeper than a binary op: one tensor,
+    /// an optional conversion, and a short chain of element-wise steps whose
+    /// operands are whole tensors or dispatch-time scalars.
+    ///
+    /// Two shapes in the vendored corpus need this and nothing narrower:
+    ///
+    ///   - `axpy`, `output[i] = y[i] + a * x[i]` with `a` a uniform scalar —
+    ///     `x`, scaled, then added to `y`.
+    ///   - `dequantize`, `output[i] = f32(input[i]) * s1 * s2` with two
+    ///     uniform scalars — a conversion, then two scales.
+    ///
+    /// Neither is one operation over two tensors, and [`Self::ElementWise`]
+    /// holds exactly two operands and one op, so both were refused. Neither is
+    /// a *fused activation* either: nothing here is a unary function of one
+    /// element, so widening `Activation` would not have held them.
+    ///
+    /// The chain is deliberately linear. Every node has exactly one operand
+    /// that is not a leaf, which is what makes it a sequence of graph nodes
+    /// rather than a tree; `snake` and `alibi`, whose multiplies have two
+    /// non-leaf operands, do not match and stay refused.
+    ElementWiseChain {
+        /// The tensor the chain starts from.
+        base: TensorBinding,
+        /// The element type `base` is converted to before the first step, when
+        /// the kernel converts it. `dequantize` reads `array<i32>` and writes
+        /// `array<f32>`, and dropping the conversion would reinterpret bits.
+        cast: Option<i32>,
+        /// Applied in order, each as `acc = acc <op> operand`.
+        steps: Vec<ChainStep>,
+        output: TensorBinding,
+        dim_name: String,
+    },
     /// 2D convolution: nested loops + kernel window + accumulation.
     Conv2D {
         input: TensorBinding,
@@ -413,6 +507,7 @@ impl fmt::Display for KernelPattern {
         match self {
             Self::MatMul { shape, .. } => write!(f, "{shape}"),
             Self::ElementWise { op, .. } => write!(f, "{op}"),
+            Self::ElementWiseChain { cast, steps, .. } => f.write_str(&chain_summary(*cast, steps)),
             Self::Conv2D { shape, .. } => write!(f, "{shape}"),
             Self::Pool { kind, shape, .. } => {
                 write!(
@@ -448,6 +543,33 @@ impl fmt::Display for KernelPattern {
             Self::Unknown { reason } => write!(f, "Unknown({reason})"),
         }
     }
+}
+
+/// The operators a chain lowers to, in order: `["Mul", "Add"]`,
+/// `["Cast", "Mul", "Mul"]`.
+///
+/// One name per node the ONNX and TFLite backends emit, because that is what a
+/// vendor support matrix has to be asked about: a chain is several ordinary
+/// operators, not one fused operator that no matrix lists. Asking about the
+/// joined name reports `Mul+Add` as unsupported on hardware that supports both
+/// a multiply and an add.
+pub fn chain_op_names(cast: Option<i32>, steps: &[ChainStep]) -> Vec<&'static str> {
+    let mut parts: Vec<&'static str> = Vec::with_capacity(steps.len() + 1);
+    if cast.is_some() {
+        parts.push("Cast");
+    }
+    parts.extend(steps.iter().map(|s| s.op.op_name()));
+    parts
+}
+
+/// Name a chain by the operators it lowers to, in order: `Mul+Add`,
+/// `Cast+Mul+Mul`.
+///
+/// Not a fixed label like "Chain". A count of steps says nothing about what a
+/// kernel computes, and neither does a category name; the operator sequence is
+/// exactly what the backend emits, so it is what the diagnostic reports.
+pub fn chain_summary(cast: Option<i32>, steps: &[ChainStep]) -> String {
+    chain_op_names(cast, steps).join("+")
 }
 
 /// Embedded constant weight data extracted from GlobalVariable initializers.
@@ -868,6 +990,23 @@ pub fn classify_entry_point(
                 });
             }
 
+            // A stored value that is more than one operation deep.
+            // `dequantize` writes `f32(input[i]) * s1 * s2`: one tensor, a
+            // conversion and two dispatch-time scalars, which is not an
+            // activation and has no second tensor to make it element-wise.
+            // `axpy`'s in-place entry point arrives here too, with `y` bound
+            // `read_write` so that it counts as an output and leaves `x` the
+            // only input.
+            if let Some(pattern) = match_elementwise_chain(
+                module,
+                &ep.function.body,
+                &ep.function.expressions,
+                &outputs,
+                &shape_names,
+            ) {
+                return Ok(pattern);
+            }
+
             // No recognized activation — unknown pattern.
             return Ok(KernelPattern::Unknown {
                 reason: "single input, no loop, no recognized activation function".into(),
@@ -1142,14 +1281,32 @@ pub fn classify_entry_point(
         }
 
         // Three inputs and no loop, writing where the thread id says: a
-        // per-element function of three tensors. `Activation` carries one
-        // input and no learned parameters, and `ElementWise` carries two, so
-        // there is nothing here to hold a snake's alpha and beta.
+        // per-element function of three tensors. `ElementWiseChain` takes as
+        // many operands as the expression has steps, so it is tried here as
+        // well as in the one- and two-input arms — the rule is about the shape
+        // of the expression, not about how many buffers are bound.
         if num_inputs == 3 && outputs.len() == 1 && !has_loop {
+            if let Some(pattern) = match_elementwise_chain(
+                module,
+                &ep.function.body,
+                &ep.function.expressions,
+                &outputs,
+                &shape_names,
+            ) {
+                return Ok(pattern);
+            }
+            // `snake`'s SnakeBeta is the shape that lands here:
+            // `x + (1/(β_c + ε)) · sin²(α_c · x)`. Its multiply has a
+            // reciprocal on one side and a squared sine on the other, so it is
+            // a tree and not a chain, and both parameters are read at
+            // `(i / L) % C` rather than at `i`, so neither is an operand of
+            // the result's shape. An `Activation` carries one input and no
+            // parameters, and `ElementWise` carries two.
             return Ok(KernelPattern::Unknown {
-                reason: "3 inputs combined per element, with no operator here \
-                         that takes three — an activation carries one input \
-                         and no parameters, and ElementWise carries two"
+                reason: "3 inputs combined per element, and not as a chain: a \
+                         chain step takes a whole tensor read at the index \
+                         written, or a scalar the host sets per dispatch, and \
+                         these operands are neither"
                     .into(),
             });
         }
@@ -1301,12 +1458,24 @@ pub fn classify_entry_point(
             Some(StoreValueOp::Binary(op)) => op,
             // `y + a * x` is not an add — the multiply has nowhere to go in a
             // two-operand `ElementWise`, and reporting `Add` would silently
-            // drop it. Say what was found instead, and say it identically
+            // drop it. `axpy` is a chain and is recognised as one; the ones
+            // that are not say what was found instead, and say it identically
             // whether or not FMA fusion has already rewritten the expression.
             Some(StoreValueOp::MultiplyAdd) => {
+                if let Some(pattern) = match_elementwise_chain(
+                    module,
+                    &ep.function.body,
+                    &ep.function.expressions,
+                    &outputs,
+                    &shape_names,
+                ) {
+                    return Ok(pattern);
+                }
                 return Ok(KernelPattern::Unknown {
                     reason: "fused multiply-add (`c + a * b`, or `fma(a, b, c)` after \
-                             optimization): a three-operand op with no element-wise equivalent"
+                             optimization) that is not a chain: a chain step takes a whole \
+                             tensor read at the index written, or a scalar the host sets per \
+                             dispatch, and at least one of these operands is neither"
                         .into(),
                 });
             }
@@ -1896,6 +2065,322 @@ fn expr_is_multiply(exprs: &Arena<Expression>, handle: Handle<Expression>) -> bo
             ..
         })
     )
+}
+
+/// A leaf of a per-element expression: something with no arithmetic under it.
+#[derive(Debug, Clone)]
+enum ChainLeaf {
+    /// A storage buffer, read at the index the result is stored at.
+    Tensor(Handle<GlobalVariable>),
+    /// A uniform scalar, or one scalar member of the uniform params struct.
+    Scalar(ScalarBinding),
+}
+
+/// A chain before its globals are turned into [`TensorBinding`]s.
+struct RawChain {
+    base: Handle<GlobalVariable>,
+    cast: Option<i32>,
+    steps: Vec<(ElementWiseOp, ChainLeaf)>,
+}
+
+/// The one `Store` in a block, as (index written, value stored).
+///
+/// `None` when there is more than one: a chain describes a single write, and
+/// two writes are two operators or a movement of values, neither of which this
+/// says.
+fn find_lone_store(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+) -> Option<(Handle<Expression>, Handle<Expression>)> {
+    fn walk(
+        body: &[Statement],
+        exprs: &Arena<Expression>,
+        found: &mut Vec<(Handle<Expression>, Handle<Expression>)>,
+    ) {
+        for stmt in body {
+            match stmt {
+                Statement::Store { pointer, value } => match access_index(exprs, *pointer) {
+                    Some(index) => found.push((index, *value)),
+                    // A store through something that is not a plain index into
+                    // a global. Recorded as a store all the same, so that it
+                    // makes the block ineligible rather than invisible.
+                    None => found.push((*pointer, *value)),
+                },
+                Statement::If { accept, reject, .. } => {
+                    walk(accept, exprs, found);
+                    walk(reject, exprs, found);
+                }
+                Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    walk(body, exprs, found);
+                    walk(continuing, exprs, found);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(body, exprs, &mut found);
+    match found.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    }
+}
+
+/// Classify an expression as a chain leaf, if that is what it is.
+///
+/// The index test is what keeps a broadcast out. `alibi` reads
+/// `slopes[head]` and `snake` reads `alpha[c]`, both at a subscript derived
+/// from the thread id rather than at the id itself; a chain step over either
+/// would be an operand of a different shape, and calling it element-wise
+/// would be the same confident guess this file exists to stop making.
+fn chain_leaf(
+    module: &Module,
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    store_index: Handle<Expression>,
+) -> Option<ChainLeaf> {
+    let Expression::Load { pointer } = exprs.try_get(handle)? else {
+        return None;
+    };
+    match exprs.try_get(*pointer)? {
+        // `x[idx]` — a whole tensor.
+        Expression::Access { base, index } => {
+            let global = access_base_global(exprs, *base)?;
+            let gv = module.global_variables.try_get(global)?;
+            if !matches!(gv.space, AddressSpace::Storage { .. }) {
+                return None;
+            }
+            (*index == store_index).then_some(ChainLeaf::Tensor(global))
+        }
+        // `input_scale` — a uniform that is one scalar.
+        Expression::GlobalVariable(global) => {
+            let gv = module.global_variables.try_get(*global)?;
+            if !matches!(gv.space, AddressSpace::Uniform) {
+                return None;
+            }
+            let TypeInner::Scalar(scalar) = &module.types.try_get(gv.ty)?.inner else {
+                return None;
+            };
+            Some(ChainLeaf::Scalar(ScalarBinding {
+                name: gv
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("scalar_{}", global.index())),
+                elem_type: scalar_to_onnx_data_type(scalar),
+            }))
+        }
+        // `params.a` — one scalar member of the uniform params struct.
+        Expression::AccessIndex { base, index } => {
+            let Expression::GlobalVariable(global) = exprs.try_get(*base)? else {
+                return None;
+            };
+            let gv = module.global_variables.try_get(*global)?;
+            if !matches!(gv.space, AddressSpace::Uniform) {
+                return None;
+            }
+            let TypeInner::Struct { members, .. } = &module.types.try_get(gv.ty)?.inner else {
+                return None;
+            };
+            let member = members.get(*index as usize)?;
+            let TypeInner::Scalar(scalar) = &module.types.try_get(member.ty)?.inner else {
+                return None;
+            };
+            Some(ChainLeaf::Scalar(ScalarBinding {
+                name: member.name.clone()?,
+                elem_type: scalar_to_onnx_data_type(scalar),
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Read a per-element expression as a chain, or refuse it.
+///
+/// The chain has to be *linear*: at every node exactly one operand carries the
+/// rest of the expression and the other is a leaf. That is the whole
+/// difference between a sequence of graph nodes and a tree, and it is what
+/// separates `axpy` from `snake`, whose multiply has a reciprocal on one side
+/// and a squared sine on the other.
+fn decompose_chain(
+    module: &Module,
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    store_index: Handle<Expression>,
+    depth: u32,
+) -> Option<RawChain> {
+    if depth == 0 {
+        return None;
+    }
+    // A tensor on its own is a chain of no steps. A scalar is not: the result
+    // is a tensor, so the chain has to start from one.
+    if let Some(leaf) = chain_leaf(module, exprs, handle, store_index) {
+        return match leaf {
+            ChainLeaf::Tensor(global) => Some(RawChain {
+                base: global,
+                cast: None,
+                steps: Vec::new(),
+            }),
+            ChainLeaf::Scalar(_) => None,
+        };
+    }
+    match exprs.try_get(handle)? {
+        // `f32(input[i])` — a conversion of the tensor the chain starts from.
+        Expression::As {
+            expr,
+            kind,
+            convert: Some(width),
+        } => {
+            let inner = decompose_chain(module, exprs, *expr, store_index, depth - 1)?;
+            // A conversion partway along would need a type per step, and
+            // nothing here carries one.
+            if inner.cast.is_some() || !inner.steps.is_empty() {
+                return None;
+            }
+            Some(RawChain {
+                cast: Some(scalar_to_onnx_data_type(&Scalar {
+                    kind: *kind,
+                    width: *width,
+                })),
+                ..inner
+            })
+        }
+        Expression::Binary { op, left, right } => {
+            let ew = match op {
+                BinaryOp::Add => ElementWiseOp::Add,
+                BinaryOp::Subtract => ElementWiseOp::Sub,
+                BinaryOp::Multiply => ElementWiseOp::Mul,
+                BinaryOp::Divide => ElementWiseOp::Div,
+                _ => return None,
+            };
+            decompose_chain_binary(module, exprs, ew, *left, *right, store_index, depth - 1)
+        }
+        // What FMA fusion leaves behind. `fma(a, b, c)` is `c + a * b`, and it
+        // has to come apart into exactly what the unfused spelling gives, or
+        // the classifier answers differently at `-O0` and `-O1` — the failure
+        // `e2e_opt_invariance` exists to catch.
+        Expression::Math {
+            fun: MathFunction::Fma,
+            arg,
+            arg1: Some(factor),
+            arg2: Some(addend),
+            ..
+        } => {
+            let mut chain = decompose_chain_binary(
+                module,
+                exprs,
+                ElementWiseOp::Mul,
+                *arg,
+                *factor,
+                store_index,
+                depth - 1,
+            )?;
+            let addend = chain_leaf(module, exprs, *addend, store_index)?;
+            chain.steps.push((ElementWiseOp::Add, addend));
+            Some(chain)
+        }
+        _ => None,
+    }
+}
+
+/// One binary node of a chain: one side continues it, the other is the operand.
+#[allow(clippy::collapsible_if)] // nested if-let for MSRV 1.87 compat (no let chains)
+fn decompose_chain_binary(
+    module: &Module,
+    exprs: &Arena<Expression>,
+    op: ElementWiseOp,
+    left: Handle<Expression>,
+    right: Handle<Expression>,
+    store_index: Handle<Expression>,
+    depth: u32,
+) -> Option<RawChain> {
+    // The left operand is tried as the accumulator first: it is the only
+    // arrangement that keeps `a - b` meaning `a - b`.
+    if let Some(operand) = chain_leaf(module, exprs, right, store_index) {
+        if let Some(mut chain) = decompose_chain(module, exprs, left, store_index, depth) {
+            chain.steps.push((op, operand));
+            return Some(chain);
+        }
+    }
+    // The accumulator on the right is only the same expression when the
+    // operation does not care which side its operands are on.
+    if op.is_commutative() {
+        if let Some(operand) = chain_leaf(module, exprs, left, store_index) {
+            if let Some(mut chain) = decompose_chain(module, exprs, right, store_index, depth) {
+                chain.steps.push((op, operand));
+                return Some(chain);
+            }
+        }
+    }
+    None
+}
+
+/// Recognise a kernel whose stored value is an element-wise chain.
+///
+/// Returns `None` — leaving the caller's refusal in place — for anything that
+/// is not one, including the chains [`KernelPattern::ElementWise`] already
+/// describes: one binary op over two whole tensors is an `Add`, and two names
+/// for one thing is how a pattern starts being emitted where it is not meant.
+fn match_elementwise_chain(
+    module: &Module,
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    outputs: &[(Handle<GlobalVariable>, &GlobalVariable)],
+    shape_names: &[String],
+) -> Option<KernelPattern> {
+    let [(out_handle, out_gv)] = outputs else {
+        return None;
+    };
+    // Element *i* of the result has to be built from element *i*, and written
+    // in one place. A chain that moved values would be a different operator.
+    if !stores_at_the_index_it_read(body, exprs) {
+        return None;
+    }
+    let (store_index, value) = find_lone_store(body, exprs)?;
+    let chain = decompose_chain(module, exprs, value, store_index, 32)?;
+
+    let has_scalar = chain
+        .steps
+        .iter()
+        .any(|(_, leaf)| matches!(leaf, ChainLeaf::Scalar(_)));
+    if chain.steps.is_empty() || (chain.cast.is_none() && chain.steps.len() == 1 && !has_scalar) {
+        return None;
+    }
+
+    let base_gv = module.global_variables.try_get(chain.base)?;
+    let base = make_binding(module, chain.base, base_gv, TensorRole::Input);
+    let mut steps = Vec::with_capacity(chain.steps.len());
+    let mut reads_its_own_output = chain.base == *out_handle;
+    for (op, leaf) in chain.steps {
+        let operand = match leaf {
+            ChainLeaf::Tensor(global) => {
+                reads_its_own_output |= global == *out_handle;
+                let gv = module.global_variables.try_get(global)?;
+                ChainOperand::Tensor(make_binding(module, global, gv, TensorRole::Input))
+            }
+            ChainLeaf::Scalar(scalar) => ChainOperand::Scalar(scalar),
+        };
+        steps.push(ChainStep { op, operand });
+    }
+
+    // `axpy`'s in-place entry point binds `y` `read_write` and computes
+    // `y = y + a*x`, so the same buffer is read and written. The arithmetic is
+    // the out-of-place kernel's exactly; only the allocation differs. A graph
+    // needs two names for the two values, so the result takes a suffix and the
+    // operand keeps the buffer's own name.
+    let mut output = make_binding(module, *out_handle, out_gv, TensorRole::Output);
+    if reads_its_own_output {
+        output.name = format!("{}_out", output.name);
+    }
+
+    Some(KernelPattern::ElementWiseChain {
+        base,
+        cast: chain.cast,
+        steps,
+        output,
+        dim_name: shape_names.first().cloned().unwrap_or_else(|| "N".into()),
+    })
 }
 
 /// Search for a Store whose value is a Math expression, detecting activation type.
@@ -2729,6 +3214,10 @@ fn collect_load_indices(
             collect_load_indices(exprs, *right, out, depth - 1);
         }
         Some(Expression::Unary { expr, .. }) => collect_load_indices(exprs, *expr, out, depth - 1),
+        // A conversion is transparent to *where* the value came from.
+        // `f32(input[i])` reads element `i`, and leaving `As` out of this walk
+        // made `dequantize` look like a kernel that read nothing at all.
+        Some(Expression::As { expr, .. }) => collect_load_indices(exprs, *expr, out, depth - 1),
         Some(Expression::Math {
             arg,
             arg1,

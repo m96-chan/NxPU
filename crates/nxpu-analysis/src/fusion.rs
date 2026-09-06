@@ -20,7 +20,8 @@ pub fn output_tensor_names(pattern: &KernelPattern) -> Vec<&str> {
         | KernelPattern::Concat { output, .. }
         | KernelPattern::Attention { output, .. }
         | KernelPattern::Gather { output, .. }
-        | KernelPattern::Scatter { output, .. } => vec![output.name.as_str()],
+        | KernelPattern::Scatter { output, .. }
+        | KernelPattern::ElementWiseChain { output, .. } => vec![output.name.as_str()],
         KernelPattern::Split { outputs, .. } => outputs.iter().map(|t| t.name.as_str()).collect(),
         KernelPattern::Unknown { .. } => vec![],
     }
@@ -62,6 +63,14 @@ pub fn input_tensor_names(pattern: &KernelPattern) -> Vec<&str> {
             indices.name.as_str(),
             updates.name.as_str(),
         ],
+        // The scalars are not tensors, so they cannot connect one kernel's
+        // output to the next one's input and have no place in this list.
+        KernelPattern::ElementWiseChain { base, steps, .. } => std::iter::once(base.name.as_str())
+            .chain(steps.iter().filter_map(|s| match &s.operand {
+                crate::analyze::ChainOperand::Tensor(t) => Some(t.name.as_str()),
+                crate::analyze::ChainOperand::Scalar(_) => None,
+            }))
+            .collect(),
         KernelPattern::Unknown { .. } => vec![],
     }
 }

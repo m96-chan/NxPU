@@ -77,10 +77,10 @@ impl Backend for OnnxBackend {
                     base, activation, ..
                 } => {
                     let base_name = match base.as_ref() {
-                        fusion::FusedPattern::Single(p) => pattern_summary(p),
-                        fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm",
-                        fusion::FusedPattern::MatMulBias { .. } => "Gemm",
-                        _ => "fused",
+                        fusion::FusedPattern::Single(p) => pattern_summary(p).into_owned(),
+                        fusion::FusedPattern::ConvBatchNorm { .. } => "Conv+BatchNorm".to_string(),
+                        fusion::FusedPattern::MatMulBias { .. } => "Gemm".to_string(),
+                        _ => "fused".to_string(),
                     };
                     format!("{base_name}+{activation:?}")
                 }
@@ -132,8 +132,18 @@ impl Backend for OnnxBackend {
     }
 }
 
-fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
-    match pattern {
+/// Name the operators a pattern lowers to, for the `classified as …`
+/// diagnostic.
+///
+/// Owned rather than `&'static str` because a chain has no fixed name: it
+/// reports the operator sequence it emits — `Mul+Add`, `Cast+Mul+Mul` — since
+/// a category label would say nothing about what the kernel computes.
+fn pattern_summary(pattern: &analyze::KernelPattern) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
+    Cow::Borrowed(match pattern {
+        analyze::KernelPattern::ElementWiseChain { cast, steps, .. } => {
+            return Cow::Owned(analyze::chain_summary(*cast, steps));
+        }
         analyze::KernelPattern::MatMul { .. } => "MatMul",
         analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
         analyze::KernelPattern::Conv2D { .. } => "Conv",
@@ -149,7 +159,7 @@ fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
         analyze::KernelPattern::Gather { .. } => "Gather",
         analyze::KernelPattern::Scatter { .. } => "ScatterND",
         analyze::KernelPattern::Unknown { .. } => "Unknown",
-    }
+    })
 }
 
 #[cfg(test)]

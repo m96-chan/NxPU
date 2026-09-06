@@ -4,9 +4,10 @@ pub mod dataflow;
 pub mod fusion;
 
 pub use analyze::{
-    ActivationOp, AnalysisError, Conv2DShape, ElementWiseOp, EmbeddedWeight, KernelPattern,
-    MatMulShape, NormType, PoolKind, PoolShape, ReduceOp, TensorBinding, TensorRole,
-    classify_entry_point, extract_embedded_weights, normalize_axis,
+    ActivationOp, AnalysisError, ChainOperand, ChainStep, Conv2DShape, ElementWiseOp,
+    EmbeddedWeight, KernelPattern, MatMulShape, NormType, PoolKind, PoolShape, ReduceOp,
+    ScalarBinding, TensorBinding, TensorRole, chain_op_names, chain_summary, classify_entry_point,
+    extract_embedded_weights, normalize_axis,
 };
 pub use cost::{
     Bottleneck, HardwareProfile, OpCost, default_profiles, estimate_activation_cost,
