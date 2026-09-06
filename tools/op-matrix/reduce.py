@@ -221,7 +221,11 @@ def main():
     lines += [LEGEND, "",
               "## The driver, asked directly", "",
               "One operator per model, built by TensorFlow's converter at "
-              "conventional NHWC shapes. This is what the silicon takes.", ""]
+              "conventional NHWC shapes, and **every weight is a constant**. "
+              "A cell is what this driver did with *that model*, which is one "
+              "instance of the operator and not the operator: on MT6899 the "
+              "same convolution is accelerated with a constant filter and "
+              "refused with a filter the graph takes as an input.", ""]
     table(lines, reference, drivers, "operator",
           lambda row: f"{row['builtin']}"
                       + (f" <sub>{row['nxpuOp']}</sub>" if row["nxpuOp"] else ""))
