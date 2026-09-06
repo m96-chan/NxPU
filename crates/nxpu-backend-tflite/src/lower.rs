@@ -384,12 +384,111 @@ struct GraphDesc {
     graph_name: String,
 }
 
+/// PROBE ONLY, not for merge.
+///
+/// Every graph input after the first becomes a constant of zeros. A MediaTek
+/// driver refuses a convolution whose filter is a graph input and accelerates
+/// the same convolution at the same shapes when the filter is a constant; this
+/// asks how much of the rest of the corpus is the same story. It is a crude
+/// rule -- `vecadd`'s second operand is an activation, not a parameter -- but
+/// the question is only which models a delegate will take, and a model it
+/// takes for the wrong reason still answers it.
+///
+/// The values are zeros, so every model built this way computes the wrong
+/// thing. Nothing here may ship.
+fn probe_freeze_parameters(desc: &mut GraphDesc, extent: i32) {
+    fn bytes_per_element(elem_type: i32) -> usize {
+        match elem_type {
+            data_type::INT8 | data_type::UINT8 | data_type::BOOL => 1,
+            data_type::FLOAT16 | data_type::BFLOAT16 => 2,
+            data_type::INT64 => 8,
+            _ => 4,
+        }
+    }
+    if desc.graph_inputs.len() < 2 {
+        return;
+    }
+    let frozen: Vec<i32> = desc.graph_inputs.split_off(1);
+    for index in frozen {
+        let t = &mut desc.tensors[index as usize];
+        if t.data.is_some() {
+            continue;
+        }
+        let count: usize = concrete_shape(&t.shape, extent)
+            .iter()
+            .map(|d| (*d).max(0) as usize)
+            .product();
+        t.data = Some(vec![0u8; count * bytes_per_element(t.elem_type)]);
+    }
+}
+
 /// Serialise a [`GraphDesc`] into a TFLite FlatBuffer.
 ///
 /// Creates one buffer slot per tensor plus the mandatory sentinel buffer at
 /// index 0.  Deduplicates operator codes so each unique opcode appears only
 /// once in the `operator_codes` vector.
 fn build_from_graph_desc(desc: &GraphDesc, extent: i32) -> Vec<u8> {
+    // PROBE ONLY.
+    let mut owned;
+    let desc = {
+        owned = GraphDesc {
+            tensors: desc
+                .tensors
+                .iter()
+                .map(|t| TensorInfo {
+                    name: t.name.clone(),
+                    elem_type: t.elem_type,
+                    shape: t.shape.clone(),
+                    data: t.data.clone(),
+                })
+                .collect(),
+            ops: desc
+                .ops
+                .iter()
+                .map(|o| OpDesc {
+                    opcode: o.opcode,
+                    inputs: o.inputs.clone(),
+                    outputs: o.outputs.clone(),
+                    options: match &o.options {
+                        OpOptions::None => OpOptions::None,
+                        OpOptions::Pad => OpOptions::Pad,
+                        OpOptions::Conv2D {
+                            padding,
+                            stride_w,
+                            stride_h,
+                            dilation_w,
+                            dilation_h,
+                        } => OpOptions::Conv2D {
+                            padding: *padding,
+                            stride_w: *stride_w,
+                            stride_h: *stride_h,
+                            dilation_w: *dilation_w,
+                            dilation_h: *dilation_h,
+                        },
+                        OpOptions::Pool2D {
+                            padding,
+                            stride_w,
+                            stride_h,
+                            filter_w,
+                            filter_h,
+                        } => OpOptions::Pool2D {
+                            padding: *padding,
+                            stride_w: *stride_w,
+                            stride_h: *stride_h,
+                            filter_w: *filter_w,
+                            filter_h: *filter_h,
+                        },
+                    },
+                })
+                .collect(),
+            graph_inputs: desc.graph_inputs.clone(),
+            graph_outputs: desc.graph_outputs.clone(),
+            graph_name: desc.graph_name.clone(),
+        };
+        probe_freeze_parameters(&mut owned, extent);
+        &owned
+    };
+
     let mut fbb = FlatBufferBuilder::with_capacity(2048);
 
     // --- strings ---
@@ -1458,114 +1557,36 @@ fn build_tflite(
     graph_name: &str,
     extent: i32,
 ) -> Vec<u8> {
-    let mut fbb = FlatBufferBuilder::with_capacity(1024);
-
-    // Strings
-    let names: Vec<_> = inputs.iter().map(|i| fbb.create_string(&i.name)).collect();
-    let name_out = fbb.create_string(&output.name);
-    let desc = fbb.create_string("nxpu");
-    let sg_name = fbb.create_string(graph_name);
-
-    // Shape vectors
-    let shape_vecs: Vec<_> = shapes
+    // PROBE ONLY: routed through the shared graph builder so the freeze applies
+    // here too. Behaviour is otherwise the one this hand-rolled builder had --
+    // the output takes `shapes[min(inputs, 2)]`, as it did.
+    let mut tensors: Vec<TensorInfo> = inputs
         .iter()
-        .map(|s| shape_vector(&mut fbb, s, extent))
+        .enumerate()
+        .map(|(i, b)| TensorInfo::input(b.name.clone(), b.elem_type, shapes[i].clone()))
         .collect();
-
-    // Operator input/output index vectors
-    let input_indices: Vec<i32> = (0..inputs.len() as i32).collect();
-    let op_inputs = fbb.create_vector(&input_indices);
-    let op_outputs = fbb.create_vector(&[inputs.len() as i32]);
-    let sg_inputs = fbb.create_vector(&input_indices);
-    let sg_outputs = fbb.create_vector(&[inputs.len() as i32]);
-
-    // Buffers (sentinel + tensors)
-    let num_tensors = inputs.len() + 1;
-    let mut buffer_offsets = Vec::new();
-    for _ in 0..=num_tensors {
-        let start = fbb.start_table();
-        buffer_offsets.push(fbb.end_table(start));
-    }
-    let buffers = fbb.create_vector(&buffer_offsets);
-
-    // Tensors
-    let mut tensor_offsets = Vec::new();
-    for (i, inp) in inputs.iter().enumerate() {
-        let t = {
-            let start = fbb.start_table();
-            fbb.push_slot_always(vt::tensor::SHAPE, shape_vecs[i]);
-            fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(inp.elem_type), 0);
-            fbb.push_slot::<u32>(vt::tensor::BUFFER, (i + 1) as u32, 0);
-            fbb.push_slot_always(vt::tensor::NAME, names[i]);
-            fbb.end_table(start)
-        };
-        tensor_offsets.push(t);
-    }
-    // Output tensor
-    let out_tensor = {
-        let start = fbb.start_table();
-        fbb.push_slot_always(
-            vt::tensor::SHAPE,
-            shape_vecs[inputs.len().min(shapes.len() - 1)],
-        );
-        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
-        fbb.push_slot::<u32>(vt::tensor::BUFFER, num_tensors as u32, 0);
-        fbb.push_slot_always(vt::tensor::NAME, name_out);
-        fbb.end_table(start)
-    };
-    tensor_offsets.push(out_tensor);
-    let tensors = fbb.create_vector(&tensor_offsets);
-
-    // OperatorCode
-    let deprecated_code = if opcode <= 127 { opcode as i8 } else { 127 };
-    let opcode_table = {
-        let start = fbb.start_table();
-        fbb.push_slot::<i8>(
-            vt::operator_code::DEPRECATED_BUILTIN_CODE,
-            deprecated_code,
-            0,
-        );
-        fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
-        fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, opcode, 0);
-        fbb.end_table(start)
-    };
-    let operator_codes = fbb.create_vector(&[opcode_table]);
-
-    // Operator
-    let operator = {
-        let start = fbb.start_table();
-        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 0, 0);
-        fbb.push_slot_always(vt::operator::INPUTS, op_inputs);
-        fbb.push_slot_always(vt::operator::OUTPUTS, op_outputs);
-        fbb.end_table(start)
-    };
-    let operators = fbb.create_vector(&[operator]);
-
-    // SubGraph
-    let subgraph = {
-        let start = fbb.start_table();
-        fbb.push_slot_always(vt::sub_graph::TENSORS, tensors);
-        fbb.push_slot_always(vt::sub_graph::INPUTS, sg_inputs);
-        fbb.push_slot_always(vt::sub_graph::OUTPUTS, sg_outputs);
-        fbb.push_slot_always(vt::sub_graph::OPERATORS, operators);
-        fbb.push_slot_always(vt::sub_graph::NAME, sg_name);
-        fbb.end_table(start)
-    };
-    let subgraphs = fbb.create_vector(&[subgraph]);
-
-    // Model (root table)
-    let model = {
-        let start = fbb.start_table();
-        fbb.push_slot::<u32>(vt::model::VERSION, 3, 0);
-        fbb.push_slot_always(vt::model::OPERATOR_CODES, operator_codes);
-        fbb.push_slot_always(vt::model::SUBGRAPHS, subgraphs);
-        fbb.push_slot_always(vt::model::DESCRIPTION, desc);
-        fbb.push_slot_always(vt::model::BUFFERS, buffers);
-        fbb.end_table(start)
-    };
-
-    fbb.finish(model, Some(TFLITE_FILE_ID));
-    fbb.finished_data().to_vec()
+    let out_index = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        output.name.clone(),
+        output.elem_type,
+        shapes[inputs.len().min(shapes.len() - 1)].clone(),
+    ));
+    let indices: Vec<i32> = (0..out_index).collect();
+    build_from_graph_desc(
+        &GraphDesc {
+            tensors,
+            ops: vec![OpDesc {
+                opcode,
+                inputs: indices.clone(),
+                outputs: vec![out_index],
+                options: OpOptions::None,
+            }],
+            graph_inputs: indices,
+            graph_outputs: vec![out_index],
+            graph_name: graph_name.into(),
+        },
+        extent,
+    )
 }
 
 /// Build a TFLite model with a single input and single output.
