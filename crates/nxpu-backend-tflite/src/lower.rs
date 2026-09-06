@@ -282,7 +282,11 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
                 elem_type: data_type::INT32,
                 ..indices.clone()
             };
-            build_tflite_scatter(&indices_i32, output, &[-1i32], &[-1i32], updates, extent)
+            // SCATTER_ND checks its operands against each other:
+            // `updates.rank - outer_dims == shape.Dims(0) - indices.Dims(last)`.
+            // For a flat output that balances when the indices are `[N, 1]` —
+            // N index vectors of length one — and the updates are `[N]`.
+            build_tflite_scatter(&indices_i32, output, &[-1i32, 1], &[-1i32], updates, extent)
         }
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(

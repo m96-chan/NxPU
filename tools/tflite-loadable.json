@@ -16,6 +16,7 @@
     "multihead_attention",
     "reduce_sum",
     "relu",
+    "scatter",
     "split",
     "split_axis1",
     "tanh_act",
