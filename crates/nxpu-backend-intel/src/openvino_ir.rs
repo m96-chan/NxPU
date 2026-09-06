@@ -99,6 +99,7 @@ fn build_pattern_layers(
             weight,
             output,
             shape,
+            bias: None,
         } => {
             let input_ids = create_parameter_layers(&[input, weight], layer_id, layers);
             let compute = IrLayer {
@@ -504,6 +505,7 @@ mod tests {
                 dilation_h: 1,
                 dilation_w: 1,
             },
+            bias: None,
         }];
 
         let xml = build_ir_xml(&patterns, "test_conv2d");

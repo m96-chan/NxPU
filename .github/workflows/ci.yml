@@ -19,6 +19,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The classifier's recognisers were written for the vendored corpus;
+          # without it the tests that exercise them silently check nothing.
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
@@ -41,6 +45,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The classifier's recognisers were written for the vendored corpus;
+          # without it the tests that exercise them silently check nothing.
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.87"
@@ -53,6 +61,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The classifier's recognisers were written for the vendored corpus;
+          # without it the tests that exercise them silently check nothing.
+          submodules: recursive
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   security-audit:
@@ -63,6 +75,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The classifier's recognisers were written for the vendored corpus;
+          # without it the tests that exercise them silently check nothing.
+          submodules: recursive
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

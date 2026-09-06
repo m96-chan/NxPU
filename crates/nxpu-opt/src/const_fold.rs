@@ -253,9 +253,39 @@ fn fold_math(
         | MathFunction::Length
         | MathFunction::Distance
         | MathFunction::SmoothStep => None,
+        // Bit manipulation — this folder works in f32, and these are integer
+        // operations. Folding them would mean deciding what extractBits of a
+        // float means, which is a question with no useful answer.
+        MathFunction::ExtractBits | MathFunction::InsertBits => None,
     };
 
     result.and_then(finite).map(Literal::F32)
+}
+
+#[cfg(test)]
+mod bit_op_folding_tests {
+    use super::*;
+    use nxpu_ir::{Expression, Function, Literal, MathFunction};
+
+    #[test]
+    fn bit_manipulation_is_not_folded() {
+        // This folder works in f32. `extractBits` of a float is a question
+        // with no useful answer, so it declines rather than inventing one.
+        let mut func = Function::new("test");
+        let a = func
+            .expressions
+            .append(Expression::Literal(Literal::F32(8.0)));
+        let h = func.expressions.append(Expression::Math {
+            fun: MathFunction::ExtractBits,
+            arg: a,
+            arg1: Some(a),
+            arg2: Some(a),
+            arg3: None,
+        });
+        let before = format!("{:?}", func.expressions[h]);
+        fold_expression_arena(&mut func.expressions);
+        assert_eq!(format!("{:?}", func.expressions[h]), before);
+    }
 }
 
 #[cfg(test)]

@@ -181,6 +181,8 @@ impl fmt::Display for MathFunction {
             Self::Step => "step",
             Self::SmoothStep => "smoothStep",
             Self::Fma => "fma",
+            Self::ExtractBits => "extractBits",
+            Self::InsertBits => "insertBits",
         };
         write!(f, "{name}")
     }
@@ -1076,5 +1078,19 @@ mod tests {
         assert_eq!(format!("{}", MathFunction::Mix), "mix");
         assert_eq!(format!("{}", MathFunction::SmoothStep), "smoothStep");
         assert_eq!(format!("{}", MathFunction::InverseSqrt), "inverseSqrt");
+    }
+}
+
+#[cfg(test)]
+mod math_function_display_tests {
+    use super::*;
+
+    #[test]
+    fn bit_manipulation_prints_as_wgsl_spells_it() {
+        // These names go into IR dumps that people read next to the shader
+        // they came from, so they match the WGSL builtin rather than the
+        // Rust variant.
+        assert_eq!(MathFunction::ExtractBits.to_string(), "extractBits");
+        assert_eq!(MathFunction::InsertBits.to_string(), "insertBits");
     }
 }

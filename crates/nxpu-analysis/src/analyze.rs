@@ -313,6 +313,12 @@ pub enum KernelPattern {
         input: TensorBinding,
         weight: TensorBinding,
         output: TensorBinding,
+        /// Per-output-channel bias, when the kernel has one.
+        ///
+        /// Optional because a convolution need not have a bias, not because
+        /// dropping it is acceptable: a backend that cannot emit one must
+        /// refuse rather than silently compute a convolution without it.
+        bias: Option<TensorBinding>,
         shape: Conv2DShape,
     },
     /// Pooling: nested loops + reduction over spatial window.
@@ -517,6 +523,18 @@ fn type_dims(ty_handle: Handle<Type>, types: &UniqueArena<Type>) -> Vec<i64> {
         } => vec![*n as i64],
         _ => vec![],
     }
+}
+
+/// Whether a params-struct member is an integer scalar, and so plausibly a
+/// tensor dimension rather than a tuning constant like `eps`.
+fn is_integer_member(module: &Module, m: &nxpu_ir::StructMember) -> bool {
+    matches!(
+        module.types[m.ty].inner,
+        TypeInner::Scalar(Scalar {
+            kind: ScalarKind::Uint | ScalarKind::Sint,
+            ..
+        })
+    )
 }
 
 /// Detect number of attention heads from shape_names or literal divisions.
@@ -737,8 +755,18 @@ pub fn classify_entry_point(
         ));
     }
 
+    // Shape parameters only. A params struct routinely carries scalars that
+    // are not dimensions — `eps` is the common one — and counting them made
+    // LayerNorm, whose struct is (N, D, eps), look like it had three shape
+    // names and report itself as BatchNorm.
     let shape_names: Vec<String> = params_members
-        .map(|members| members.iter().filter_map(|m| m.name.clone()).collect())
+        .map(|members| {
+            members
+                .iter()
+                .filter(|m| is_integer_member(module, m))
+                .filter_map(|m| m.name.clone())
+                .collect()
+        })
         .unwrap_or_default();
 
     let has_loop = has_loop(&ep.function.body);
@@ -748,17 +776,47 @@ pub fn classify_entry_point(
     if num_inputs == 1 {
         let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
 
-        // Split: 1 input + 2+ outputs + has If
-        if outputs.len() >= 2 && has_if_statement(&ep.function.body) {
-            let out_bindings: Vec<TensorBinding> = outputs
-                .iter()
-                .map(|(h, gv)| make_binding(module, *h, gv, TensorRole::Output))
-                .collect();
-            let axis = infer_split_axis(&ep.function.body, &ep.function.expressions, &shape_names);
-            return Ok(KernelPattern::Split {
-                input,
-                outputs: out_bindings,
-                axis,
+        // 1 input + 2 or more outputs: a Split, or nothing this compiler has.
+        //
+        // "One input, several outputs, and an If somewhere" was the whole
+        // test, and it asks about the kernel's shape rather than about what it
+        // computes. Three vendor kernels answered yes and none of them is a
+        // split: an activation quantizer emitting codes and per-row scales, a
+        // greedy CTC decode emitting labels and their lengths, and a
+        // mixture-of-experts router emitting expert indices and gate weights.
+        //
+        // What a Split is, and what every backend here emits for one, is a
+        // slice: each output element *is* an input element, moved. So that is
+        // what has to be found — a boundary test, and stores that copy rather
+        // than compute. The rest is refused by name below.
+        if outputs.len() >= 2 {
+            let output_handles: Vec<Handle<GlobalVariable>> =
+                outputs.iter().map(|(h, _)| *h).collect();
+            let (written, computed) = survey_output_stores(
+                &ep.function.body,
+                &ep.function.expressions,
+                inputs[0].0,
+                &output_handles,
+            );
+            let every_output_is_a_copy =
+                computed.is_empty() && written.len() == output_handles.len();
+
+            if every_output_is_a_copy && has_if_statement(&ep.function.body) {
+                let out_bindings: Vec<TensorBinding> = outputs
+                    .iter()
+                    .map(|(h, gv)| make_binding(module, *h, gv, TensorRole::Output))
+                    .collect();
+                let axis =
+                    infer_split_axis(&ep.function.body, &ep.function.expressions, &shape_names);
+                return Ok(KernelPattern::Split {
+                    input,
+                    outputs: out_bindings,
+                    axis,
+                });
+            }
+
+            return Ok(KernelPattern::Unknown {
+                reason: multi_output_refusal(module, &outputs, inputs[0].1, &written, &computed),
             });
         }
 
@@ -778,7 +836,11 @@ pub fn classify_entry_point(
             }
 
             // ElementWise with embedded weight: 1 storage input + binary op + private init global.
-            let ew_op = find_store_binary_op(&ep.function.body, &ep.function.expressions);
+            let ew_op = match find_store_value_op(&ep.function.body, &ep.function.expressions) {
+                Some(StoreValueOp::Binary(op)) => Some(op),
+                // A multiply-add is not an element-wise binary op; fall through.
+                Some(StoreValueOp::MultiplyAdd) | None => None,
+            };
             if let (Some(ew_op), Some(&(wh, wgv))) = (ew_op, init_globals.first()) {
                 let weight = make_binding(module, wh, wgv, TensorRole::Input);
                 let dim_name = shape_names.first().cloned().unwrap_or_else(|| "N".into());
@@ -790,15 +852,55 @@ pub fn classify_entry_point(
                 });
             }
 
+            // A reindexing kernel: it moves values without computing on
+            // them, so there is no activation to find and it used to fall
+            // through to Unknown. Every backend already lowers Transpose.
+            if let Some(perm) = detect_permutation(
+                &ep.function.body,
+                &ep.function.expressions,
+                inputs[0].0,
+                outputs[0].0,
+            ) {
+                return Ok(KernelPattern::Transpose {
+                    input,
+                    output: make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output),
+                    perm,
+                });
+            }
+
             // No recognized activation — unknown pattern.
             return Ok(KernelPattern::Unknown {
                 reason: "single input, no loop, no recognized activation function".into(),
             });
         }
 
+        // A softmax stores `exp(x - max) / Σ exp(x - max)` and builds that sum
+        // in a loop of its own. Recognised as an Activation, which both the
+        // ONNX and TFLite backends already lower.
+        //
+        // `dim_name` is the innermost shape parameter, not the first: the
+        // reduction runs along the last axis, and naming it with the batch
+        // count would label the softmax's length wrongly.
+        if outputs.len() == 1
+            && detect_softmax(&ep.function.body, &ep.function.expressions, outputs[0].0)
+        {
+            let dim_name = shape_names.last().cloned().unwrap_or_else(|| "N".into());
+            return Ok(KernelPattern::Activation {
+                op: ActivationOp::Softmax,
+                input,
+                output,
+                dim_name,
+            });
+        }
+
         // Has loop + single input → Pool or Reduce
-        if shape_names.len() >= 4 {
-            // Pool pattern: many spatial params
+        //
+        // "Four or more parameters" is not evidence of pooling. A pool has a
+        // spatial window, so the loop bounds have to be there; without them
+        // the kernel size was invented as 2x2 and the stride copied from it,
+        // and a reduction over a 4-parameter tensor came back as AveragePool.
+        let pool_bounds = extract_loop_bound_literals(&ep.function.body, &ep.function.expressions);
+        if shape_names.len() >= 4 && !pool_bounds.is_empty() {
             let pool_kind = if find_store_math_fun(
                 &ep.function.body,
                 &ep.function.expressions,
@@ -808,9 +910,9 @@ pub fn classify_entry_point(
             } else {
                 PoolKind::Avg
             };
-            let bounds = extract_loop_bound_literals(&ep.function.body, &ep.function.expressions);
+            let bounds = pool_bounds;
             let strides = extract_multiply_literals(&ep.function.expressions);
-            let kh_u = bounds.first().copied().unwrap_or(2);
+            let kh_u = bounds[0];
             let kw_u = bounds.get(1).copied().unwrap_or(kh_u);
             let sh_u = strides.first().copied().unwrap_or(kh_u);
             let sw_u = strides.get(1).copied().unwrap_or(sh_u);
@@ -885,18 +987,46 @@ pub fn classify_entry_point(
             });
         }
 
-        // Normalization: 3 inputs (input, scale, bias) + 1 output + loop + Sqrt, no Exp.
+        // Normalization: 3 inputs (input, scale, bias) + 1 output + loop, a
+        // reciprocal square root in either spelling, and no Exp.
         // Distinguishes LayerNorm (2 shape params: N, C) from BatchNorm (3+: N, C, HW).
+        //
+        // `inverseSqrt` is the spelling a kernel written for speed uses, and
+        // requiring `sqrt` rejected real LayerNorm and GroupNorm kernels for a
+        // difference that is not one.
         if num_inputs == 3
             && outputs.len() == 1
             && has_loop
-            && has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sqrt)
+            && (has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sqrt)
+                || has_math_function_in_expressions(
+                    &ep.function.expressions,
+                    MathFunction::InverseSqrt,
+                ))
             && !has_math_function_in_expressions(&ep.function.expressions, MathFunction::Exp)
+            && !has_nested_loop(&ep.function.body)
         {
             let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
             let scale = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
             let bias = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
             let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
+            // A group count in the params means group normalization, and the
+            // formats this compiler targets cannot express it: ONNX's
+            // GroupNormalization takes num_groups as a static attribute, and
+            // here it is a uniform the host sets at dispatch time. Saying so
+            // is the only honest answer — reporting it as BatchNormalization,
+            // which is what the parameter count produced, is a graph that runs
+            // and computes something else.
+            if shape_names
+                .iter()
+                .any(|n| n == "G" || n.eq_ignore_ascii_case("groups"))
+            {
+                return Ok(KernelPattern::Unknown {
+                    reason: "group normalization with a group count supplied at \
+                             runtime — the target formats need it as a static \
+                             attribute"
+                        .into(),
+                });
+            }
             let norm_type = if shape_names.len() <= 2 {
                 NormType::Layer
             } else {
@@ -910,6 +1040,72 @@ pub fn classify_entry_point(
                 epsilon: 1e-5,
                 norm_type,
             });
+        }
+
+        // Conv with a bias. Convolution detection lived in the two-input arm,
+        // so every conv that adds a per-channel bias — which is most of them —
+        // arrived here with three inputs and was refused for want of a
+        // recogniser rather than for want of a lowering.
+        //
+        // The evidence is the kernel window itself, named in the params. A
+        // parameter count is not evidence and was tried: it swallowed
+        // attention scores, GQA, MoE dispatch and an inverse STFT, all
+        // reported as CONV_2D — the same guessing this recogniser replaces,
+        // moved to a different arm.
+        //
+        // KH and KW without a KD is exactly two spatial dimensions. A 1-D
+        // conv names one extent, a 3-D conv names three, and a transposed
+        // conv is a different operator; none of them is a Conv2D and each is
+        // refused below rather than rounded to one.
+        let names_kernel = |n: &str| {
+            shape_names.iter().any(|s| {
+                s.eq_ignore_ascii_case(n) || s.eq_ignore_ascii_case(&format!("kernel_{n}"))
+            })
+        };
+        if num_inputs == 3
+            && outputs.len() == 1
+            && has_loop
+            && names_kernel("kh")
+            && names_kernel("kw")
+            && !names_kernel("kd")
+        {
+            let input = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
+            let weight = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
+            let bias = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
+            let output = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
+            let conv_shape = extract_conv2d_shape(
+                &shape_names,
+                Some(&ep.function.body),
+                Some(&ep.function.expressions),
+            );
+            return Ok(KernelPattern::Conv2D {
+                input,
+                weight,
+                output,
+                bias: Some(bias),
+                shape: conv_shape,
+            });
+        }
+
+        // The convolutions this compiler has no operator for. Each is a real
+        // shape, recognised, and declined by name — which is worth more than
+        // a CONV_2D that computes something else.
+        if num_inputs == 3 && outputs.len() == 1 && has_loop {
+            let names = |n: &str| shape_names.iter().any(|s| s.eq_ignore_ascii_case(n));
+            if names("kd") {
+                return Ok(KernelPattern::Unknown {
+                    reason: "3-D convolution — the kernel window has three \
+                             spatial extents and Conv2D has two"
+                        .into(),
+                });
+            }
+            if names("lout") && names("k") {
+                return Ok(KernelPattern::Unknown {
+                    reason: "1-D or transposed convolution — one spatial \
+                             extent, which Conv2D cannot represent"
+                        .into(),
+                });
+            }
         }
 
         // Scatter: 3 inputs + 1 output + no loop (simple scatter write)
@@ -938,6 +1134,92 @@ pub fn classify_entry_point(
     let input_b = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
     let output_c = make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output);
 
+    // Addresses that were loaded rather than computed.
+    //
+    // Every pattern below reads and writes at positions built from the thread
+    // id. A kernel that takes an address out of a second buffer is a gather or
+    // a scatter whatever its loop structure looks like, so the evidence is
+    // weighed here, once, ahead of the loop/no-loop split — the alternative is
+    // a scatter with a loop reported as a matmul, which is what happened.
+    let input_handles = [inputs[0].0, inputs[1].0];
+    let output_handles: Vec<Handle<GlobalVariable>> = outputs.iter().map(|(h, _)| *h).collect();
+
+    // Writes that accumulate. An atomic output means several invocations
+    // reach the same slot and their contributions are summed there; the
+    // read-modify-write is the operator, not an implementation detail of it.
+    if outputs
+        .iter()
+        .any(|(_, gv)| is_atomic_buffer(module, gv.ty))
+    {
+        return Ok(KernelPattern::Unknown {
+            reason: "the output is an array of atomics, so writes to the same slot \
+                     accumulate instead of overwriting — an accumulating scatter. \
+                     Scatter has no reduction mode and takes the tensor it writes \
+                     into as an input; here the destination is the output itself, \
+                     zeroed by the caller"
+                .into(),
+        });
+    }
+
+    // Writes whose position comes out of a buffer.
+    if detect_indexed_write(
+        &ep.function.body,
+        &ep.function.expressions,
+        &input_handles,
+        &output_handles,
+    ) {
+        let also = if outputs.len() > 1 {
+            ", and it writes two output tensors where every pattern here writes one"
+        } else {
+            ""
+        };
+        return Ok(KernelPattern::Unknown {
+            reason: format!(
+                "the address written to is loaded from an input buffer — a \
+                 data-dependent placement, where the input data decides where each \
+                 element lands{also}. Scatter takes three inputs, a destination to \
+                 write into as well as the indices and the updates, and there are two"
+            ),
+        });
+    }
+
+    // Reads whose position comes out of a buffer. Either input can be the one
+    // holding the addresses; nothing says the index tensor is bound second.
+    let indexed_read = [(0usize, 1usize), (1, 0)].into_iter().find_map(|(d, i)| {
+        detect_indexed_read(
+            &ep.function.body,
+            &ep.function.expressions,
+            inputs[d].0,
+            inputs[i].0,
+            outputs[0].0,
+        )
+        .map(|kind| (d, i, kind))
+    });
+    if let Some((d, i, kind)) = indexed_read {
+        let data = make_binding(module, inputs[d].0, inputs[d].1, TensorRole::Input);
+        let indices = make_binding(module, inputs[i].0, inputs[i].1, TensorRole::Input);
+        return Ok(match kind {
+            IndexedRead::Element => KernelPattern::Gather {
+                data,
+                indices,
+                output: output_c,
+                axis: 0,
+            },
+            // A row gather. Every backend lowers `Gather` over a flat buffer —
+            // one element per index — so emitting one here would select single
+            // elements out of a table whose rows are `D` wide, which is a
+            // different tensor of a different size. The row width is the thing
+            // missing, and nothing in `Gather` can carry it.
+            IndexedRead::Block => KernelPattern::Unknown {
+                reason: "a row gather: the index is scaled by a row width before it \
+                         becomes an address, so each index names a block rather than \
+                         an element. Gather indexes a flat buffer and carries no row \
+                         width"
+                    .into(),
+            },
+        });
+    }
+
     if !has_loop {
         let has_structural_if = has_non_guard_if(&ep.function.body);
 
@@ -947,7 +1229,7 @@ pub fn classify_entry_point(
             || input_b.elem_type == data_type::INT32
             || input_b.elem_type == data_type::INT64;
         if second_is_int
-            && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none()
+            && find_store_value_op(&ep.function.body, &ep.function.expressions).is_none()
             && !has_structural_if
         {
             return Ok(KernelPattern::Gather {
@@ -960,7 +1242,7 @@ pub fn classify_entry_point(
 
         // Concat: 2 inputs + no loop + has If + no binary store op
         if has_structural_if
-            && find_store_binary_op(&ep.function.body, &ep.function.expressions).is_none()
+            && find_store_value_op(&ep.function.body, &ep.function.expressions).is_none()
         {
             let axis = infer_concat_axis(&ep.function.body, &ep.function.expressions, &shape_names);
             return Ok(KernelPattern::Concat {
@@ -971,10 +1253,25 @@ pub fn classify_entry_point(
         }
 
         // ElementWise: store of binary operation.
-        let op =
-            find_store_binary_op(&ep.function.body, &ep.function.expressions).ok_or_else(|| {
-                AnalysisError::UnsupportedPattern("no recognizable binary operation found".into())
-            })?;
+        let op = match find_store_value_op(&ep.function.body, &ep.function.expressions) {
+            Some(StoreValueOp::Binary(op)) => op,
+            // `y + a * x` is not an add — the multiply has nowhere to go in a
+            // two-operand `ElementWise`, and reporting `Add` would silently
+            // drop it. Say what was found instead, and say it identically
+            // whether or not FMA fusion has already rewritten the expression.
+            Some(StoreValueOp::MultiplyAdd) => {
+                return Ok(KernelPattern::Unknown {
+                    reason: "fused multiply-add (`c + a * b`, or `fma(a, b, c)` after \
+                             optimization): a three-operand op with no element-wise equivalent"
+                        .into(),
+                });
+            }
+            None => {
+                return Err(AnalysisError::UnsupportedPattern(
+                    "no recognizable binary operation found".into(),
+                ));
+            }
+        };
 
         let dim_name = shape_names.first().cloned().unwrap_or_else(|| "N".into());
 
@@ -986,8 +1283,49 @@ pub fn classify_entry_point(
         });
     }
 
-    // 2 inputs + loop: Conv2D (many params) vs MatMul (3 params)
-    if shape_names.len() > 3 {
+    // A matmul does not compute a reciprocal square root. RMSNorm is a
+    // normalization with a scale and no bias, so it has two inputs rather than
+    // three and never reached the Normalization branch — it fell through to
+    // here and was reported as BATCH_MATMUL. Serving it properly needs the
+    // Normalization pattern to make its bias optional, which is a change to
+    // every backend that lowers one; until then, refusing is the honest half.
+    if (has_math_function_in_expressions(&ep.function.expressions, MathFunction::InverseSqrt)
+        || has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sqrt))
+        && !has_math_function_in_expressions(&ep.function.expressions, MathFunction::Exp)
+    {
+        return Ok(KernelPattern::Unknown {
+            reason: "2 inputs, a loop and a reciprocal square root — a \
+                     normalization without a bias, which Normalization cannot \
+                     yet represent"
+                .into(),
+        });
+    }
+
+    // A convolution does not evaluate trigonometry. An STFT does — its
+    // twiddle factors are sin and cos — and with five parameters it landed in
+    // the arm below and was reported as CONV_2D.
+    if has_math_function_in_expressions(&ep.function.expressions, MathFunction::Sin)
+        || has_math_function_in_expressions(&ep.function.expressions, MathFunction::Cos)
+    {
+        return Ok(KernelPattern::Unknown {
+            reason: "2 inputs, a loop and trigonometry — a transform rather \
+                     than a convolution or a matmul"
+                .into(),
+        });
+    }
+
+    // 2 inputs + loop: a convolution without a bias.
+    //
+    // Same evidence as the three-input arm — the kernel window named in the
+    // params. The parameter count that used to stand in for it reported
+    // attention's context half, GQA's, and MoE dispatch as CONV_2D.
+    let names_kernel_2d = shape_names
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case("kh") || s.eq_ignore_ascii_case("kernel_h"))
+        && shape_names
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("kw") || s.eq_ignore_ascii_case("kernel_w"));
+    if names_kernel_2d {
         let conv_shape = extract_conv2d_shape(
             &shape_names,
             Some(&ep.function.body),
@@ -998,22 +1336,29 @@ pub fn classify_entry_point(
             weight: input_b,
             output: output_c,
             shape: conv_shape,
+            bias: None,
         });
     }
 
     // MatMul: loop + accumulation pattern.
-    let shape = if shape_names.len() >= 3 {
-        MatMulShape {
-            m: shape_names[0].clone(),
-            n: shape_names[1].clone(),
-            k: shape_names[2].clone(),
-        }
-    } else {
-        MatMulShape {
-            m: "M".into(),
-            n: "N".into(),
-            k: "K".into(),
-        }
+    //
+    // The dimensions have to come from the kernel. Inventing M, N and K when
+    // the params struct does not name three of them meant every two-input
+    // looping kernel became a matmul over dimensions nobody had established —
+    // a scatter, among others.
+    if shape_names.len() < 3 {
+        return Ok(KernelPattern::Unknown {
+            reason: format!(
+                "2 inputs and a loop, but {} shape parameters — too few to \
+                 establish a matmul's M, N and K",
+                shape_names.len()
+            ),
+        });
+    }
+    let shape = MatMulShape {
+        m: shape_names[0].clone(),
+        n: shape_names[1].clone(),
+        k: shape_names[2].clone(),
     };
 
     Ok(KernelPattern::MatMul {
@@ -1420,28 +1765,40 @@ fn has_loop(body: &[Statement]) -> bool {
     })
 }
 
-/// Search a block for a Store whose value is a Binary expression,
-/// returning the corresponding element-wise op.
-fn find_store_binary_op(body: &[Statement], exprs: &Arena<Expression>) -> Option<ElementWiseOp> {
+/// What the value expression of a `Store` computes, as far as element-wise
+/// classification is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreValueOp {
+    /// A plain two-operand binary op: `a + b`, `a - b`, `a * b`, `a / b`.
+    Binary(ElementWiseOp),
+    /// A three-operand multiply-add, in either of the two spellings this
+    /// pipeline can produce for it: `c + a * b` as the kernel author wrote it,
+    /// or `fma(a, b, c)` after `nxpu-opt`'s FMA fusion pass has rewritten it.
+    ///
+    /// It is deliberately *not* mapped onto [`ElementWiseOp::Add`]. Calling it
+    /// an add discards the multiply, which is how `axpy` — `y + a * x` — used
+    /// to classify as a bare `Add` at `--opt-level 0` and then fail outright at
+    /// `--opt-level 1` once fusion had rewritten it. Naming the shape here lets
+    /// the classifier give the same answer at every optimization level, and
+    /// leaves a single place to add a real three-operand pattern later.
+    MultiplyAdd,
+}
+
+/// Search a block for a Store whose value is a recognizable arithmetic
+/// expression, returning what kind it is.
+fn find_store_value_op(body: &[Statement], exprs: &Arena<Expression>) -> Option<StoreValueOp> {
     for stmt in body {
         match stmt {
             Statement::Store { value, .. } => {
-                if let Some(Expression::Binary { op, .. }) = exprs.try_get(*value) {
-                    let ew = match op {
-                        BinaryOp::Add => ElementWiseOp::Add,
-                        BinaryOp::Subtract => ElementWiseOp::Sub,
-                        BinaryOp::Multiply => ElementWiseOp::Mul,
-                        BinaryOp::Divide => ElementWiseOp::Div,
-                        _ => continue,
-                    };
-                    return Some(ew);
+                if let Some(op) = classify_store_value_op(exprs, *value) {
+                    return Some(op);
                 }
             }
             Statement::If { accept, reject, .. } => {
-                if let Some(op) = find_store_binary_op(accept, exprs) {
+                if let Some(op) = find_store_value_op(accept, exprs) {
                     return Some(op);
                 }
-                if let Some(op) = find_store_binary_op(reject, exprs) {
+                if let Some(op) = find_store_value_op(reject, exprs) {
                     return Some(op);
                 }
             }
@@ -1449,6 +1806,52 @@ fn find_store_binary_op(body: &[Statement], exprs: &Arena<Expression>) -> Option
         }
     }
     None
+}
+
+/// Classify a single stored value expression.
+fn classify_store_value_op(
+    exprs: &Arena<Expression>,
+    value: Handle<Expression>,
+) -> Option<StoreValueOp> {
+    match exprs.try_get(value)? {
+        // What FMA fusion leaves behind.
+        Expression::Math {
+            fun: MathFunction::Fma,
+            ..
+        } => Some(StoreValueOp::MultiplyAdd),
+        Expression::Binary { op, left, right } => {
+            let ew = match op {
+                // The same three-operand op before fusion. Only `Add` is
+                // checked because only `Add` is what FmaFusion rewrites; a
+                // `Subtract` over multiplies (rope's rotation, say) stays a
+                // `Subtract` at every level and needs no special case.
+                BinaryOp::Add => {
+                    if expr_is_multiply(exprs, *left) || expr_is_multiply(exprs, *right) {
+                        return Some(StoreValueOp::MultiplyAdd);
+                    }
+                    ElementWiseOp::Add
+                }
+                BinaryOp::Subtract => ElementWiseOp::Sub,
+                BinaryOp::Multiply => ElementWiseOp::Mul,
+                BinaryOp::Divide => ElementWiseOp::Div,
+                _ => return None,
+            };
+            Some(StoreValueOp::Binary(ew))
+        }
+        _ => None,
+    }
+}
+
+/// Whether an expression is directly a multiplication — the operand shape
+/// FMA fusion looks for.
+fn expr_is_multiply(exprs: &Arena<Expression>, handle: Handle<Expression>) -> bool {
+    matches!(
+        exprs.try_get(handle),
+        Some(Expression::Binary {
+            op: BinaryOp::Multiply,
+            ..
+        })
+    )
 }
 
 /// Search for a Store whose value is a Math expression, detecting activation type.
@@ -1565,7 +1968,23 @@ fn contains_binary_op(
                 || contains_binary_op(exprs, *left, target)
                 || contains_binary_op(exprs, *right, target)
         }
-        Some(Expression::Math { arg, .. }) => contains_binary_op(exprs, *arg, target),
+        Some(Expression::Math {
+            fun,
+            arg,
+            arg1,
+            arg2,
+            arg3,
+        }) => {
+            // `fma(a, b, c)` is a multiply and an add wearing one name. Say so,
+            // or a pattern that asks "is there a multiply in here?" changes its
+            // answer the moment FMA fusion runs.
+            (*fun == MathFunction::Fma && matches!(target, BinaryOp::Multiply | BinaryOp::Add))
+                || contains_binary_op(exprs, *arg, target)
+                || [*arg1, *arg2, *arg3]
+                    .into_iter()
+                    .flatten()
+                    .any(|h| contains_binary_op(exprs, h, target))
+        }
         Some(Expression::Unary { expr, .. }) => contains_binary_op(exprs, *expr, target),
         _ => false,
     }
@@ -1578,8 +1997,21 @@ fn contains_math_fun(
     target: MathFunction,
 ) -> bool {
     match exprs.try_get(handle) {
-        Some(Expression::Math { fun, arg, .. }) => {
-            *fun == target || contains_math_fun(exprs, *arg, target)
+        Some(Expression::Math {
+            fun,
+            arg,
+            arg1,
+            arg2,
+            arg3,
+        }) => {
+            // All operands, not just the first: `fma` carries two more, and
+            // anything fused into them was invisible to this walk before.
+            *fun == target
+                || contains_math_fun(exprs, *arg, target)
+                || [*arg1, *arg2, *arg3]
+                    .into_iter()
+                    .flatten()
+                    .any(|h| contains_math_fun(exprs, h, target))
         }
         Some(Expression::Binary { left, right, .. }) => {
             contains_math_fun(exprs, *left, target) || contains_math_fun(exprs, *right, target)
@@ -1587,6 +2019,476 @@ fn contains_math_fun(
         Some(Expression::Unary { expr, .. }) => contains_math_fun(exprs, *expr, target),
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Permutation recognition
+// ---------------------------------------------------------------------------
+
+/// How many divisions were applied to the flat invocation id to produce this
+/// value, or `None` if it is not derived from the id by the usual
+/// decomposition.
+///
+/// A kernel that reindexes a tensor peels dimensions off the flat id from the
+/// fastest-varying end: `d = id % D`, `rest = id / D`, `i = rest % N`, and so
+/// on. The number of divisions on the path is therefore the axis's distance
+/// from the fastest end, which is all that is needed to place it.
+fn id_division_depth(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    depth: u32,
+) -> Option<u32> {
+    if depth == 0 {
+        return None;
+    }
+    match exprs.try_get(handle)? {
+        // The flat id itself: `gid.x`.
+        Expression::AccessIndex { base, index: 0 } => {
+            matches!(exprs.try_get(*base)?, Expression::FunctionArgument(_)).then_some(0)
+        }
+        Expression::Binary { op, left, .. } => match op {
+            BinaryOp::Modulo => id_division_depth(exprs, *left, depth - 1),
+            BinaryOp::Divide => id_division_depth(exprs, *left, depth - 1).map(|d| d + 1),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Decompose a store index built as `((c_n * f_n + c_n-1) * f_n-1 + …) + c_0`
+/// into its components, fastest-varying first.
+///
+/// Both spellings are accepted: the multiply-add as written, and the `fma`
+/// the optimizer rewrites it into. Missing the second cost a whole pass's
+/// worth of kernels once already.
+fn flatten_index_components(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    out: &mut Vec<Handle<Expression>>,
+    depth: u32,
+) {
+    if depth == 0 {
+        return;
+    }
+    match exprs.try_get(handle) {
+        Some(Expression::Math {
+            fun: MathFunction::Fma,
+            arg,
+            arg2: Some(addend),
+            ..
+        }) => {
+            out.push(*addend);
+            flatten_index_components(exprs, *arg, out, depth - 1);
+        }
+        Some(Expression::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        }) => {
+            // `a * f + c`: the addend is the component, the product carries
+            // the rest.
+            let (product, addend) = match exprs.try_get(*left) {
+                Some(Expression::Binary {
+                    op: BinaryOp::Multiply,
+                    ..
+                }) => (*left, *right),
+                _ => (*right, *left),
+            };
+            out.push(addend);
+            if let Some(Expression::Binary {
+                op: BinaryOp::Multiply,
+                left: inner,
+                ..
+            }) = exprs.try_get(product)
+            {
+                flatten_index_components(exprs, *inner, out, depth - 1);
+            }
+        }
+        _ => out.push(handle),
+    }
+}
+
+/// Recognise a kernel that copies `input[id]` to a position built by taking
+/// the flat id apart and putting it back together in a different order.
+///
+/// Every backend already lowers `KernelPattern::Transpose`; until now nothing
+/// produced one, so `permute` was refused for want of a recogniser rather
+/// than for want of a lowering.
+fn detect_permutation(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    input: Handle<GlobalVariable>,
+    output: Handle<GlobalVariable>,
+) -> Option<Vec<i64>> {
+    fn find_store(
+        body: &[Statement],
+        exprs: &Arena<Expression>,
+        input: Handle<GlobalVariable>,
+        output: Handle<GlobalVariable>,
+    ) -> Option<(Handle<Expression>, Handle<Expression>)> {
+        for stmt in body {
+            match stmt {
+                Statement::Store { pointer, value } => {
+                    let store_index = match exprs.try_get(*pointer) {
+                        Some(Expression::Access { base, index })
+                            if matches!(
+                                exprs.try_get(*base),
+                                Some(Expression::GlobalVariable(g)) if *g == output
+                            ) =>
+                        {
+                            *index
+                        }
+                        _ => continue,
+                    };
+                    let load_index = match exprs.try_get(*value) {
+                        Some(Expression::Load { pointer }) => match exprs.try_get(*pointer) {
+                            Some(Expression::Access { base, index })
+                                if matches!(
+                                    exprs.try_get(*base),
+                                    Some(Expression::GlobalVariable(g)) if *g == input
+                                ) =>
+                            {
+                                *index
+                            }
+                            _ => continue,
+                        },
+                        _ => continue,
+                    };
+                    return Some((store_index, load_index));
+                }
+                Statement::If { accept, reject, .. } => {
+                    if let Some(found) = find_store(accept, exprs, input, output)
+                        .or_else(|| find_store(reject, exprs, input, output))
+                    {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    let (store_index, load_index) = find_store(body, exprs, input, output)?;
+
+    // The read has to be the plain flat id; anything else is a gather, not a
+    // permutation, and calling it Transpose would be the same kind of
+    // confident guess this recogniser exists to replace.
+    if id_division_depth(exprs, load_index, 32)? != 0 {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    flatten_index_components(exprs, store_index, &mut components, 32);
+    if components.len() < 2 {
+        return None;
+    }
+
+    // Components come out fastest-first; a permutation is stated slowest-first.
+    let rank = components.len();
+    let mut perm = Vec::with_capacity(rank);
+    for handle in components.iter().rev() {
+        let depth = id_division_depth(exprs, *handle, 32)?;
+        if depth as usize >= rank {
+            return None;
+        }
+        perm.push((rank - 1 - depth as usize) as i64);
+    }
+
+    // A genuine permutation uses each axis exactly once, and one that is the
+    // identity is a copy rather than a transpose.
+    let mut seen = perm.clone();
+    seen.sort_unstable();
+    if seen != (0..rank as i64).collect::<Vec<_>>() {
+        return None;
+    }
+    if perm.iter().enumerate().all(|(i, p)| i as i64 == *p) {
+        return None;
+    }
+    Some(perm)
+}
+
+/// Which outputs a kernel writes, and which of them it *computes* rather than
+/// copies out of `input`.
+///
+/// A Split hands back slices of its input: every element it writes is an
+/// element it read, so every store into an output is a bare `Load` from the
+/// input and nothing else. Anything arithmetic in the stored value — a scale,
+/// a rounding, a cast to an index — means the kernel is producing a new tensor
+/// rather than partitioning the one it was given, whatever else it may be
+/// doing, and no `Split` describes that.
+///
+/// Returns `(written, computed)`, both in first-seen order. An output that is
+/// never written at all is absent from `written`, which is also disqualifying:
+/// a slice that stores nothing is not a slice.
+fn survey_output_stores(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    input: Handle<GlobalVariable>,
+    outputs: &[Handle<GlobalVariable>],
+) -> (Vec<Handle<GlobalVariable>>, Vec<Handle<GlobalVariable>>) {
+    fn walk(
+        body: &[Statement],
+        exprs: &Arena<Expression>,
+        input: Handle<GlobalVariable>,
+        outputs: &[Handle<GlobalVariable>],
+        written: &mut Vec<Handle<GlobalVariable>>,
+        computed: &mut Vec<Handle<GlobalVariable>>,
+    ) {
+        for stmt in body {
+            match stmt {
+                Statement::Store { pointer, value } => {
+                    let Some(target) = access_base_global(exprs, *pointer) else {
+                        continue;
+                    };
+                    if !outputs.contains(&target) {
+                        continue;
+                    }
+                    if !written.contains(&target) {
+                        written.push(target);
+                    }
+                    let copied = match exprs.try_get(*value) {
+                        Some(Expression::Load { pointer }) => {
+                            access_base_global(exprs, *pointer) == Some(input)
+                        }
+                        _ => false,
+                    };
+                    if !copied && !computed.contains(&target) {
+                        computed.push(target);
+                    }
+                }
+                Statement::If { accept, reject, .. } => {
+                    walk(accept, exprs, input, outputs, written, computed);
+                    walk(reject, exprs, input, outputs, written, computed);
+                }
+                Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    walk(body, exprs, input, outputs, written, computed);
+                    walk(continuing, exprs, input, outputs, written, computed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut written = Vec::new();
+    let mut computed = Vec::new();
+    walk(body, exprs, input, outputs, &mut written, &mut computed);
+    (written, computed)
+}
+
+/// Say, in the refusal, what was actually seen.
+///
+/// "Unrecognized pattern" tells the caller nothing about their kernel. These
+/// name the outputs that disqualified it and why, so the message is checkable
+/// against the source in front of them.
+fn multi_output_refusal(
+    module: &Module,
+    outputs: &[(Handle<GlobalVariable>, &GlobalVariable)],
+    input: &GlobalVariable,
+    written: &[Handle<GlobalVariable>],
+    computed: &[Handle<GlobalVariable>],
+) -> String {
+    let name_of = |handle: Handle<GlobalVariable>| -> String {
+        outputs
+            .iter()
+            .find(|(h, _)| *h == handle)
+            .and_then(|(_, gv)| gv.name.clone())
+            .unwrap_or_else(|| "an output".into())
+    };
+    let quoted = |handles: &[Handle<GlobalVariable>]| -> String {
+        handles
+            .iter()
+            .map(|h| format!("'{}'", name_of(*h)))
+            .collect::<Vec<_>>()
+            .join(" and ")
+    };
+
+    let unwritten: Vec<Handle<GlobalVariable>> = outputs
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| !written.contains(h))
+        .collect();
+
+    let mut reason = format!(
+        "1 input and {} outputs, but this does not slice its input: ",
+        outputs.len()
+    );
+    if !computed.is_empty() {
+        reason.push_str(&format!(
+            "{} {} written with a computed value rather than a copy of the input",
+            quoted(computed),
+            if computed.len() == 1 { "is" } else { "are" },
+        ));
+        if !unwritten.is_empty() {
+            reason.push_str(", and ");
+        }
+    }
+    if !unwritten.is_empty() {
+        reason.push_str(&format!(
+            "{} {} never stored to",
+            quoted(&unwritten),
+            if unwritten.len() == 1 { "is" } else { "are" },
+        ));
+    }
+    if computed.is_empty() && unwritten.is_empty() {
+        // Copies throughout, but no boundary test to split on.
+        reason.push_str("there is no comparison marking where one output ends and the next begins");
+    }
+
+    // A slice keeps its element type. When it changes, the kernel is
+    // converting, and saying so points at the half of the problem a Split
+    // could never have carried anyway.
+    let input_elem = resolve_array_elem_type(module, input.ty);
+    if outputs
+        .iter()
+        .any(|(_, gv)| resolve_array_elem_type(module, gv.ty) != input_elem)
+    {
+        reason.push_str(
+            ". The outputs do not all share the input's element type either, and a slice \
+             never changes it",
+        );
+    }
+
+    reason.push_str(
+        ". Splitting is the only single-input, multi-output op these backends lower, \
+         so there is nothing here for one to carry",
+    );
+    reason
+}
+
+/// Positive recognition of a softmax: `exp(x - max) / Σ exp(x - max)`.
+///
+/// Two facts have to hold together, and neither is enough on its own:
+///
+///   - the value written to the output is an `exp` over a division — the
+///     normalised numerator, whether it is spelled `exp(..) / sum` or
+///     `exp(..) * (1.0 / sum)`, which are the same expression tree with the
+///     `Divide` in a different place;
+///   - some store inside a loop adds an `exp` into a running total — the
+///     denominator being built, one element of the row at a time.
+///
+/// The second is what separates a softmax from a hand-written sigmoid,
+/// `1.0 / (1.0 + exp(-x))`, which also stores an `exp` over a `Divide`. A
+/// sigmoid accumulates no exponentials because it has nothing to sum over.
+/// The first is what separates it from a plain `ReduceSum` of exponentials,
+/// which builds the same total and then writes the total.
+///
+/// What is deliberately *not* required is the max subtraction. It is there in
+/// every stable softmax and in this vendor kernel, but it is an implementation
+/// choice about overflow rather than part of the operator, and a kernel that
+/// skips it is still a softmax.
+fn detect_softmax(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    output: Handle<GlobalVariable>,
+) -> bool {
+    stores_a_normalized_exp(body, exprs, output) && sums_exponentials_in_a_loop(body, exprs, false)
+}
+
+/// A store into `output` whose value contains both an `exp` and a division.
+fn stores_a_normalized_exp(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    output: Handle<GlobalVariable>,
+) -> bool {
+    for stmt in body {
+        match stmt {
+            Statement::Store { pointer, value } => {
+                if access_base_global(exprs, *pointer) == Some(output)
+                    && contains_math_fun(exprs, *value, MathFunction::Exp)
+                    && contains_binary_op(exprs, *value, BinaryOp::Divide)
+                {
+                    return true;
+                }
+            }
+            Statement::If { accept, reject, .. } => {
+                if stores_a_normalized_exp(accept, exprs, output)
+                    || stores_a_normalized_exp(reject, exprs, output)
+                {
+                    return true;
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } if stores_a_normalized_exp(body, exprs, output)
+                || stores_a_normalized_exp(continuing, exprs, output) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// An `acc = acc + exp(..)` — an add, containing an exponential, executed
+/// inside a loop. The target is not checked: a workgroup slot, a local and a
+/// storage scratch buffer are all the same accumulator here.
+fn sums_exponentials_in_a_loop(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    in_loop: bool,
+) -> bool {
+    for stmt in body {
+        match stmt {
+            Statement::Store { value, .. } => {
+                if in_loop
+                    && matches!(
+                        exprs.try_get(*value),
+                        Some(Expression::Binary {
+                            op: BinaryOp::Add,
+                            ..
+                        })
+                    )
+                    && contains_math_fun(exprs, *value, MathFunction::Exp)
+                {
+                    return true;
+                }
+            }
+            Statement::If { accept, reject, .. } => {
+                if sums_exponentials_in_a_loop(accept, exprs, in_loop)
+                    || sums_exponentials_in_a_loop(reject, exprs, in_loop)
+                {
+                    return true;
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } if sums_exponentials_in_a_loop(body, exprs, true)
+                || sums_exponentials_in_a_loop(continuing, exprs, true) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a loop appears inside another loop.
+///
+/// A normalization reduces once over a row: its passes are sequential loops,
+/// never nested. A filterbank contracts a matrix against a spectrum, so its
+/// loops nest. That is the difference between `mel`, which was reported as
+/// BatchNormalization because it has three inputs and a square root, and a
+/// normalization that actually is one.
+fn has_nested_loop(body: &[Statement]) -> bool {
+    fn inside_loop(body: &[Statement]) -> bool {
+        body.iter().any(|s| match s {
+            Statement::Loop { .. } => true,
+            Statement::If { accept, reject, .. } => inside_loop(accept) || inside_loop(reject),
+            _ => false,
+        })
+    }
+    body.iter().any(|s| match s {
+        Statement::Loop {
+            body, continuing, ..
+        } => inside_loop(body) || inside_loop(continuing) || has_nested_loop(body),
+        Statement::If { accept, reject, .. } => has_nested_loop(accept) || has_nested_loop(reject),
+        _ => false,
+    })
 }
 
 /// Check if a block contains a Store whose value (or sub-expr) uses a specific Math function.
@@ -1664,6 +2566,255 @@ fn find_store_binary_divide(body: &[Statement], exprs: &Arena<Expression>) -> bo
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Data-dependent addressing
+// ---------------------------------------------------------------------------
+//
+// Every pattern this file recognises reads and writes at positions computed
+// from the thread id: a matmul's `row * K + k`, a convolution's window, an
+// element-wise op's `idx`. The kernels that do not are the ones that take an
+// address *out of a buffer* — a gather on the read side, a scatter on the
+// write side — and that is visible in the expression graph without counting
+// anything.
+
+/// What an index-dependent read addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexedRead {
+    /// `out[i] = data[idx[i]]` — the loaded index *is* the address, so each
+    /// index names one element. This is what `KernelPattern::Gather` lowers
+    /// to: a flat buffer, one element per index.
+    Element,
+    /// `out[i] = data[idx[n] * W + d]` — the loaded index is scaled by a width
+    /// before it becomes an address, so each index names a whole block.
+    Block,
+}
+
+/// Walk a pointer expression down to the global variable it addresses.
+fn access_base_global(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+) -> Option<Handle<GlobalVariable>> {
+    let mut handle = handle;
+    for _ in 0..32 {
+        match exprs.try_get(handle)? {
+            Expression::GlobalVariable(g) => return Some(*g),
+            Expression::Access { base, .. } | Expression::AccessIndex { base, .. } => {
+                handle = *base;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Peel the type casts off a value. `u32(indices[n])` is the index it loaded.
+fn strip_casts(exprs: &Arena<Expression>, handle: Handle<Expression>) -> Handle<Expression> {
+    let mut handle = handle;
+    for _ in 0..8 {
+        match exprs.try_get(handle) {
+            Some(Expression::As { expr, .. }) => handle = *expr,
+            _ => break,
+        }
+    }
+    handle
+}
+
+/// If `handle` is a load out of `global`, the index expression it loaded from.
+fn load_address(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    global: Handle<GlobalVariable>,
+) -> Option<Handle<Expression>> {
+    let Expression::Load { pointer } = exprs.try_get(handle)? else {
+        return None;
+    };
+    let Expression::Access { base, index } = exprs.try_get(*pointer)? else {
+        return None;
+    };
+    (access_base_global(exprs, *base) == Some(global)).then_some(*index)
+}
+
+/// Does any of `roots` load, anywhere inside it, from one of `wanted`?
+///
+/// Iterative with a visited set rather than the depth-limited recursion used
+/// elsewhere in this file: an expression arena is a DAG, and an address built
+/// from shared subexpressions is walked exponentially by the naive spelling.
+fn reads_global(
+    exprs: &Arena<Expression>,
+    roots: &[Handle<Expression>],
+    wanted: &[Handle<GlobalVariable>],
+) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<Handle<Expression>> = roots.to_vec();
+    while let Some(handle) = stack.pop() {
+        if !seen.insert(handle.index()) {
+            continue;
+        }
+        let Some(expr) = exprs.try_get(handle) else {
+            continue;
+        };
+        // Nested rather than a let-chain: those are stable from 1.88 and this
+        // workspace's rust-version is 1.87.
+        #[allow(clippy::collapsible_if)]
+        if let Expression::Load { pointer } = expr {
+            if access_base_global(exprs, *pointer).is_some_and(|g| wanted.contains(&g)) {
+                return true;
+            }
+        }
+        push_operands(expr, &mut stack);
+    }
+    false
+}
+
+/// Push every sub-expression of `expr` onto `stack`.
+fn push_operands(expr: &Expression, stack: &mut Vec<Handle<Expression>>) {
+    match expr {
+        Expression::Load { pointer } => stack.push(*pointer),
+        Expression::Access { base, index } => {
+            stack.push(*base);
+            stack.push(*index);
+        }
+        Expression::AccessIndex { base, .. } => stack.push(*base),
+        Expression::Unary { expr, .. } => stack.push(*expr),
+        Expression::Binary { left, right, .. } => {
+            stack.push(*left);
+            stack.push(*right);
+        }
+        Expression::Select {
+            condition,
+            accept,
+            reject,
+        } => {
+            stack.push(*condition);
+            stack.push(*accept);
+            stack.push(*reject);
+        }
+        Expression::Math {
+            arg,
+            arg1,
+            arg2,
+            arg3,
+            ..
+        } => {
+            stack.push(*arg);
+            stack.extend([*arg1, *arg2, *arg3].into_iter().flatten());
+        }
+        Expression::As { expr, .. } => stack.push(*expr),
+        Expression::Splat { value, .. } => stack.push(*value),
+        Expression::Swizzle { vector, .. } => stack.push(*vector),
+        Expression::Compose { components, .. } => stack.extend(components.iter().copied()),
+        Expression::ArrayLength(handle) => stack.push(*handle),
+        _ => {}
+    }
+}
+
+/// Recognise a store into `output` whose value was loaded from `data` at an
+/// address that was itself loaded from `indices` — a gather.
+///
+/// The two shapes are told apart because only one of them is representable:
+/// `Gather` indexes a flat buffer and carries no row width, so a read whose
+/// index is scaled by one is a different operator wearing the same name.
+fn detect_indexed_read(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    data: Handle<GlobalVariable>,
+    indices: Handle<GlobalVariable>,
+    output: Handle<GlobalVariable>,
+) -> Option<IndexedRead> {
+    for stmt in body {
+        match stmt {
+            Statement::Store { pointer, value } => {
+                if access_base_global(exprs, *pointer) != Some(output) {
+                    continue;
+                }
+                let Some(address) = load_address(exprs, strip_casts(exprs, *value), data) else {
+                    continue;
+                };
+                if !reads_global(exprs, &[address], &[indices]) {
+                    continue;
+                }
+                return Some(
+                    if load_address(exprs, strip_casts(exprs, address), indices).is_some() {
+                        IndexedRead::Element
+                    } else {
+                        IndexedRead::Block
+                    },
+                );
+            }
+            Statement::If { accept, reject, .. } => {
+                if let Some(kind) = detect_indexed_read(accept, exprs, data, indices, output)
+                    .or_else(|| detect_indexed_read(reject, exprs, data, indices, output))
+                {
+                    return Some(kind);
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                if let Some(kind) = detect_indexed_read(body, exprs, data, indices, output)
+                    .or_else(|| detect_indexed_read(continuing, exprs, data, indices, output))
+                {
+                    return Some(kind);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Does a store into one of `outputs` write to an address that was loaded out
+/// of one of `sources` — a scatter?
+fn detect_indexed_write(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    sources: &[Handle<GlobalVariable>],
+    outputs: &[Handle<GlobalVariable>],
+) -> bool {
+    for stmt in body {
+        match stmt {
+            Statement::Store { pointer, .. } => {
+                let Some(Expression::Access { base, index }) = exprs.try_get(*pointer) else {
+                    continue;
+                };
+                if !access_base_global(exprs, *base).is_some_and(|g| outputs.contains(&g)) {
+                    continue;
+                }
+                if reads_global(exprs, &[*index], sources) {
+                    return true;
+                }
+            }
+            Statement::If { accept, reject, .. }
+                if detect_indexed_write(accept, exprs, sources, outputs)
+                    || detect_indexed_write(reject, exprs, sources, outputs) =>
+            {
+                return true;
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } if detect_indexed_write(body, exprs, sources, outputs)
+                || detect_indexed_write(continuing, exprs, sources, outputs) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Is this buffer an array of atomics (or an atomic scalar)?
+///
+/// An atomic output is a statement about the operator: several invocations
+/// reach the same slot and their contributions are combined there.
+fn is_atomic_buffer(module: &Module, ty: Handle<Type>) -> bool {
+    match &module.types[ty].inner {
+        TypeInner::Atomic(_) => true,
+        TypeInner::Array { base, .. } => matches!(&module.types[*base].inner, TypeInner::Atomic(_)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -3497,22 +4648,45 @@ mod tests {
             right: load,
         });
 
-        let val = func
+        // `out_a[idx] = input[idx]` on one side of the boundary and
+        // `out_b[idx] = input[idx]` on the other. Both stores used to be a
+        // float literal written through a float literal, which addresses
+        // nothing and copies nothing; the classifier now asks whether the
+        // outputs are slices of the input, so the module has to be one.
+        let (input_gv, out_a_gv, out_b_gv) = {
+            let mut iter = module.global_variables.iter();
+            let input = iter.next().unwrap().0;
+            let out_a = iter.next().unwrap().0;
+            let out_b = iter.next().unwrap().0;
+            (input, out_a, out_b)
+        };
+        let input_expr = func
             .expressions
-            .append(Expression::Literal(Literal::F32(0.0)));
-        let ptr = func
-            .expressions
-            .append(Expression::Literal(Literal::F32(0.0)));
+            .append(Expression::GlobalVariable(input_gv));
+        let read = func.expressions.append(Expression::Access {
+            base: input_expr,
+            index: idx,
+        });
+        let val = func.expressions.append(Expression::Load { pointer: read });
+
+        let mut copy_into = |out: Handle<GlobalVariable>| {
+            let out_expr = func.expressions.append(Expression::GlobalVariable(out));
+            let ptr = func.expressions.append(Expression::Access {
+                base: out_expr,
+                index: idx,
+            });
+            Statement::Store {
+                pointer: ptr,
+                value: val,
+            }
+        };
+        let store_a = copy_into(out_a_gv);
+        let store_b = copy_into(out_b_gv);
+
         func.body.push(Statement::If {
             condition: cmp,
-            accept: vec![Statement::Store {
-                pointer: ptr,
-                value: val,
-            }],
-            reject: vec![Statement::Store {
-                pointer: ptr,
-                value: val,
-            }],
+            accept: vec![store_a],
+            reject: vec![store_b],
         });
 
         module.entry_points.push(EntryPoint {
@@ -3741,6 +4915,45 @@ mod tests {
         let names: Vec<String> = vec!["N".into()];
         let result = find_if_comparison_axis(&body, &func.expressions, &names);
         assert_eq!(result, None);
+    }
+
+    /// A params struct that mixes dimensions with a tolerance constant is the
+    /// normal case, not an edge one: LayerNorm's is (N, D, eps), and counting
+    /// eps as a third dimension is what made it report as BatchNorm.
+    #[test]
+    fn eps_is_not_a_dimension() {
+        let mut module = Module::default();
+        let u32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        });
+        let f32_ty = module.types.insert(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        });
+        let members = [
+            StructMember {
+                name: Some("N".into()),
+                ty: u32_ty,
+                offset: 0,
+            },
+            StructMember {
+                name: Some("D".into()),
+                ty: u32_ty,
+                offset: 4,
+            },
+            StructMember {
+                name: Some("eps".into()),
+                ty: f32_ty,
+                offset: 8,
+            },
+        ];
+        let dims: Vec<String> = members
+            .iter()
+            .filter(|m| is_integer_member(&module, m))
+            .filter_map(|m| m.name.clone())
+            .collect();
+        assert_eq!(dims, vec!["N".to_string(), "D".to_string()]);
     }
 
     // --- Multi-head & causal attention classification tests ---

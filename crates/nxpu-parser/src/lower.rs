@@ -383,7 +383,8 @@ impl LowerCtx<'_> {
         }
 
         // Body
-        fctx.function.body = self.lower_block(&naga_func.body, &fctx)?;
+        let body = self.lower_block(&naga_func.body, &mut fctx)?;
+        fctx.function.body = body;
 
         Ok(fctx.function)
     }
@@ -669,7 +670,7 @@ impl LowerCtx<'_> {
     fn lower_block(
         &self,
         block: &naga::Block,
-        fctx: &FuncCtx,
+        fctx: &mut FuncCtx,
     ) -> Result<nxpu_ir::Block, ParseError> {
         let mut out = Vec::new();
         for stmt in block.iter() {
@@ -681,7 +682,7 @@ impl LowerCtx<'_> {
     fn lower_statement(
         &self,
         stmt: &naga::Statement,
-        fctx: &FuncCtx,
+        fctx: &mut FuncCtx,
         out: &mut nxpu_ir::Block,
     ) -> Result<(), ParseError> {
         match *stmt {
@@ -716,6 +717,60 @@ impl LowerCtx<'_> {
                     accept: self.lower_block(accept, fctx)?,
                     reject: self.lower_block(reject, fctx)?,
                 });
+            }
+            // WGSL has no fall-through, so a switch is an if/else-if chain
+            // with the default as the final else. Lowering it here keeps the
+            // IR — and every pass and backend that matches on it — from
+            // needing a construct that adds no expressive power.
+            naga::Statement::Switch {
+                selector,
+                ref cases,
+            } => {
+                if cases.iter().any(|c| c.fall_through) {
+                    return Err(unsupported("Switch statement with fall-through"));
+                }
+                let selector = self.map_func_expr(fctx, selector)?;
+
+                let mut arms = Vec::new();
+                let mut default_body = nxpu_ir::Block::new();
+                for case in cases {
+                    let body = self.lower_block(&case.body, fctx)?;
+                    match case.value {
+                        naga::SwitchValue::Default => default_body = body,
+                        naga::SwitchValue::I32(v) => arms.push((nxpu_ir::Literal::I32(v), body)),
+                        naga::SwitchValue::U32(v) => arms.push((nxpu_ir::Literal::U32(v), body)),
+                    }
+                }
+
+                // Built back to front: each arm's `reject` is the chain so
+                // far, so the first case ends up outermost and the default
+                // innermost, which is the order the switch had.
+                let mut chain = default_body;
+                for (literal, body) in arms.into_iter().rev() {
+                    let lit = fctx
+                        .function
+                        .expressions
+                        .append(nxpu_ir::Expression::Literal(literal));
+                    let cmp = fctx
+                        .function
+                        .expressions
+                        .append(nxpu_ir::Expression::Binary {
+                            op: nxpu_ir::BinaryOp::Equal,
+                            left: selector,
+                            right: lit,
+                        });
+                    // Both are new arena entries and consecutive, and the
+                    // emit has to precede the `If` that reads it.
+                    out.push(nxpu_ir::Statement::Emit(nxpu_ir::Range::from_index_range(
+                        lit.index() as u32..cmp.index() as u32 + 1,
+                    )));
+                    chain = vec![nxpu_ir::Statement::If {
+                        condition: cmp,
+                        accept: body,
+                        reject: chain,
+                    }];
+                }
+                out.extend(chain);
             }
             naga::Statement::Loop {
                 ref body,
@@ -773,7 +828,6 @@ impl LowerCtx<'_> {
                 }
             }
             // Unsupported statements
-            naga::Statement::Switch { .. } => return Err(unsupported("Switch statement")),
             naga::Statement::CooperativeStore { .. } => {
                 return Err(unsupported("CooperativeStore statement"));
             }
@@ -956,6 +1010,8 @@ fn lower_math_function(fun: naga::MathFunction) -> Result<nxpu_ir::MathFunction,
         naga::MathFunction::Step => Ok(nxpu_ir::MathFunction::Step),
         naga::MathFunction::SmoothStep => Ok(nxpu_ir::MathFunction::SmoothStep),
         naga::MathFunction::Fma => Ok(nxpu_ir::MathFunction::Fma),
+        naga::MathFunction::ExtractBits => Ok(nxpu_ir::MathFunction::ExtractBits),
+        naga::MathFunction::InsertBits => Ok(nxpu_ir::MathFunction::InsertBits),
         other => Err(unsupported(&format!("{other:?} math function"))),
     }
 }
@@ -1520,6 +1576,75 @@ fn main() {}";
             ParseError::Unsupported(ref msg) => assert!(msg.contains("Image"), "got: {msg}"),
             other => panic!("expected Unsupported, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_bits_lowers() {
+        // Every quantized matmul and matvec kernel unpacks codes out of a u32
+        // with this, so it is the difference between compiling that family and
+        // rejecting all of it.
+        let source = "
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  dst[gid.x] = extractBits(src[gid.x], 8u, 8u);
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+        let func = &module.entry_points[0].function;
+        assert!(
+            func.expressions.iter().any(|(_, e)| matches!(
+                e,
+                nxpu_ir::Expression::Math {
+                    fun: nxpu_ir::MathFunction::ExtractBits,
+                    ..
+                }
+            )),
+            "no ExtractBits in the lowered function"
+        );
+    }
+
+    /// Count `If` statements anywhere in a block, including nested ones.
+    fn count_ifs(block: &nxpu_ir::Block) -> usize {
+        block
+            .iter()
+            .map(|s| match s {
+                nxpu_ir::Statement::If { accept, reject, .. } => {
+                    1 + count_ifs(accept) + count_ifs(reject)
+                }
+                nxpu_ir::Statement::Loop {
+                    body, continuing, ..
+                } => count_ifs(body) + count_ifs(continuing),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn switch_becomes_an_if_chain() {
+        // WGSL switches do not fall through, so the IR needs no Switch of its
+        // own — and not having one keeps every pass and backend from growing
+        // an arm for a construct that adds no expressive power.
+        let source = "
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  var v = 0.0;
+  switch (gid.y) {
+    case 0u: { v = src[gid.x]; }
+    case 1u: { v = -src[gid.x]; }
+    default: { v = 0.0; }
+  }
+  dst[gid.x] = v;
+}";
+        let naga_module = naga::front::wgsl::parse_str(source).expect("WGSL parse failed");
+        let module = lower_module(&naga_module).expect("lowering failed");
+        // One per non-default case; the default is the innermost else.
+        assert_eq!(count_ifs(&module.entry_points[0].function.body), 2);
     }
 
     #[test]

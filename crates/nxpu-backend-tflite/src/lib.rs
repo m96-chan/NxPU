@@ -231,7 +231,13 @@ fn pattern_summary(pattern: &analyze::KernelPattern) -> &'static str {
         analyze::KernelPattern::Reduce { op, .. } => op.op_name(),
         analyze::KernelPattern::Transpose { .. } => "TRANSPOSE",
         analyze::KernelPattern::Reshape { .. } => "RESHAPE",
-        analyze::KernelPattern::Normalization { .. } => "BatchNormalization",
+        // The kind matters: reporting every normalization as BatchNormalization
+        // hid a LayerNorm being classified correctly and described wrongly,
+        // which is worse than either mistake alone.
+        analyze::KernelPattern::Normalization { norm_type, .. } => match norm_type {
+            analyze::NormType::Batch => "BatchNormalization",
+            analyze::NormType::Layer => "LayerNormalization",
+        },
         analyze::KernelPattern::Concat { .. } => "CONCATENATION",
         analyze::KernelPattern::Split { .. } => "SPLIT",
         analyze::KernelPattern::Attention { .. } => "Attention",
@@ -407,6 +413,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 dilation_h: 1,
                 dilation_w: 1,
             },
+            bias: None,
         };
         let norm = KernelPattern::Normalization {
             input: make_tensor("conv_out", TensorRole::Input),
@@ -520,6 +527,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 dilation_h: 1,
                 dilation_w: 1,
             },
+            bias: None,
         };
         let norm = KernelPattern::Normalization {
             input: make_tensor("conv_out", TensorRole::Input),
@@ -624,6 +632,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     dilation_h: 1,
                     dilation_w: 1,
                 },
+                bias: None,
             },
             norm: Box::new(KernelPattern::Normalization {
                 input: make_tensor("conv_out", TensorRole::Input),
@@ -841,6 +850,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 dilation_h: 1,
                 dilation_w: 1,
             },
+            bias: None,
         };
         assert_eq!(pattern_summary(&conv), "CONV_2D");
 

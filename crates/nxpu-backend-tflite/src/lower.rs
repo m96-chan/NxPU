@@ -88,7 +88,8 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
             weight,
             output,
             shape,
-        } => build_tflite_conv2d(input, weight, output, shape, extent),
+            bias,
+        } => build_tflite_conv2d(input, weight, bias.as_ref(), output, shape, extent),
         KernelPattern::Pool {
             kind,
             input,
@@ -1633,6 +1634,7 @@ fn build_tflite_softmax(input: &TensorBinding, output: &TensorBinding, extent: i
 fn build_tflite_conv2d(
     input: &TensorBinding,
     weight: &TensorBinding,
+    bias: Option<&TensorBinding>,
     output: &TensorBinding,
     shape: &Conv2DShape,
     extent: i32,
@@ -1646,15 +1648,30 @@ fn build_tflite_conv2d(
     let sg_name = fbb.create_string("conv2d");
 
     let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1], extent);
+    // Per-output-channel, so one dimension rather than four.
+    let shape_1d = shape_vector(&mut fbb, &[-1i32], extent);
+    let name_bias = bias.map(|b| fbb.create_string(&b.name));
 
-    let op_inputs = fbb.create_vector(&[0i32, 1]);
-    let op_outputs = fbb.create_vector(&[2i32]);
-    let sg_inputs = fbb.create_vector(&[0i32, 1]);
-    let sg_outputs = fbb.create_vector(&[2i32]);
+    // With a bias the output tensor moves to index 3, because the bias is
+    // appended before it.
+    let out_index = if bias.is_some() { 3i32 } else { 2 };
+    let op_inputs = if bias.is_some() {
+        fbb.create_vector(&[0i32, 1, 2])
+    } else {
+        fbb.create_vector(&[0i32, 1])
+    };
+    let op_outputs = fbb.create_vector(&[out_index]);
+    let sg_inputs = if bias.is_some() {
+        fbb.create_vector(&[0i32, 1, 2])
+    } else {
+        fbb.create_vector(&[0i32, 1])
+    };
+    let sg_outputs = fbb.create_vector(&[out_index]);
 
-    // 4 buffers: sentinel + input + weight + output
+    // sentinel + input + weight + output, and the bias when there is one
+    let buffer_count = if bias.is_some() { 5 } else { 4 };
     let mut buffer_offsets = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..buffer_count {
         let start = fbb.start_table();
         buffer_offsets.push(fbb.end_table(start));
     }
@@ -1676,15 +1693,31 @@ fn build_tflite_conv2d(
         fbb.push_slot_always(vt::tensor::NAME, name_w);
         fbb.end_table(start)
     };
+    let tensor_bias = name_bias.map(|name| {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_1d);
+        fbb.push_slot::<i8>(
+            vt::tensor::TYPE,
+            onnx_to_tflite_type(bias.expect("name implies binding").elem_type),
+            0,
+        );
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 3, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name);
+        fbb.end_table(start)
+    });
+
     let tensor_out = {
         let start = fbb.start_table();
         fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
         fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
-        fbb.push_slot::<u32>(vt::tensor::BUFFER, 3, 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, buffer_count as u32 - 1, 0);
         fbb.push_slot_always(vt::tensor::NAME, name_out);
         fbb.end_table(start)
     };
-    let tensors = fbb.create_vector(&[tensor_in, tensor_w, tensor_out]);
+    let tensors = match tensor_bias {
+        Some(b) => fbb.create_vector(&[tensor_in, tensor_w, b, tensor_out]),
+        None => fbb.create_vector(&[tensor_in, tensor_w, tensor_out]),
+    };
 
     let deprecated_code = if builtin_op::CONV_2D <= 127 {
         builtin_op::CONV_2D as i8
@@ -2617,6 +2650,7 @@ mod tests {
                 dilation_h: 1,
                 dilation_w: 1,
             },
+            bias: None,
         };
         let bytes = build_model(&pattern, 1).unwrap();
         assert_eq!(&bytes[4..8], b"TFL3");
@@ -2696,6 +2730,7 @@ mod tests {
                 dilation_h: 1,
                 dilation_w: 1,
             },
+            bias: None,
         }
     }
 

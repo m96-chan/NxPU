@@ -125,6 +125,12 @@ pub enum MathFunction {
     SmoothStep,
     // Fused multiply-add
     Fma,
+    // Bit manipulation
+    //
+    // Quantized weights arrive packed several codes to a u32, so unpacking one
+    // is the first thing every int4/int8 matmul kernel does.
+    ExtractBits,
+    InsertBits,
 }
 
 /// An atomic operation.
