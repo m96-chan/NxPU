@@ -13,8 +13,8 @@ use nxpu_analysis::fusion::FusedPattern;
 use nxpu_backend_core::BackendError;
 
 use crate::schema::{
-    builtin_op, builtin_options_type, concatenation_options, conv2d_options, pool2d_options,
-    softmax_options, split_options, tensor_type, vt,
+    builtin_op, builtin_options_type, concatenation_options, conv2d_options, padding,
+    pool2d_options, softmax_options, split_options, tensor_type, vt,
 };
 
 /// File identifier for TFLite FlatBuffer files.
@@ -2257,9 +2257,82 @@ fn build_tflite_conv2d(
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("conv2d");
 
-    let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1], extent);
+    // A convolution's three tensors do not have the same shape, and writing one
+    // shape vector to all of them is how this emitted models nothing would run.
+    // At `--symbolic-dim 64` every tensor came out [64, 64, 64, 64]: a 64x64
+    // window with 64 channels each way over a 64x64 image, whose im2col is 2^36
+    // elements and overflows TFLite's own 32-bit limit before a delegate is
+    // ever asked. On a MediaTek MT6899 all four drivers refused it while the
+    // same operator built by TensorFlow's converter was accelerated.
+    //
+    // TFLite reads them as NHWC, with the weight as [out, kh, kw, in].
+    let n = extent.max(1);
+    let channels_in = extent.max(1);
+    let channels_out = extent.max(1);
+    let in_h = extent.max(1);
+    let in_w = extent.max(1);
+
+    // A window the kernel states as a literal is known exactly. One supplied
+    // through the params struct is not, and falls back to the extent like any
+    // other symbolic dimension -- which makes the window as wide as the image,
+    // so the output is a single pixel. Degenerate, but coherent, and coherence
+    // is what decides whether anything will load it.
+    let window = |literal: i64| {
+        if literal > 0 {
+            (literal as i32).max(1)
+        } else {
+            extent.max(1)
+        }
+    };
+    let kernel_h = window(shape.kernel_h_val);
+    let kernel_w = window(shape.kernel_w_val);
+
+    // A kernel that reads no further than `in - k + 1` is not padding, and one
+    // that offsets its reads by a literal is. TFLite offers only these two
+    // modes, so an asymmetric pad would need an explicit PAD operator; nothing
+    // classified here produces one yet.
+    let pad_mode = if shape.pad_h == 0 && shape.pad_w == 0 {
+        padding::VALID
+    } else {
+        padding::SAME
+    };
+
+    // Sized for the padding actually written. Deriving the output from one mode
+    // and declaring the other is how a 64-wide extent became a 2^36 im2col: SAME
+    // holds the output at the input's size no matter how wide the window is.
+    let out_extent = |input: i32, k: i32, stride: i32, dilation: i32| {
+        let stride = stride.max(1);
+        if pad_mode == padding::SAME {
+            // Written out rather than `div_ceil`: that is unstable for a
+            // signed integer, and this workspace's rust-version is 1.87.
+            ((input + stride - 1) / stride).max(1)
+        } else {
+            let reach = dilation.max(1) * (k - 1) + 1;
+            ((input - reach) / stride + 1).max(1)
+        }
+    };
+    let out_h = out_extent(
+        in_h,
+        kernel_h,
+        shape.stride_h as i32,
+        shape.dilation_h as i32,
+    );
+    let out_w = out_extent(
+        in_w,
+        kernel_w,
+        shape.stride_w as i32,
+        shape.dilation_w as i32,
+    );
+
+    let shape_in = shape_vector(&mut fbb, &[n, in_h, in_w, channels_in], extent);
+    let shape_weight = shape_vector(
+        &mut fbb,
+        &[channels_out, kernel_h, kernel_w, channels_in],
+        extent,
+    );
+    let shape_out = shape_vector(&mut fbb, &[n, out_h, out_w, channels_out], extent);
     // Per-output-channel, so one dimension rather than four.
-    let shape_1d = shape_vector(&mut fbb, &[-1i32], extent);
+    let shape_1d = shape_vector(&mut fbb, &[channels_out], extent);
     // TFLite's CONV_2D kernel requires three inputs — `has_bias was not true`
     // is a hard failure, not a fallback — so a convolution whose source has no
     // bias still gets one here, as a constant of zeros.
@@ -2268,7 +2341,8 @@ fn build_tflite_conv2d(
         .unwrap_or_else(|| "bias".into());
     let name_bias = fbb.create_string(&bias_name);
     let zero_bias = if bias.is_none() {
-        let zeros = vec![0u8; (extent.max(1) as usize) * 4];
+        // One per output channel, matching the shape written for it above.
+        let zeros = vec![0u8; (channels_out as usize) * 4];
         Some(fbb.create_vector(&zeros))
     } else {
         None
@@ -2306,7 +2380,7 @@ fn build_tflite_conv2d(
 
     let tensor_in = {
         let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_in);
         fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(input.elem_type), 0);
         fbb.push_slot::<u32>(vt::tensor::BUFFER, 1, 0);
         fbb.push_slot_always(vt::tensor::NAME, name_in);
@@ -2314,7 +2388,7 @@ fn build_tflite_conv2d(
     };
     let tensor_w = {
         let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_weight);
         fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(weight.elem_type), 0);
         fbb.push_slot::<u32>(vt::tensor::BUFFER, 2, 0);
         fbb.push_slot_always(vt::tensor::NAME, name_w);
@@ -2337,7 +2411,7 @@ fn build_tflite_conv2d(
 
     let tensor_out = {
         let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_out);
         fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
         fbb.push_slot::<u32>(vt::tensor::BUFFER, 4, 0);
         fbb.push_slot_always(vt::tensor::NAME, name_out);
@@ -2363,7 +2437,7 @@ fn build_tflite_conv2d(
     };
     let operator_codes = fbb.create_vector(&[opcode_table]);
 
-    // Conv2DOptions table: stride_w, stride_h, dilation_w=1, dilation_h=1, padding=VALID(0)
+    // Conv2DOptions table: padding, stride_w, stride_h, dilation_w=1, dilation_h=1
     //
     // The stride defaults are 0, not 1. `push_slot` omits a field whose value
     // equals the default it is given, and TFLite's schema default for a stride
@@ -2374,7 +2448,10 @@ fn build_tflite_conv2d(
     // it.
     let conv2d_opts = {
         let start = fbb.start_table();
-        fbb.push_slot::<i8>(conv2d_options::PADDING, 0, 0); // VALID
+        // The default is SAME, so a VALID convolution has to be written out;
+        // `push_slot` omits a field that matches its default, and SAME was
+        // being written as absence.
+        fbb.push_slot::<i8>(conv2d_options::PADDING, pad_mode, padding::SAME);
         fbb.push_slot::<i32>(conv2d_options::STRIDE_W, shape.stride_w.max(1) as i32, 0);
         fbb.push_slot::<i32>(conv2d_options::STRIDE_H, shape.stride_h.max(1) as i32, 0);
         fbb.push_slot::<i32>(conv2d_options::ACTIVATION, 0, 0); // NONE
@@ -2439,7 +2516,26 @@ fn build_tflite_pool(
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string(graph_name);
 
-    let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1], extent);
+    // Input and output do not have the same shape, and one vector was being
+    // written to both. A pool with a window narrows its input; saying otherwise
+    // is the defect the convolution builder had, and it survived here only
+    // because the padding was wrong in the direction that hid it.
+    //
+    // `PoolShape` carries no padding, so these are VALID and sized for VALID.
+    let n = extent.max(1);
+    let channels = extent.max(1);
+    let in_h = extent.max(1);
+    let in_w = extent.max(1);
+    // floor((in - k) / stride) + 1, which is what TFLite's own kernel computes
+    // for VALID. Writing it as (in - k + 1) / stride is a different function
+    // that agrees only at stride 1.
+    let valid_out =
+        |input: i32, k: i32, stride: i32| ((input - k.max(1)) / stride.max(1) + 1).max(1);
+    let out_h = valid_out(in_h, shape.kernel_h as i32, shape.stride_h as i32);
+    let out_w = valid_out(in_w, shape.kernel_w as i32, shape.stride_w as i32);
+
+    let shape_in = shape_vector(&mut fbb, &[n, in_h, in_w, channels], extent);
+    let shape_out = shape_vector(&mut fbb, &[n, out_h, out_w, channels], extent);
 
     let op_inputs = fbb.create_vector(&[0i32]);
     let op_outputs = fbb.create_vector(&[1i32]);
@@ -2456,7 +2552,7 @@ fn build_tflite_pool(
 
     let tensor_in = {
         let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_in);
         fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(input.elem_type), 0);
         fbb.push_slot::<u32>(vt::tensor::BUFFER, 1, 0);
         fbb.push_slot_always(vt::tensor::NAME, name_in);
@@ -2464,7 +2560,7 @@ fn build_tflite_pool(
     };
     let tensor_out = {
         let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_out);
         fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
         fbb.push_slot::<u32>(vt::tensor::BUFFER, 2, 0);
         fbb.push_slot_always(vt::tensor::NAME, name_out);
@@ -2486,10 +2582,12 @@ fn build_tflite_pool(
     };
     let operator_codes = fbb.create_vector(&[opcode_table]);
 
-    // Pool2DOptions table: padding=VALID(0), stride_w, stride_h, filter_w, filter_h, activation=NONE(0)
+    // Pool2DOptions table: padding, stride_w, stride_h, filter_w, filter_h, activation=NONE(0)
     let pool2d_opts = {
         let start = fbb.start_table();
-        fbb.push_slot::<i8>(pool2d_options::PADDING, 0, 0); // VALID
+        // SAME is the schema default and so was written as absence; the comment
+        // here claimed VALID while the byte said the opposite.
+        fbb.push_slot::<i8>(pool2d_options::PADDING, padding::VALID, padding::SAME);
         // Same defaulting bug as Conv2DOptions above: 0 is TFLite's schema
         // default, so a stride of 1 has to be written rather than omitted.
         fbb.push_slot::<i32>(pool2d_options::STRIDE_W, shape.stride_w.max(1) as i32, 0);
@@ -3274,6 +3372,127 @@ mod tests {
             let bytes = build_model(&pattern, 1).unwrap();
             assert_eq!(&bytes[4..8], b"TFL3", "failed for {:?}", op);
         }
+    }
+
+    /// Does the model contain this shape vector?
+    ///
+    /// A flatbuffer vector of i32 is a length followed by the elements, all
+    /// little-endian, so a shape is a findable byte sequence. Low-level, but
+    /// the alternative is asserting the file starts with `TFL3`, and that is
+    /// what let a convolution give its input, its weight and its output the
+    /// same shape for as long as this backend has existed.
+    fn has_shape(bytes: &[u8], dims: &[i32]) -> bool {
+        let mut needle = (dims.len() as i32).to_le_bytes().to_vec();
+        for d in dims {
+            needle.extend_from_slice(&d.to_le_bytes());
+        }
+        bytes.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn a_convolution_gives_each_tensor_its_own_shape() {
+        // NHWC input, [out, kh, kw, in] weight, [out] bias, NHWC output. At an
+        // extent of 8 with a 5x5 window and no padding the output is 4x4, and
+        // none of the four is the same vector as another.
+        let pattern = KernelPattern::Conv2D {
+            input: make_tensor("input", TensorRole::Input),
+            weight: make_tensor("weight", TensorRole::Input),
+            output: make_tensor("output", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "IC".into(),
+                channels_out: "OC".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                kernel_h_val: 5,
+                kernel_w_val: 5,
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 0,
+                pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
+            },
+            bias: None,
+        };
+        let bytes = build_model(&pattern, 8).unwrap();
+        assert!(has_shape(&bytes, &[8, 8, 8, 8]), "no input shape");
+        assert!(
+            has_shape(&bytes, &[8, 5, 5, 8]),
+            "the weight is not [out, kh, kw, in]"
+        );
+        assert!(has_shape(&bytes, &[8]), "no per-output-channel bias shape");
+        // The output shape is the assertion that catches a SAME padding
+        // written under a comment claiming VALID: SAME would leave it at 8x8.
+        assert!(
+            has_shape(&bytes, &[8, 4, 4, 8]),
+            "the output is not sized for VALID"
+        );
+    }
+
+    #[test]
+    fn a_convolution_whose_window_is_symbolic_still_narrows_its_output() {
+        // A window supplied through the params struct is unknown, so it takes
+        // the extent like any other symbolic dimension -- which makes it as
+        // wide as the image and the output a single pixel. Degenerate, but
+        // coherent; the incoherent version needed an im2col of 2^36 at an
+        // extent of 64 and no interpreter would load it.
+        let pattern = KernelPattern::Conv2D {
+            input: make_tensor("input", TensorRole::Input),
+            weight: make_tensor("weight", TensorRole::Input),
+            output: make_tensor("output", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "IC".into(),
+                channels_out: "OC".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                kernel_h_val: 0,
+                kernel_w_val: 0,
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 0,
+                pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
+            },
+            bias: None,
+        };
+        let bytes = build_model(&pattern, 16).unwrap();
+        assert!(has_shape(&bytes, &[16, 16, 16, 16]), "no input shape");
+        assert!(
+            has_shape(&bytes, &[16, 1, 1, 16]),
+            "the output is not a single pixel"
+        );
+    }
+
+    #[test]
+    fn a_pool_narrows_its_input() {
+        // The same defect as the convolution's, in the builder next door: one
+        // shape vector written to the input and the output alike.
+        let pattern = KernelPattern::Pool {
+            kind: PoolKind::Max,
+            input: make_tensor("input", TensorRole::Input),
+            output: make_tensor("output", TensorRole::Output),
+            shape: PoolShape {
+                kernel_h: 2,
+                kernel_w: 2,
+                stride_h: 2,
+                stride_w: 2,
+            },
+        };
+        let bytes = build_model(&pattern, 8).unwrap();
+        assert!(has_shape(&bytes, &[8, 8, 8, 8]), "no input shape");
+        assert!(
+            has_shape(&bytes, &[8, 4, 4, 8]),
+            "a 2x2 window at stride 2 over 8 pixels is not 8 pixels out"
+        );
     }
 
     #[test]
