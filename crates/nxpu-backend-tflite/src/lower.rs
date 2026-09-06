@@ -181,17 +181,13 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
                 extent,
             )
         }
-        KernelPattern::Transpose { input, output, .. } => {
-            let shapes = [vec![-1, -1], vec![-1, -1]];
-            build_tflite_unary(
-                input,
-                output,
-                &shapes[0],
-                &shapes[1],
-                builtin_op::TRANSPOSE,
-                "transpose",
-                extent,
-            )
+        KernelPattern::Transpose {
+            input,
+            output,
+            perm,
+        } => {
+            let dims: Vec<i32> = vec![-1i32; perm.len().max(2)];
+            build_tflite_transpose(input, output, &dims, &dims, perm, extent)
         }
         KernelPattern::Reshape { input, output, .. } => {
             let shapes = [vec![-1i32], vec![-1]];
@@ -1604,6 +1600,142 @@ fn build_tflite_reduce(
     };
     let tensors = fbb.create_vector(&[tensor_in, tensor_axes, tensor_out]);
 
+    let deprecated_code = if opcode <= 127 { opcode as i8 } else { 127 };
+    let opcode_table = {
+        let start = fbb.start_table();
+        fbb.push_slot::<i8>(
+            vt::operator_code::DEPRECATED_BUILTIN_CODE,
+            deprecated_code,
+            0,
+        );
+        fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
+        fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, opcode, 0);
+        fbb.end_table(start)
+    };
+    let operator_codes = fbb.create_vector(&[opcode_table]);
+
+    let operator = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 0, 0);
+        fbb.push_slot_always(vt::operator::INPUTS, op_inputs);
+        fbb.push_slot_always(vt::operator::OUTPUTS, op_outputs);
+        fbb.end_table(start)
+    };
+    let operators = fbb.create_vector(&[operator]);
+
+    let subgraph = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::sub_graph::TENSORS, tensors);
+        fbb.push_slot_always(vt::sub_graph::INPUTS, sg_inputs);
+        fbb.push_slot_always(vt::sub_graph::OUTPUTS, sg_outputs);
+        fbb.push_slot_always(vt::sub_graph::OPERATORS, operators);
+        fbb.push_slot_always(vt::sub_graph::NAME, sg_name);
+        fbb.end_table(start)
+    };
+    let subgraphs = fbb.create_vector(&[subgraph]);
+
+    let model = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::model::VERSION, 3, 0);
+        fbb.push_slot_always(vt::model::OPERATOR_CODES, operator_codes);
+        fbb.push_slot_always(vt::model::SUBGRAPHS, subgraphs);
+        fbb.push_slot_always(vt::model::DESCRIPTION, desc);
+        fbb.push_slot_always(vt::model::BUFFERS, buffers);
+        fbb.end_table(start)
+    };
+
+    fbb.finish(model, Some(TFLITE_FILE_ID));
+    fbb.finished_data().to_vec()
+}
+
+/// Build a TFLite model for BatchNorm as MUL(input, scale) → ADD(mul_result, bias).
+///
+/// Emits a 2-operator subgraph since TFLite has no native BatchNorm op.
+/// Build a scatter: `(indices, updates, shape) -> output`.
+///
+/// SCATTER_ND builds its output rather than editing an existing tensor, so it
+/// takes a shape and no base. The kernels this comes from never read their
+/// `data` binding either — `output[indices[i]] = updates[i]` — so nothing is
+/// lost by leaving it out.
+/// Build a transpose: `(input, perm) -> output`.
+///
+/// The permutation is an operand, not an attribute — a TRANSPOSE emitted with
+/// one input is rejected with `NumInputs(node) != 2`, which is how the first
+/// kernel this backend ever recognised as a Transpose turned out to be
+/// unloadable.
+fn build_tflite_transpose(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    in_shape: &[i32],
+    out_shape: &[i32],
+    perm: &[i64],
+    extent: i32,
+) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::with_capacity(1024);
+
+    let name_in = fbb.create_string(&input.name);
+    let name_out = fbb.create_string(&output.name);
+    let desc = fbb.create_string("nxpu");
+    let sg_name = fbb.create_string("transpose");
+
+    let shape_in = shape_vector(&mut fbb, in_shape, extent);
+    let shape_out = shape_vector(&mut fbb, out_shape, extent);
+    // The permutation, as an i32 constant. TRANSPOSE takes it as a second
+    // input; without it the kernel is rejected with `NumInputs(node) != 2`.
+    let shape_perm = shape_vector(&mut fbb, &[perm.len() as i32], extent);
+    let name_perm = fbb.create_string("perm");
+    let perm_bytes: Vec<u8> = perm
+        .iter()
+        .flat_map(|p| (*p as i32).to_le_bytes())
+        .collect();
+    let perm_data = fbb.create_vector(&perm_bytes);
+
+    // (input, perm) -> output. The permutation is a constant, so the graph's
+    // only input is the tensor being transposed.
+    let op_inputs = fbb.create_vector(&[0i32, 1]);
+    let op_outputs = fbb.create_vector(&[2i32]);
+    let sg_inputs = fbb.create_vector(&[0i32]);
+    let sg_outputs = fbb.create_vector(&[2i32]);
+
+    // 3 buffers: sentinel + input + output
+    let mut buffer_offsets = Vec::new();
+    for i in 0..4 {
+        let start = fbb.start_table();
+        // Buffer 2 holds the permutation.
+        if i == 2 {
+            fbb.push_slot_always(vt::buffer::DATA, perm_data);
+        }
+        buffer_offsets.push(fbb.end_table(start));
+    }
+    let buffers = fbb.create_vector(&buffer_offsets);
+
+    let tensor_in = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_in);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(input.elem_type), 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 1, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_in);
+        fbb.end_table(start)
+    };
+    let tensor_out = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_out);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 3, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_out);
+        fbb.end_table(start)
+    };
+    let tensor_perm = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_perm);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, tensor_type::INT32, 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 2, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_perm);
+        fbb.end_table(start)
+    };
+    let tensors = fbb.create_vector(&[tensor_in, tensor_perm, tensor_out]);
+
+    let opcode = builtin_op::TRANSPOSE;
     let deprecated_code = if opcode <= 127 { opcode as i8 } else { 127 };
     let opcode_table = {
         let start = fbb.start_table();
