@@ -190,13 +190,38 @@ jobs:
             printf ']\n'
           }
 
+          # A *batch* sweep exits 0 in normal operation, refusals and all: the
+          # per-row outcome lives in the JSON, which is how ~10 sweeps with
+          # many refused operators have gone green already. So a non-zero
+          # status here is not a driver saying no to an operator — it is the
+          # sweep never producing rows to reduce at all — and under
+          # `set -euo pipefail` it used to die as a bare code with no word on
+          # which of those it was. The contract gives each its own meaning:
+          # 1 invalid model or request, 2 the driver refused, 3 no such
+          # device, 4 the agent stopped answering. Captured and named here so
+          # a bad --device (this handset's own drivers are a workflow_dispatch
+          # input, typo included) reads as "no such device: X" instead of an
+          # unexplained step failure.
+          sweep() {  # sweep manifest output label
+            local status=0
+            droidrunner-device test batch "$1" --budget-ms 900000 \
+              --output "$2" > /dev/null || status=$?
+            case $status in
+              0) ;;
+              1) echo "::error::$3: invalid model or request"; exit "$status" ;;
+              2) echo "::error::$3: the driver refused"; exit "$status" ;;
+              3) echo "::error::$3: no such device"; exit "$status" ;;
+              4) echo "::error::$3: the agent stopped answering"; exit "$status" ;;
+              *) echo "::error::$3: droidrunner-device exited $status"; exit "$status" ;;
+            esac
+          }
+
           # The control: every model with no device at all. A model that will
           # not run on the CPU either is a defect of ours, and filing it as an
           # operator a driver refuses would put that defect into a table other
           # people compile against.
           manifest > manifest-cpu.json
-          droidrunner-device test batch manifest-cpu.json --budget-ms 900000 \
-            --output sweep-cpu.json > /dev/null
+          sweep manifest-cpu.json sweep-cpu.json "control"
           echo "control: $(grep -o '"id":' sweep-cpu.json | wc -l) rows"
 
           # Every model failing on the CPU means the models never arrived, or
@@ -221,8 +246,7 @@ jobs:
           for driver in $DRIVERS; do
             echo "=== $driver"
             manifest "$driver" > "manifest-$driver.json"
-            droidrunner-device test batch "manifest-$driver.json" \
-              --budget-ms 900000 --output "sweep-$driver.json" > /dev/null
+            sweep "manifest-$driver.json" "sweep-$driver.json" "$driver"
             test -s "sweep-$driver.json"
             rows=$(grep -o '"id":' "sweep-$driver.json" | wc -l)
             took=$(grep -o '"delegated":' "sweep-$driver.json" | wc -l)
