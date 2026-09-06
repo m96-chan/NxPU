@@ -42,6 +42,7 @@ pub mod builtin_op {
     pub const DEPTHWISE_CONV_2D: i32 = 4;
     pub const CUSTOM: i32 = 32;
     pub const CAST: i32 = 53;
+    pub const PAD: i32 = 34;
     pub const GELU: i32 = 150;
 }
 
@@ -105,6 +106,7 @@ pub mod builtin_options_type {
     pub const SOFTMAX: u8 = 9;
     pub const CONCATENATION: u8 = 10;
     pub const SPLIT: u8 = 35;
+    pub const PAD: u8 = 22;
 }
 
 /// VTable field offsets for `SoftmaxOptions`.
