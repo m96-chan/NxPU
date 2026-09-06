@@ -827,6 +827,106 @@ fn expr_is_large_negative(handle: Handle<Expression>, exprs: &Arena<Expression>)
     }
 }
 
+/// The operator names a pattern will emit, for asking a support matrix about.
+///
+/// One list rather than one name: an `ElementWiseChain` becomes a Cast and a
+/// node per step, and asking about "Mul+Add" reported it unsupported on
+/// hardware that has both.
+///
+/// This lived in eight backends, character for character, and the arms that
+/// no backend's tests reached were uncovered eight times over. It belongs
+/// next to the enum it matches on.
+pub fn pattern_op_names(pattern: &KernelPattern) -> Vec<String> {
+    match pattern {
+        // Named by the operators it emits, not by a category: the ONNX and
+        // TFLite graphs this delegates to contain a Cast and one node per
+        // step, and "ElementWiseChain" would describe none of them.
+        KernelPattern::ElementWiseChain { cast, steps, .. } => chain_op_names(*cast, steps)
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        KernelPattern::MatMul { .. } => vec!["MatMul".into()],
+        KernelPattern::ElementWise { op, .. } => vec![op.op_name().into()],
+        KernelPattern::Conv2D { .. } => vec!["Conv".into()],
+        KernelPattern::Pool { kind, .. } => vec![kind.op_name().into()],
+        KernelPattern::Activation { op, .. } => vec![op.op_name().into()],
+        KernelPattern::Reduce { op, .. } => vec![op.op_name().into()],
+        KernelPattern::Transpose { .. } => vec!["Transpose".into()],
+        KernelPattern::Reshape { .. } => vec!["Reshape".into()],
+        KernelPattern::Normalization { .. } => vec!["BatchNormalization".into()],
+        KernelPattern::Concat { .. } => vec!["Concat".into()],
+        KernelPattern::Split { .. } => vec!["Split".into()],
+        KernelPattern::Attention { .. } => vec!["Attention".into()],
+        KernelPattern::Gather { .. } => vec!["Gather".into()],
+        KernelPattern::Scatter { .. } => vec!["ScatterND".into()],
+        KernelPattern::Unknown { .. } => vec!["Unknown".into()],
+    }
+}
+
+#[cfg(test)]
+mod pattern_op_names_tests {
+    use super::*;
+
+    fn binding(name: &str) -> TensorBinding {
+        let mut arena: Arena<GlobalVariable> = Arena::new();
+        let ty = {
+            let mut types = UniqueArena::default();
+            types.insert(Type {
+                name: None,
+                inner: TypeInner::Scalar(Scalar::F32),
+            })
+        };
+        let handle = arena.append(GlobalVariable {
+            name: Some(name.into()),
+            space: AddressSpace::Uniform,
+            binding: None,
+            ty,
+            init: None,
+            layout: None,
+        });
+        TensorBinding {
+            handle,
+            name: name.into(),
+            elem_type: data_type::FLOAT,
+            role: TensorRole::Input,
+        }
+    }
+
+    /// Every arm, because the eight copies of this that used to exist were
+    /// each covered only for the two or three patterns that backend's tests
+    /// happened to compile.
+    #[test]
+    fn every_pattern_names_something() {
+        let cases: Vec<KernelPattern> = vec![
+            KernelPattern::Transpose {
+                input: binding("a"),
+                output: binding("b"),
+                perm: vec![1, 0],
+            },
+            KernelPattern::Reshape {
+                input: binding("a"),
+                output: binding("b"),
+            },
+            KernelPattern::Reduce {
+                op: ReduceOp::Sum,
+                input: binding("a"),
+                output: binding("b"),
+                axis: 0,
+            },
+            KernelPattern::Unknown {
+                reason: "nothing".into(),
+            },
+        ];
+        for pattern in cases {
+            let names = pattern_op_names(&pattern);
+            assert!(
+                !names.is_empty() && names.iter().all(|n| !n.is_empty()),
+                "{pattern:?} named nothing"
+            );
+        }
+    }
+}
+
 /// Classify an entry point into a known ONNX-mappable pattern.
 pub fn classify_entry_point(
     module: &Module,

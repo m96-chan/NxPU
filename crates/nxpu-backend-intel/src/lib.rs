@@ -45,7 +45,7 @@ impl Backend for IntelBackend {
         for (i, ep) in module.entry_points.iter().enumerate() {
             match analyze::classify_entry_point(module, i) {
                 Ok(pattern) => {
-                    op_names.extend(pattern_op_names(&pattern));
+                    op_names.extend(analyze::pattern_op_names(&pattern));
                     patterns.push(pattern);
                 }
                 Err(e) => {
@@ -99,36 +99,6 @@ impl Backend for IntelBackend {
         });
 
         Ok(BackendOutput { files, diagnostics })
-    }
-}
-
-/// Map a KernelPattern to its ONNX-compatible op name string.
-fn pattern_op_names(pattern: &analyze::KernelPattern) -> Vec<String> {
-    match pattern {
-        // Named by the operators it emits, not by a category: the ONNX and
-        // TFLite graphs this delegates to contain a Cast and one node per
-        // step, and "ElementWiseChain" would describe none of them.
-        analyze::KernelPattern::ElementWiseChain { cast, steps, .. } => {
-            analyze::chain_op_names(*cast, steps)
-                .into_iter()
-                .map(String::from)
-                .collect()
-        }
-        analyze::KernelPattern::MatMul { .. } => vec!["MatMul".into()],
-        analyze::KernelPattern::ElementWise { op, .. } => vec![op.op_name().into()],
-        analyze::KernelPattern::Conv2D { .. } => vec!["Conv".into()],
-        analyze::KernelPattern::Pool { kind, .. } => vec![kind.op_name().into()],
-        analyze::KernelPattern::Activation { op, .. } => vec![op.op_name().into()],
-        analyze::KernelPattern::Reduce { op, .. } => vec![op.op_name().into()],
-        analyze::KernelPattern::Transpose { .. } => vec!["Transpose".into()],
-        analyze::KernelPattern::Reshape { .. } => vec!["Reshape".into()],
-        analyze::KernelPattern::Normalization { .. } => vec!["BatchNormalization".into()],
-        analyze::KernelPattern::Concat { .. } => vec!["Concat".into()],
-        analyze::KernelPattern::Split { .. } => vec!["Split".into()],
-        analyze::KernelPattern::Attention { .. } => vec!["Attention".into()],
-        analyze::KernelPattern::Gather { .. } => vec!["Gather".into()],
-        analyze::KernelPattern::Scatter { .. } => vec!["ScatterND".into()],
-        analyze::KernelPattern::Unknown { .. } => vec!["Unknown".into()],
     }
 }
 
