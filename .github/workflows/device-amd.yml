@@ -2,6 +2,21 @@ name: Device AMD XDNA
 
 # What does the XDNA2 machine actually have?
 #
+# Answered, 2026-09-06 — and the blockers are the machine's, not this
+# repository's:
+#
+#   /dev/accel/accel0 exists, amdxdna is loaded, XRT 2.21.75 is installed.
+#   `xrt-smi examine` fails with EAGAIN on a 64 MB mmap because
+#   `max locked memory` is 8192 KB for the runner user, and the runner's shell
+#   cannot raise it — that is a hard limit, set outside the job.
+#   Another process already holds the device (`fuser` shows a live mmap).
+#   Python is 3.14.7 with no pip, so there is no onnxruntime and no wheel to
+#   install one from.
+#
+# Until the locked-memory limit is raised on that host and an interpreter with
+# an ONNX Runtime exists there, nothing downstream can be built. This file
+# stays so the state can be re-checked in one dispatch rather than rediscovered.
+#
 # The same order the Hexagon work took: find out what the device exposes
 # before designing anything for it. Every assumption made about that phone
 # from the outside — which libraries were loadable, which delegate reached the
