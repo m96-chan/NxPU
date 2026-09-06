@@ -628,14 +628,15 @@ fn collect_conv_batchnorm_graph(
     norm: &KernelPattern,
     extent: i32,
 ) -> Result<GraphDesc, BackendError> {
-    let (input, weight, conv_bias, conv_out, conv_shape) = match conv {
+    let (input, weight, conv_bias, conv_out, conv_shape, conv_activation) = match conv {
         KernelPattern::Conv2D {
             input,
             weight,
             bias,
             output,
             shape,
-        } => (input, weight, bias.as_ref(), output, shape),
+            activation,
+        } => (input, weight, bias.as_ref(), output, shape, *activation),
         _ => {
             return Err(BackendError::Other(
                 "ConvBatchNorm: conv slot is not Conv2D".into(),
@@ -781,6 +782,14 @@ fn collect_conv_batchnorm_graph(
             stride_h: conv_shape.stride_h as i32,
             dilation_w: conv_shape.dilation_w as i32,
             dilation_h: conv_shape.dilation_h as i32,
+            // The kernel applies it to what the convolution stores, so it
+            // belongs on the convolution and ahead of the normalisation that
+            // reads that tensor -- not after the whole chain.
+            activation: match conv_activation {
+                Some(ActivationOp::Relu) => activation_function::RELU,
+                Some(ActivationOp::Tanh) => activation_function::TANH,
+                _ => activation_function::NONE,
+            },
         },
     });
 
@@ -3854,6 +3863,9 @@ mod tests {
                     stride_h: 1,
                     dilation_w: 1,
                     dilation_h: 1,
+                    // This fixture's convolution stores its accumulator
+                    // directly, so there is nothing to fuse.
+                    activation: activation_function::NONE,
                 }
             ),
             "the convolution has no options table"
