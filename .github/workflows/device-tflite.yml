@@ -9,7 +9,7 @@ name: Device TFLite
 # device actually answers.
 on:
   push:
-    branches: [feat/device-tflite-verification]
+    branches: [feat/device-tflite-verification, feat/device-mediatek]
   workflow_dispatch:
     inputs:
       example:
@@ -91,11 +91,33 @@ jobs:
           if-no-files-found: error
 
   device:
-    name: Execute on NX729J
+    # One model, every phone in the fleet, one run. This was a single hard-coded
+    # handset until a second vendor arrived, and the comparison between vendors
+    # turned out to be the most informative thing the job produces: the same
+    # bytes, the same fixtures, two NPUs, and only one of them returns what f32
+    # arithmetic gives.
+    name: Execute on ${{ matrix.phone }}
     needs: build
-    # soc-qti-sm8550-qcom means this handset. Two Snapdragons share the vendor
-    # labels, and one of them once served results from a stale build.
-    runs-on: [self-hosted, android, soc-qti-sm8550-qcom]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `soc-*` picks the handset, not the vendor. Two Snapdragons share the
+          # vendor labels, and one of them once served results from a stale build.
+          - phone: NX729J
+            soc: soc-qti-sm8550-qcom
+            # Qualcomm ships no NNAPI driver: a Snapdragon enumerates only
+            # `nnapi-reference`, which is its CPU. The Hexagon is reachable only
+            # through Qualcomm's own runtime, behind a per-device licence.
+            device: qnn-htp
+          - phone: 2511FPC34G
+            soc: soc-mediatek-mt6899-mt6899
+            # MediaTek is the opposite case: the accelerators are NNAPI drivers,
+            # so they are named as `droidrunner-device devices` lists them. This
+            # phone enumerates mtk-neuron_shim, mtk-mdla_shim, mtk-dsp_shim and
+            # nnapi-reference; the first is the APU.
+            device: mtk-neuron_shim
+    runs-on: [self-hosted, android, "${{ matrix.soc }}"]
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -107,6 +129,13 @@ jobs:
       # acceptance, and a reflashed device silently loses it.
       - name: What the phone has
         run: droidrunner-device capabilities
+
+      # The driver names are per handset, and a name that does not exist is
+      # refused with status 3 rather than run somewhere else. Printing the
+      # enumeration next to the request means a refusal is legible from the log
+      # alone instead of needing another visit to the device.
+      - name: What it will accept as --device
+        run: droidrunner-device devices
 
       # upload-artifact uploads the contents of a directory, not the directory.
       # Asserting the path before posting it is cheaper than a green run with
@@ -125,7 +154,7 @@ jobs:
         uses: m96-chan/DroidRunner/actions/run-model@main
         with:
           model: model/${{ env.EXAMPLE }}.tflite
-          device: qnn-htp
+          device: ${{ matrix.device }}
           iterations: 50
           results-path: latency.json
 
@@ -135,7 +164,7 @@ jobs:
         uses: m96-chan/DroidRunner/actions/run-model@main
         with:
           model: model/${{ env.EXAMPLE }}.tflite
-          device: qnn-htp
+          device: ${{ matrix.device }}
           iterations: 10
           inputs: |
             model/input-0.bin
@@ -167,19 +196,37 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: device-result
+          name: device-result-${{ matrix.phone }}
           path: |
             device-out/
             latency.json
             numeric.json
           if-no-files-found: warn
 
-  # The phone has no python3 and no jq, so the tolerance comparison happens
+  # The phones have no python3 and no jq, so the tolerance comparison happens
   # where the golden was made.
   compare:
-    name: Compare against the reference
+    name: Compare ${{ matrix.phone }} against the reference
     needs: [build, device]
     if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # What each vendor is expected to return, in ULP, as a bound rather
+          # than a note. These are predictions, and a run that breaks one is
+          # reporting a finding rather than a fault.
+          - phone: NX729J
+            # Not bit-exact for f32 and not claiming to be: this Hexagon
+            # computes an f32 ADD in fp16 and returns the result with the low
+            # bit of the word set. 1 ULP is what these fixtures produce.
+            ulp: 1
+          - phone: 2511FPC34G
+            # MediaTek's APU returned bit-exact f32 on DroidRunner's own ULP
+            # fixtures while the Hexagon did not. Pinned at 0 so that if this
+            # phone ever computes in a narrower format, this job says so on the
+            # run it starts rather than on the day somebody reads a histogram.
+            ulp: 0
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -188,11 +235,13 @@ jobs:
           path: model
       - uses: actions/download-artifact@v8
         with:
-          name: device-result
+          name: device-result-${{ matrix.phone }}
           path: device
         continue-on-error: true
 
       - name: Numbers
+        env:
+          ULP_BOUND: ${{ matrix.ulp }}
         run: |
           if [ ! -f device/device-out/output-0.bin ]; then
             echo "::error::the device wrote no outputs; nothing to compare"
@@ -200,7 +249,7 @@ jobs:
             exit 1
           fi
           python3 - <<'PY'
-          import struct, collections
+          import os, struct, collections
           read = lambda p: open(p, "rb").read()
           floats = lambda b: struct.unpack(f"<{len(b)//4}f", b)
           words = lambda b: struct.unpack(f"<{len(b)//4}I", b)
@@ -220,22 +269,23 @@ jobs:
           i = max(range(len(ulp)), key=lambda i: abs(ulp[i]))
           print(f"worst at index {i}: expected {want[i]!r}, device {got[i]!r}")
 
-          # This accelerator is not bit-exact for f32, so the bound is a
-          # tolerance rather than equality. It is deliberately tight: 1 ULP is
-          # what these fixtures produce, and a looser bound would stop
-          # reporting the day it grows.
+          # The bound is per phone and deliberately tight, because a bound wide
+          # enough for every vendor stops reporting anything about any of them.
           #
-          # It does grow. On operands finer than these — sums needing the full
-          # significand rather than multiples of 0.25 — the Qualcomm path
-          # discards the smaller addend entirely, and the error reaches
-          # hundreds of ULP. These fixtures are all well above the resolution
-          # where that begins, so 1 ULP is a fact about this input, not about
-          # the hardware. Widening the bound to accommodate a future fixture
-          # set would defeat the only check that has ever caught anything.
-          if worst > 1:
-              raise SystemExit(f"outside tolerance: {worst} ULP")
+          # It is a fact about these fixtures, not about the hardware. On
+          # operands finer than these — sums needing the full significand
+          # rather than multiples of 0.25 — the Qualcomm path discards the
+          # smaller addend entirely and the error reaches hundreds of ULP.
+          # Widening the bound to accommodate a future fixture set would defeat
+          # the only check that has ever caught anything; give that fixture set
+          # its own bound instead.
+          bound = int(os.environ["ULP_BOUND"])
+          if worst > bound:
+              raise SystemExit(f"outside tolerance: {worst} ULP, bound {bound}")
           if any(u != 0 for u in ulp):
               print(f"::notice::within tolerance, but not exact: "
-                    f"{sum(1 for u in ulp if u)} of {len(ulp)} elements differ by 1 ULP")
-          print("within tolerance")
+                    f"{sum(1 for u in ulp if u)} of {len(ulp)} elements differ")
+          else:
+              print(f"::notice::bit-exact: all {len(ulp)} elements")
+          print(f"within tolerance: worst {worst} ULP, bound {bound}")
           PY
