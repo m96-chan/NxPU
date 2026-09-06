@@ -414,6 +414,15 @@ pub enum KernelPattern {
         /// refuse rather than silently compute a convolution without it.
         bias: Option<TensorBinding>,
         shape: Conv2DShape,
+        /// The activation the kernel applies to what it stores.
+        ///
+        /// `output[i] = max(sum, 0.0)` is a convolution and a ReLU, and this
+        /// was silently dropped: the emitted model held a CONV_2D and nothing
+        /// else, so it loaded, was accelerated, and returned unclipped values.
+        /// The TFLite backend folds it into `Conv2DOptions`; a backend that
+        /// cannot express it must say so rather than emit the convolution
+        /// alone.
+        activation: Option<ActivationOp>,
     },
     /// Pooling: nested loops + reduction over spatial window.
     Pool {
@@ -1419,6 +1428,7 @@ pub fn classify_entry_point(
                 output,
                 bias: Some(bias),
                 shape: conv_shape,
+                activation: store_value_activation(&ep.function.body, &ep.function.expressions),
             });
         }
 
@@ -1746,6 +1756,7 @@ pub fn classify_entry_point(
             output: output_c,
             shape: conv_shape,
             bias: None,
+            activation: store_value_activation(&ep.function.body, &ep.function.expressions),
         });
     }
 
@@ -2696,10 +2707,47 @@ fn extract_loop_bound_literals(body: &[Statement], exprs: &Arena<Expression>) ->
     bounds
 }
 
-/// Scan the expression arena for `Binary(Multiply, _, Literal(U32(n)))` where n > 1.
-/// These represent stride factors in index computations like `oh * 2u + kh`.
+/// Does this expression come from the invocation id rather than from a loop?
+///
+/// The dividing line for [`extract_multiply_literals`], and the only structural
+/// difference between the two things a literal multiply can mean. A stride
+/// scales the coordinate the invocation is computing — `oh`, which is `gid.y` —
+/// while an index-flattening factor scales a reduction's loop variable, which
+/// reaches the expression as a load of a local.
+///
+/// Deliberately narrow: an id reaches this either directly or through one
+/// component access, and nothing else counts. Widening it to follow arithmetic
+/// would readmit `oh + kh`, which is half a loop variable.
+fn derives_from_invocation_id(exprs: &Arena<Expression>, handle: Handle<Expression>) -> bool {
+    match exprs.try_get(handle) {
+        // `gid` itself, and `gid.x` / `gid.y` / `gid.z`.
+        Some(Expression::FunctionArgument(_)) => true,
+        Some(Expression::AccessIndex { base, .. }) => {
+            matches!(exprs.try_get(*base), Some(Expression::FunctionArgument(_)))
+        }
+        _ => false,
+    }
+}
+
+/// Stride factors, from `Binary(Multiply, id, Literal(U32(n)))` where n > 1.
+///
+/// The multiplicand has to come from the invocation id. Without that test this
+/// took **every** literal multiply in the function, and a convolution flattens
+/// its weight index with them: `oc * IC * 9u + ic * 9u + kh * 3u + kw` reported
+/// strides of 3 and 9, and a 3x3 VALID convolution over a 64x64 image was
+/// emitted with an output of 21x7 instead of 62x62. That model loads, is
+/// accelerated, and returns the wrong numbers — the failure this project
+/// refuses everywhere it can see it, and this one it could not see.
+///
+/// The test narrows rather than widens, on purpose. A genuine stride written
+/// through a loop variable is now missed and reported as 1, which is the
+/// common case and wrong by a little; a flattening factor read as a stride is
+/// wrong by whatever the channel count happens to be.
 fn extract_multiply_literals(exprs: &Arena<Expression>) -> Vec<u32> {
     let mut strides = Vec::new();
+    // Nested rather than a let-chain: those are stable from 1.88 and this
+    // workspace's rust-version is 1.87.
+    #[allow(clippy::collapsible_if)]
     for (_, expr) in exprs.iter() {
         let Expression::Binary {
             op: BinaryOp::Multiply,
@@ -2710,9 +2758,13 @@ fn extract_multiply_literals(exprs: &Arena<Expression>) -> Vec<u32> {
             continue;
         };
         if let Some(&Expression::Literal(Literal::U32(n @ 2..))) = exprs.try_get(*right) {
-            strides.push(n);
+            if derives_from_invocation_id(exprs, *left) {
+                strides.push(n);
+            }
         } else if let Some(&Expression::Literal(Literal::U32(n @ 2..))) = exprs.try_get(*left) {
-            strides.push(n);
+            if derives_from_invocation_id(exprs, *right) {
+                strides.push(n);
+            }
         }
     }
     strides.sort_unstable();
@@ -4052,6 +4104,58 @@ fn has_nested_loop(body: &[Statement]) -> bool {
 }
 
 /// Check if a block contains a Store whose value (or sub-expr) uses a specific Math function.
+/// The activation a kernel applies to the value it stores, if any.
+///
+/// A convolution that writes `max(sum, 0.0)` is a convolution *and* a ReLU, and
+/// the classifier used to return `Conv2D` and drop the `max` on the floor. The
+/// emitted model then loaded, was accelerated, and computed the wrong thing --
+/// which is not a shortcoming of the operator table but a graph that lies.
+///
+/// Only `max` and `tanh` are recognised, and deliberately: those are the two
+/// TFLite can fuse into a convolution and the two whose expression shape cannot
+/// be mistaken for something else. GELU, SiLU and Mish are all *multiplies*,
+/// and a convolution's own accumulation is a multiply, so recognising them here
+/// would risk reading an accumulator as an activation. Narrowing is the same
+/// choice made for stride extraction and for the same reason: missing an
+/// activation leaves today's behaviour, inventing one corrupts a graph.
+fn store_value_activation(body: &[Statement], exprs: &Arena<Expression>) -> Option<ActivationOp> {
+    for stmt in body {
+        match stmt {
+            Statement::Store { value, .. } => match exprs.try_get(*value) {
+                Some(Expression::Math {
+                    fun: MathFunction::Max,
+                    ..
+                }) => return Some(ActivationOp::Relu),
+                Some(Expression::Math {
+                    fun: MathFunction::Tanh,
+                    ..
+                }) => return Some(ActivationOp::Tanh),
+                _ => {}
+            },
+            Statement::If { accept, reject, .. } => {
+                if let Some(act) = store_value_activation(accept, exprs) {
+                    return Some(act);
+                }
+                if let Some(act) = store_value_activation(reject, exprs) {
+                    return Some(act);
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                if let Some(act) = store_value_activation(body, exprs) {
+                    return Some(act);
+                }
+                if let Some(act) = store_value_activation(continuing, exprs) {
+                    return Some(act);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn find_store_math_fun(
     body: &[Statement],
     exprs: &Arena<Expression>,
@@ -5574,12 +5678,21 @@ mod tests {
         assert_eq!(bounds, vec![5]);
     }
 
+    /// `gid.y`, as a kernel spells the coordinate a stride scales.
+    ///
+    /// These fixtures used to multiply one literal by another, which no kernel
+    /// writes and which stopped being enough once a stride had to come from
+    /// the invocation id.
+    fn invocation_id_component(func: &mut Function, index: u32) -> Handle<Expression> {
+        let gid = func.expressions.append(Expression::FunctionArgument(0));
+        func.expressions
+            .append(Expression::AccessIndex { base: gid, index })
+    }
+
     #[test]
     fn extract_multiply_literals_stride() {
         let mut func = Function::new("test");
-        let oh = func
-            .expressions
-            .append(Expression::Literal(Literal::U32(0)));
+        let oh = invocation_id_component(&mut func, 1);
         let two = func
             .expressions
             .append(Expression::Literal(Literal::U32(2)));
@@ -5590,6 +5703,32 @@ mod tests {
         });
         let strides = extract_multiply_literals(&func.expressions);
         assert_eq!(strides, vec![2]);
+    }
+
+    #[test]
+    fn a_flattening_factor_is_not_a_stride() {
+        // `kh * 3u` inside a weight index. Read as a stride, it emitted a 3x3
+        // convolution over a 64x64 image with an output of 21x7 rather than
+        // 62x62 -- a model that loads, is accelerated, and is wrong.
+        let mut func = Function::new("test");
+        // A loop variable reaches the expression as a load, which is the whole
+        // difference from `gid.y`; what it loads from does not matter here.
+        let slot = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)));
+        let kh = func.expressions.append(Expression::Load { pointer: slot });
+        let three = func
+            .expressions
+            .append(Expression::Literal(Literal::U32(3)));
+        func.expressions.append(Expression::Binary {
+            op: BinaryOp::Multiply,
+            left: kh,
+            right: three,
+        });
+        assert_eq!(
+            extract_multiply_literals(&func.expressions),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
@@ -5676,10 +5815,10 @@ mod tests {
             left: kw_var,
             right: lit5b,
         });
-        // Also add stride: oh * 2u
-        let oh = func
-            .expressions
-            .append(Expression::Literal(Literal::U32(0)));
+        // Also add stride: oh * 2u, with `oh` coming from the invocation id
+        // as it does in a kernel -- a literal multiplied by a literal is not
+        // a stride and is no longer read as one.
+        let oh = invocation_id_component(&mut func, 1);
         let two = func
             .expressions
             .append(Expression::Literal(Literal::U32(2)));

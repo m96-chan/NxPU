@@ -59,7 +59,22 @@ pub fn build_model(
             output,
             shape,
             bias,
-        } => build_conv2d_graph(input, weight, bias.as_ref(), output, shape, ep_name),
+            activation,
+        } => {
+            // ONNX has a Relu node and a Tanh node, and this lowering does not
+            // append one. Emitting the convolution alone would be a graph that
+            // runs and returns unclipped values — the failure the TFLite
+            // backend had until it learned to fold the activation into
+            // `Conv2DOptions`. Refused by name until this can do the same.
+            if let Some(act) = activation {
+                return Err(BackendError::Unsupported(format!(
+                    "convolution with a fused {act}: the ONNX lowering does not \
+                     emit the activation, and emitting the convolution without \
+                     it would compute the wrong thing"
+                )));
+            }
+            build_conv2d_graph(input, weight, bias.as_ref(), output, shape, ep_name)
+        }
         KernelPattern::Pool {
             kind,
             input,
@@ -2036,6 +2051,7 @@ mod tests {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         };
         let model = build_model(&pattern, "conv2d", &[]).unwrap();
         let graph = model.graph.as_ref().unwrap();
@@ -2237,6 +2253,7 @@ mod tests {
             output: make_tensor("y", TensorRole::Output),
             shape: make_conv2d_shape(),
             bias: None,
+            activation: None,
         };
         let fused = FusedPattern::Single(pattern);
         let model = build_fused_model(&fused, "single_conv", &[]).unwrap();
@@ -2254,6 +2271,7 @@ mod tests {
             output: make_tensor("conv_out", TensorRole::Output),
             shape: make_conv2d_shape(),
             bias: None,
+            activation: None,
         };
         let norm = KernelPattern::Normalization {
             input: make_tensor("conv_out", TensorRole::Input),
@@ -2573,6 +2591,7 @@ mod tests {
             output: make_tensor("conv_out", TensorRole::Output),
             shape: make_conv2d_shape(),
             bias: None,
+            activation: None,
         };
         let norm = KernelPattern::Normalization {
             input: make_tensor("conv_out", TensorRole::Input),
@@ -2740,6 +2759,7 @@ mod tests {
             output: make_tensor("conv_out", TensorRole::Output),
             shape: make_conv2d_shape(),
             bias: None,
+            activation: None,
         };
         let norm = KernelPattern::Normalization {
             input: make_tensor("conv_out", TensorRole::Input),
