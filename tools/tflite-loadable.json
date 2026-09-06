@@ -6,6 +6,7 @@
     "concat",
     "concat_axis1",
     "conv2d",
+    "conv2d_3x3",
     "conv2d_5x5",
     "depthwise_conv",
     "gather",

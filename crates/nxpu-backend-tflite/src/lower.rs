@@ -13,8 +13,8 @@ use nxpu_analysis::fusion::FusedPattern;
 use nxpu_backend_core::BackendError;
 
 use crate::schema::{
-    builtin_op, builtin_options_type, concatenation_options, conv2d_options, pool2d_options,
-    softmax_options, split_options, tensor_type, vt,
+    builtin_op, builtin_options_type, concatenation_options, conv2d_options, padding,
+    pool2d_options, softmax_options, split_options, tensor_type, vt,
 };
 
 /// File identifier for TFLite FlatBuffer files.
@@ -86,7 +86,7 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
         // Several operators, so these go through the multi-op builder rather
         // than through `build_tflite`, which emits exactly one.
         KernelPattern::ElementWiseChain { .. } | KernelPattern::QuantizedMatMul { .. } => {
-            let desc = collect_single_graph(pattern)?;
+            let desc = collect_single_graph(pattern, extent)?;
             build_from_graph_desc(&desc, extent)
         }
         KernelPattern::Conv2D {
@@ -337,11 +337,41 @@ impl TensorInfo {
     }
 }
 
+/// Builtin options for one operator in a multi-op subgraph.
+///
+/// [`build_from_graph_desc`] wrote no options at all, which is survivable for
+/// an operator that has none and fatal for one that does: TFLite's schema
+/// default for a stride is 0, so a CONV_2D emitted through that path was
+/// rejected by its own kernel with `params->stride_height > 0 was not true`
+/// before any delegate saw it.
+enum OpOptions {
+    /// The operator has no options table, or needs none.
+    None,
+    Conv2D {
+        padding: i8,
+        stride_w: i32,
+        stride_h: i32,
+        dilation_w: i32,
+        dilation_h: i32,
+    },
+    Pool2D {
+        padding: i8,
+        stride_w: i32,
+        stride_h: i32,
+        filter_w: i32,
+        filter_h: i32,
+    },
+    /// `PadOptions` is an empty table, but the union tag still has to be set
+    /// or the operator carries a payload TFLite will not look for.
+    Pad,
+}
+
 /// An operator descriptor used when building multi-op TFLite subgraphs.
 struct OpDesc {
     opcode: i32,
     inputs: Vec<i32>,
     outputs: Vec<i32>,
+    options: OpOptions,
 }
 
 /// An intermediate graph description that can be serialised to a TFLite
@@ -458,6 +488,61 @@ fn build_from_graph_desc(desc: &GraphDesc, extent: i32) -> Vec<u8> {
     }
     let operator_codes_vec = fbb.create_vector(&opcode_offsets);
 
+    // --- builtin options, before the operator tables that point at them ---
+    //
+    // FlatBuffers cannot start a table while another is open, so an operator's
+    // options table has to be finished before the operator's own table begins.
+    let option_offsets: Vec<
+        Option<(
+            u8,
+            flatbuffers::WIPOffset<flatbuffers::TableFinishedWIPOffset>,
+        )>,
+    > = desc
+        .ops
+        .iter()
+        .map(|op| match &op.options {
+            OpOptions::None => None,
+            OpOptions::Conv2D {
+                padding: pad,
+                stride_w,
+                stride_h,
+                dilation_w,
+                dilation_h,
+            } => {
+                let start = fbb.start_table();
+                // Every default here is the value that must not be written
+                // as absence: SAME for the padding, 0 for a stride.
+                fbb.push_slot::<i8>(conv2d_options::PADDING, *pad, padding::SAME);
+                fbb.push_slot::<i32>(conv2d_options::STRIDE_W, (*stride_w).max(1), 0);
+                fbb.push_slot::<i32>(conv2d_options::STRIDE_H, (*stride_h).max(1), 0);
+                fbb.push_slot::<i32>(conv2d_options::ACTIVATION, 0, 0);
+                fbb.push_slot::<i32>(conv2d_options::DILATION_W, (*dilation_w).max(1), 1);
+                fbb.push_slot::<i32>(conv2d_options::DILATION_H, (*dilation_h).max(1), 1);
+                Some((builtin_options_type::CONV_2D, fbb.end_table(start)))
+            }
+            OpOptions::Pool2D {
+                padding: pad,
+                stride_w,
+                stride_h,
+                filter_w,
+                filter_h,
+            } => {
+                let start = fbb.start_table();
+                fbb.push_slot::<i8>(pool2d_options::PADDING, *pad, padding::SAME);
+                fbb.push_slot::<i32>(pool2d_options::STRIDE_W, (*stride_w).max(1), 0);
+                fbb.push_slot::<i32>(pool2d_options::STRIDE_H, (*stride_h).max(1), 0);
+                fbb.push_slot::<i32>(pool2d_options::FILTER_W, (*filter_w).max(1), 0);
+                fbb.push_slot::<i32>(pool2d_options::FILTER_H, (*filter_h).max(1), 0);
+                fbb.push_slot::<i32>(pool2d_options::ACTIVATION, 0, 0);
+                Some((builtin_options_type::POOL_2D, fbb.end_table(start)))
+            }
+            OpOptions::Pad => {
+                let start = fbb.start_table();
+                Some((builtin_options_type::PAD, fbb.end_table(start)))
+            }
+        })
+        .collect();
+
     // --- operators ---
     let mut operator_offsets = Vec::with_capacity(desc.ops.len());
     for (i, op) in desc.ops.iter().enumerate() {
@@ -467,6 +552,10 @@ fn build_from_graph_desc(desc: &GraphDesc, extent: i32) -> Vec<u8> {
             fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, opcode_index, 0);
             fbb.push_slot_always(vt::operator::INPUTS, op_input_offsets[i]);
             fbb.push_slot_always(vt::operator::OUTPUTS, op_output_offsets[i]);
+            if let Some((kind, table)) = option_offsets[i] {
+                fbb.push_slot::<u8>(vt::operator::BUILTIN_OPTIONS_TYPE, kind, 0);
+                fbb.push_slot_always(vt::operator::BUILTIN_OPTIONS, table);
+            }
             fbb.end_table(start)
         };
         operator_offsets.push(o);
@@ -564,16 +653,19 @@ fn collect_conv_batchnorm_graph(
                 opcode: builtin_op::CONV_2D,
                 inputs: vec![0, 1],
                 outputs: vec![4],
+                options: OpOptions::None,
             },
             OpDesc {
                 opcode: builtin_op::MUL,
                 inputs: vec![4, 2],
                 outputs: vec![5],
+                options: OpOptions::None,
             },
             OpDesc {
                 opcode: builtin_op::ADD,
                 inputs: vec![5, 3],
                 outputs: vec![6],
+                options: OpOptions::None,
             },
         ],
         graph_inputs: vec![0, 1, 2, 3],
@@ -641,11 +733,13 @@ fn collect_matmul_bias_graph(
                 opcode: builtin_op::BATCH_MATMUL,
                 inputs: vec![0, 1],
                 outputs: vec![3],
+                options: OpOptions::None,
             },
             OpDesc {
                 opcode: builtin_op::ADD,
                 inputs: vec![3, 2],
                 outputs: vec![4],
+                options: OpOptions::None,
             },
         ],
         graph_inputs: vec![0, 1, 2],
@@ -693,6 +787,7 @@ fn collect_elementwise_chain_graph(
             opcode: builtin_op::CAST,
             inputs: vec![acc],
             outputs: vec![idx],
+            options: OpOptions::None,
         });
         acc = idx;
     }
@@ -730,6 +825,7 @@ fn collect_elementwise_chain_graph(
             opcode,
             inputs: vec![acc, operand_idx],
             outputs: vec![result_idx],
+            options: OpOptions::None,
         });
         acc = result_idx;
     }
@@ -840,16 +936,19 @@ fn collect_quantized_matmul_graph(
             opcode: builtin_op::TRANSPOSE,
             inputs: vec![1, perm],
             outputs: vec![transposed],
+            options: OpOptions::None,
         },
         OpDesc {
             opcode: builtin_op::CAST,
             inputs: vec![transposed],
             outputs: vec![dequantized],
+            options: OpOptions::None,
         },
         OpDesc {
             opcode: builtin_op::BATCH_MATMUL,
             inputs: vec![0, dequantized],
             outputs: vec![contracted],
+            options: OpOptions::None,
         },
     ];
 
@@ -870,6 +969,7 @@ fn collect_quantized_matmul_graph(
         opcode: builtin_op::MUL,
         inputs: vec![contracted, 2],
         outputs: vec![scaled],
+        options: OpOptions::None,
     });
     let mut last = scaled;
     if bias.is_some() {
@@ -883,6 +983,7 @@ fn collect_quantized_matmul_graph(
             opcode: builtin_op::ADD,
             inputs: vec![scaled, 3],
             outputs: vec![last],
+            options: OpOptions::None,
         });
     }
 
@@ -901,7 +1002,7 @@ fn collect_quantized_matmul_graph(
 /// already-multi-op for Normalization/Attention) subgraph.  Returns an error
 /// for patterns that are better handled by the specialised builders (e.g.
 /// Attention), causing the caller to fall back to [`build_model`].
-fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendError> {
+fn collect_single_graph(pattern: &KernelPattern, extent: i32) -> Result<GraphDesc, BackendError> {
     match pattern {
         KernelPattern::MatMul {
             inputs,
@@ -927,6 +1028,7 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                     opcode: builtin_op::BATCH_MATMUL,
                     inputs: vec![0, 1],
                     outputs: vec![2],
+                    options: OpOptions::None,
                 }],
                 graph_inputs: vec![0, 1],
                 graph_outputs: vec![2],
@@ -976,60 +1078,42 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                     opcode,
                     inputs: vec![0, 1],
                     outputs: vec![2],
+                    options: OpOptions::None,
                 }],
                 graph_inputs: vec![0, 1],
                 graph_outputs: vec![2],
                 graph_name: format!("{}_1d", op.op_name().to_lowercase()),
             })
         }
+        // The same graph the standalone builder emits, rather than a second
+        // one written next to it. This arm used to omit the bias TFLite
+        // requires, omit the options entirely -- a stride of 0 to the schema --
+        // and give every tensor the same shape.
         KernelPattern::Conv2D {
             input,
             weight,
             output,
-            ..
-        } => {
-            let shape_4d = vec![-1i32, -1, -1, -1];
-            Ok(GraphDesc {
-                tensors: vec![
-                    TensorInfo::input(input.name.clone(), input.elem_type, shape_4d.clone()),
-                    TensorInfo::input(weight.name.clone(), weight.elem_type, shape_4d.clone()),
-                    TensorInfo::input(output.name.clone(), output.elem_type, shape_4d),
-                ],
-                ops: vec![OpDesc {
-                    opcode: builtin_op::CONV_2D,
-                    inputs: vec![0, 1],
-                    outputs: vec![2],
-                }],
-                graph_inputs: vec![0, 1],
-                graph_outputs: vec![2],
-                graph_name: "conv2d".into(),
-            })
-        }
+            shape,
+            bias,
+        } => Ok(conv2d_graph(
+            input,
+            weight,
+            bias.as_ref(),
+            output,
+            shape,
+            extent,
+        )),
         KernelPattern::Pool {
             kind,
             input,
             output,
-            ..
+            shape,
         } => {
             let opcode = match kind {
                 PoolKind::Max => builtin_op::MAX_POOL_2D,
                 PoolKind::Avg => builtin_op::AVERAGE_POOL_2D,
             };
-            let shape_4d = vec![-1i32, -1, -1, -1];
-            Ok(GraphDesc {
-                tensors: vec![
-                    TensorInfo::input(input.name.clone(), input.elem_type, shape_4d.clone()),
-                    TensorInfo::input(output.name.clone(), output.elem_type, shape_4d),
-                ],
-                ops: vec![OpDesc {
-                    opcode,
-                    inputs: vec![0],
-                    outputs: vec![1],
-                }],
-                graph_inputs: vec![0],
-                graph_outputs: vec![1],
-                graph_name: "pool".into(),
-            })
+            Ok(pool_graph(input, output, opcode, shape, "pool", extent))
         }
         KernelPattern::Activation {
             op, input, output, ..
@@ -1055,6 +1139,7 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                     opcode,
                     inputs: vec![0],
                     outputs: vec![1],
+                    options: OpOptions::None,
                 }],
                 graph_inputs: vec![0],
                 graph_outputs: vec![1],
@@ -1079,6 +1164,7 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                     opcode,
                     inputs: vec![0],
                     outputs: vec![1],
+                    options: OpOptions::None,
                 }],
                 graph_inputs: vec![0],
                 graph_outputs: vec![1],
@@ -1094,6 +1180,7 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                 opcode: builtin_op::TRANSPOSE,
                 inputs: vec![0],
                 outputs: vec![1],
+                options: OpOptions::None,
             }],
             graph_inputs: vec![0],
             graph_outputs: vec![1],
@@ -1108,6 +1195,7 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                 opcode: builtin_op::RESHAPE,
                 inputs: vec![0],
                 outputs: vec![1],
+                options: OpOptions::None,
             }],
             graph_inputs: vec![0],
             graph_outputs: vec![1],
@@ -1136,11 +1224,13 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                         opcode: builtin_op::MUL,
                         inputs: vec![0, 1],
                         outputs: vec![3],
+                        options: OpOptions::None,
                     },
                     OpDesc {
                         opcode: builtin_op::ADD,
                         inputs: vec![3, 2],
                         outputs: vec![4],
+                        options: OpOptions::None,
                     },
                 ],
                 graph_inputs: vec![0, 1, 2],
@@ -1173,6 +1263,7 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                     opcode: builtin_op::CONCATENATION,
                     inputs: input_indices,
                     outputs: vec![n],
+                    options: OpOptions::None,
                 }],
                 tensors,
                 graph_name: "concat".into(),
@@ -1198,6 +1289,7 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                     opcode: builtin_op::GATHER,
                     inputs: vec![0, 1],
                     outputs: vec![2],
+                    options: OpOptions::None,
                 }],
                 graph_inputs: vec![0, 1],
                 graph_outputs: vec![2],
@@ -1223,6 +1315,7 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                     opcode: builtin_op::SCATTER_ND,
                     inputs: vec![0, 1, 2],
                     outputs: vec![3],
+                    options: OpOptions::None,
                 }],
                 graph_inputs: vec![0, 1, 2],
                 graph_outputs: vec![3],
@@ -1281,6 +1374,7 @@ fn append_activation(
         opcode: act_opcode,
         inputs: vec![old_out_idx],
         outputs: vec![act_tensor_idx],
+        options: OpOptions::None,
     });
     // Replace graph outputs with the new activation output.
     *desc.graph_outputs.last_mut().unwrap() = act_tensor_idx;
@@ -1318,7 +1412,7 @@ pub fn build_fused_model(fp: &FusedPattern, extent: i32) -> Result<Vec<u8>, Back
 
             // Collect the base graph descriptor, then append the activation op.
             let mut desc = match base.as_ref() {
-                FusedPattern::Single(p) => match collect_single_graph(p) {
+                FusedPattern::Single(p) => match collect_single_graph(p, extent) {
                     Ok(d) => d,
                     // Fall back to build_model for complex single patterns
                     // (Attention, Split) and just return it without activation.
@@ -2241,6 +2335,17 @@ fn build_tflite_softmax(input: &TensorBinding, output: &TensorBinding, extent: i
 }
 
 /// Build a TFLite model for Conv2D with a Conv2DOptions table.
+/// A convolution, with an explicit PAD in front of it when the source kernel
+/// pads by an amount TFLite's two modes cannot express.
+///
+/// TFLite offers SAME and VALID and nothing else. A kernel that reads no
+/// further than `in - k + 1` is VALID; one that offsets its reads by a literal
+/// is padding by that literal, and SAME is only the same thing by coincidence.
+/// `conv2d_5x5.wgsl` pads by 1 with a 5x5 window at stride 2, where its own
+/// arithmetic gives 31 output pixels, SAME gives 32 and VALID gives 30 -- so
+/// neither mode reproduces it, and emitting the nearer one would be a model
+/// that runs and computes something else. A PAD operator says exactly what the
+/// kernel says, and the convolution after it is VALID.
 fn build_tflite_conv2d(
     input: &TensorBinding,
     weight: &TensorBinding,
@@ -2249,181 +2354,181 @@ fn build_tflite_conv2d(
     shape: &Conv2DShape,
     extent: i32,
 ) -> Vec<u8> {
-    let mut fbb = FlatBufferBuilder::with_capacity(1024);
-
-    let name_in = fbb.create_string(&input.name);
-    let name_w = fbb.create_string(&weight.name);
-    let name_out = fbb.create_string(&output.name);
-    let desc = fbb.create_string("nxpu");
-    let sg_name = fbb.create_string("conv2d");
-
-    let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1], extent);
-    // Per-output-channel, so one dimension rather than four.
-    let shape_1d = shape_vector(&mut fbb, &[-1i32], extent);
-    // TFLite's CONV_2D kernel requires three inputs — `has_bias was not true`
-    // is a hard failure, not a fallback — so a convolution whose source has no
-    // bias still gets one here, as a constant of zeros.
-    let bias_name = bias
-        .map(|b| b.name.clone())
-        .unwrap_or_else(|| "bias".into());
-    let name_bias = fbb.create_string(&bias_name);
-    let zero_bias = if bias.is_none() {
-        let zeros = vec![0u8; (extent.max(1) as usize) * 4];
-        Some(fbb.create_vector(&zeros))
-    } else {
-        None
-    };
-
-    // Always three inputs and the output at index 3. When the bias is
-    // synthesised it is a constant, so it is not a graph input.
-    let out_index = 3i32;
-    let op_inputs = fbb.create_vector(&[0i32, 1, 2]);
-    let op_outputs = fbb.create_vector(&[out_index]);
-    let sg_inputs = if bias.is_some() {
-        fbb.create_vector(&[0i32, 1, 2])
-    } else {
-        fbb.create_vector(&[0i32, 1])
-    };
-    let sg_outputs = fbb.create_vector(&[out_index]);
-
-    // sentinel + input + weight + bias + output
-    let mut buffer_offsets = Vec::new();
-    for i in 0..5 {
-        let start = fbb.start_table();
-        // Buffer 3 is the bias. When it was synthesised it carries zeros;
-        // when it came from the kernel it is a graph input and stays empty.
-        // Nested rather than a let-chain: those are stable from 1.88 and
-        // this workspace's rust-version is 1.87.
-        #[allow(clippy::collapsible_if)]
-        if i == 3 {
-            if let Some(data) = zero_bias {
-                fbb.push_slot_always(vt::buffer::DATA, data);
-            }
-        }
-        buffer_offsets.push(fbb.end_table(start));
-    }
-    let buffers = fbb.create_vector(&buffer_offsets);
-
-    let tensor_in = {
-        let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
-        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(input.elem_type), 0);
-        fbb.push_slot::<u32>(vt::tensor::BUFFER, 1, 0);
-        fbb.push_slot_always(vt::tensor::NAME, name_in);
-        fbb.end_table(start)
-    };
-    let tensor_w = {
-        let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
-        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(weight.elem_type), 0);
-        fbb.push_slot::<u32>(vt::tensor::BUFFER, 2, 0);
-        fbb.push_slot_always(vt::tensor::NAME, name_w);
-        fbb.end_table(start)
-    };
-    let tensor_bias = {
-        let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_1d);
-        // A synthesised bias is f32 whatever the inputs are; TFLite requires
-        // the bias to match the accumulator, not the operands.
-        fbb.push_slot::<i8>(
-            vt::tensor::TYPE,
-            bias.map_or(tensor_type::FLOAT32, |b| onnx_to_tflite_type(b.elem_type)),
-            0,
-        );
-        fbb.push_slot::<u32>(vt::tensor::BUFFER, 3, 0);
-        fbb.push_slot_always(vt::tensor::NAME, name_bias);
-        fbb.end_table(start)
-    };
-
-    let tensor_out = {
-        let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
-        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
-        fbb.push_slot::<u32>(vt::tensor::BUFFER, 4, 0);
-        fbb.push_slot_always(vt::tensor::NAME, name_out);
-        fbb.end_table(start)
-    };
-    let tensors = fbb.create_vector(&[tensor_in, tensor_w, tensor_bias, tensor_out]);
-
-    let deprecated_code = if builtin_op::CONV_2D <= 127 {
-        builtin_op::CONV_2D as i8
-    } else {
-        127
-    };
-    let opcode_table = {
-        let start = fbb.start_table();
-        fbb.push_slot::<i8>(
-            vt::operator_code::DEPRECATED_BUILTIN_CODE,
-            deprecated_code,
-            0,
-        );
-        fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
-        fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, builtin_op::CONV_2D, 0);
-        fbb.end_table(start)
-    };
-    let operator_codes = fbb.create_vector(&[opcode_table]);
-
-    // Conv2DOptions table: stride_w, stride_h, dilation_w=1, dilation_h=1, padding=VALID(0)
-    //
-    // The stride defaults are 0, not 1. `push_slot` omits a field whose value
-    // equals the default it is given, and TFLite's schema default for a stride
-    // is 0 — so passing 1 here meant a stride of 1, the most common stride
-    // there is, was written as absent and read back as zero. Every convolution
-    // this backend emitted at stride 1 was rejected by TFLite's own kernel
-    // with `params->stride_height > 0 was not true`, before any delegate saw
-    // it.
-    let conv2d_opts = {
-        let start = fbb.start_table();
-        fbb.push_slot::<i8>(conv2d_options::PADDING, 0, 0); // VALID
-        fbb.push_slot::<i32>(conv2d_options::STRIDE_W, shape.stride_w.max(1) as i32, 0);
-        fbb.push_slot::<i32>(conv2d_options::STRIDE_H, shape.stride_h.max(1) as i32, 0);
-        fbb.push_slot::<i32>(conv2d_options::ACTIVATION, 0, 0); // NONE
-        fbb.push_slot::<i32>(conv2d_options::DILATION_W, 1, 1);
-        fbb.push_slot::<i32>(conv2d_options::DILATION_H, 1, 1);
-        fbb.end_table(start)
-    };
-
-    let operator = {
-        let start = fbb.start_table();
-        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 0, 0);
-        fbb.push_slot_always(vt::operator::INPUTS, op_inputs);
-        fbb.push_slot_always(vt::operator::OUTPUTS, op_outputs);
-        fbb.push_slot::<u8>(
-            vt::operator::BUILTIN_OPTIONS_TYPE,
-            builtin_options_type::CONV_2D,
-            0,
-        );
-        fbb.push_slot_always(vt::operator::BUILTIN_OPTIONS, conv2d_opts);
-        fbb.end_table(start)
-    };
-    let operators = fbb.create_vector(&[operator]);
-
-    let subgraph = {
-        let start = fbb.start_table();
-        fbb.push_slot_always(vt::sub_graph::TENSORS, tensors);
-        fbb.push_slot_always(vt::sub_graph::INPUTS, sg_inputs);
-        fbb.push_slot_always(vt::sub_graph::OUTPUTS, sg_outputs);
-        fbb.push_slot_always(vt::sub_graph::OPERATORS, operators);
-        fbb.push_slot_always(vt::sub_graph::NAME, sg_name);
-        fbb.end_table(start)
-    };
-    let subgraphs = fbb.create_vector(&[subgraph]);
-
-    let model = {
-        let start = fbb.start_table();
-        fbb.push_slot::<u32>(vt::model::VERSION, 3, 0);
-        fbb.push_slot_always(vt::model::OPERATOR_CODES, operator_codes);
-        fbb.push_slot_always(vt::model::SUBGRAPHS, subgraphs);
-        fbb.push_slot_always(vt::model::DESCRIPTION, desc);
-        fbb.push_slot_always(vt::model::BUFFERS, buffers);
-        fbb.end_table(start)
-    };
-
-    fbb.finish(model, Some(TFLITE_FILE_ID));
-    fbb.finished_data().to_vec()
+    build_from_graph_desc(
+        &conv2d_graph(input, weight, bias, output, shape, extent),
+        extent,
+    )
 }
 
-/// Build a TFLite model for a pooling op (Max or Avg) with a Pool2DOptions table.
+/// The graph a convolution becomes, so that the fused path and the standalone
+/// one cannot disagree about it.
+///
+/// They did. `collect_single_graph` built its own CONV_2D with two inputs, no
+/// options and one shape vector for every tensor -- so a convolution followed
+/// by an activation, which is the shape most real ones have, went out with a
+/// stride of 0 and a missing bias and was refused by TFLite's own kernel.
+fn conv2d_graph(
+    input: &TensorBinding,
+    weight: &TensorBinding,
+    bias: Option<&TensorBinding>,
+    output: &TensorBinding,
+    shape: &Conv2DShape,
+    extent: i32,
+) -> GraphDesc {
+    // A convolution's tensors do not share a shape, and one vector used to be
+    // written to all of them. At `--symbolic-dim 64` every tensor came out
+    // [64, 64, 64, 64]: a 64x64 window with 64 channels each way over a 64x64
+    // image, an im2col of 2^36 elements, past TFLite's 32-bit limit before any
+    // delegate is asked. TFLite reads them as NHWC with the weight as
+    // [out, kh, kw, in].
+    let n = extent.max(1);
+    let channels_in = extent.max(1);
+    let channels_out = extent.max(1);
+    let in_h = extent.max(1);
+    let in_w = extent.max(1);
+
+    // A window the kernel states as a literal is known exactly. One supplied
+    // through the params struct is not, and falls back to the extent like any
+    // other symbolic dimension -- which makes the window as wide as the image,
+    // so the output is a single pixel. Degenerate, but coherent, and coherence
+    // is what decides whether anything will load it.
+    let window = |literal: i64| {
+        if literal > 0 {
+            (literal as i32).max(1)
+        } else {
+            extent.max(1)
+        }
+    };
+    let kernel_h = window(shape.kernel_h_val);
+    let kernel_w = window(shape.kernel_w_val);
+
+    let pad_h = shape.pad_h.max(0) as i32;
+    let pad_w = shape.pad_w.max(0) as i32;
+    let padded_h = in_h + 2 * pad_h;
+    let padded_w = in_w + 2 * pad_w;
+
+    // floor((in - reach) / stride) + 1, which is what TFLite's own kernel
+    // computes for VALID, over the padded extent because that is what the
+    // convolution now sees.
+    let valid_out = |input: i32, k: i32, stride: i32, dilation: i32| {
+        let reach = dilation.max(1) * (k - 1) + 1;
+        ((input - reach) / stride.max(1) + 1).max(1)
+    };
+    let out_h = valid_out(
+        padded_h,
+        kernel_h,
+        shape.stride_h as i32,
+        shape.dilation_h as i32,
+    );
+    let out_w = valid_out(
+        padded_w,
+        kernel_w,
+        shape.stride_w as i32,
+        shape.dilation_w as i32,
+    );
+
+    let mut tensors = vec![TensorInfo::input(
+        input.name.clone(),
+        input.elem_type,
+        vec![n, in_h, in_w, channels_in],
+    )];
+    let mut ops = Vec::new();
+
+    // The tensor the convolution reads: the input itself, or the padded copy.
+    let conv_input = if pad_h > 0 || pad_w > 0 {
+        // PAD takes the amounts as an int32 [rank, 2] constant, before and
+        // after each dimension. Batch and channels are untouched.
+        let amounts: [i32; 8] = [0, 0, pad_h, pad_h, pad_w, pad_w, 0, 0];
+        tensors.push(TensorInfo::constant(
+            format!("{}_paddings", input.name),
+            data_type::INT32,
+            vec![4, 2],
+            amounts.iter().flat_map(|d| d.to_le_bytes()).collect(),
+        ));
+        tensors.push(TensorInfo::input(
+            format!("{}_padded", input.name),
+            input.elem_type,
+            vec![n, padded_h, padded_w, channels_in],
+        ));
+        ops.push(OpDesc {
+            opcode: builtin_op::PAD,
+            inputs: vec![0, 1],
+            outputs: vec![2],
+            options: OpOptions::Pad,
+        });
+        2
+    } else {
+        0
+    };
+
+    let weight_index = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        weight.name.clone(),
+        weight.elem_type,
+        vec![channels_out, kernel_h, kernel_w, channels_in],
+    ));
+
+    // TFLite's CONV_2D kernel requires three inputs — `has_bias was not true`
+    // is a hard failure, not a fallback — so a convolution whose source has no
+    // bias still gets one here, as a constant of zeros. A synthesised bias is
+    // f32 whatever the operands are; TFLite requires it to match the
+    // accumulator.
+    let bias_index = tensors.len() as i32;
+    match bias {
+        Some(b) => tensors.push(TensorInfo::input(
+            b.name.clone(),
+            b.elem_type,
+            vec![channels_out],
+        )),
+        None => tensors.push(TensorInfo::constant(
+            "bias",
+            data_type::FLOAT,
+            vec![channels_out],
+            vec![0u8; (channels_out as usize) * 4],
+        )),
+    }
+
+    let output_index = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        output.name.clone(),
+        output.elem_type,
+        vec![n, out_h, out_w, channels_out],
+    ));
+
+    ops.push(OpDesc {
+        opcode: builtin_op::CONV_2D,
+        inputs: vec![conv_input, weight_index, bias_index],
+        outputs: vec![output_index],
+        options: OpOptions::Conv2D {
+            // VALID, because the padding is now the PAD operator's business.
+            // `Padding`'s first member is SAME, so VALID is 1 and not 0; both
+            // builders here pushed 0 under a comment saying VALID, and
+            // `push_slot` then omitted the field for matching its own default,
+            // so the mistake was not in the bytes to find.
+            padding: padding::VALID,
+            stride_w: shape.stride_w as i32,
+            stride_h: shape.stride_h as i32,
+            dilation_w: shape.dilation_w as i32,
+            dilation_h: shape.dilation_h as i32,
+        },
+    });
+
+    // A constant is not a graph input; the synthesised bias and the paddings
+    // are constants, and listing either here makes the model invalid.
+    let mut graph_inputs = vec![0, weight_index];
+    if bias.is_some() {
+        graph_inputs.push(bias_index);
+    }
+
+    GraphDesc {
+        tensors,
+        ops,
+        graph_inputs,
+        graph_outputs: vec![output_index],
+        graph_name: "conv2d".into(),
+    }
+}
+
 fn build_tflite_pool(
     input: &TensorBinding,
     output: &TensorBinding,
@@ -2432,122 +2537,74 @@ fn build_tflite_pool(
     graph_name: &str,
     extent: i32,
 ) -> Vec<u8> {
-    let mut fbb = FlatBufferBuilder::with_capacity(1024);
-
-    let name_in = fbb.create_string(&input.name);
-    let name_out = fbb.create_string(&output.name);
-    let desc = fbb.create_string("nxpu");
-    let sg_name = fbb.create_string(graph_name);
-
-    let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1], extent);
-
-    let op_inputs = fbb.create_vector(&[0i32]);
-    let op_outputs = fbb.create_vector(&[1i32]);
-    let sg_inputs = fbb.create_vector(&[0i32]);
-    let sg_outputs = fbb.create_vector(&[1i32]);
-
-    // 3 buffers: sentinel + input + output
-    let mut buffer_offsets = Vec::new();
-    for _ in 0..3 {
-        let start = fbb.start_table();
-        buffer_offsets.push(fbb.end_table(start));
-    }
-    let buffers = fbb.create_vector(&buffer_offsets);
-
-    let tensor_in = {
-        let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
-        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(input.elem_type), 0);
-        fbb.push_slot::<u32>(vt::tensor::BUFFER, 1, 0);
-        fbb.push_slot_always(vt::tensor::NAME, name_in);
-        fbb.end_table(start)
-    };
-    let tensor_out = {
-        let start = fbb.start_table();
-        fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
-        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
-        fbb.push_slot::<u32>(vt::tensor::BUFFER, 2, 0);
-        fbb.push_slot_always(vt::tensor::NAME, name_out);
-        fbb.end_table(start)
-    };
-    let tensors = fbb.create_vector(&[tensor_in, tensor_out]);
-
-    let deprecated_code = if opcode <= 127 { opcode as i8 } else { 127 };
-    let opcode_table = {
-        let start = fbb.start_table();
-        fbb.push_slot::<i8>(
-            vt::operator_code::DEPRECATED_BUILTIN_CODE,
-            deprecated_code,
-            0,
-        );
-        fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
-        fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, opcode, 0);
-        fbb.end_table(start)
-    };
-    let operator_codes = fbb.create_vector(&[opcode_table]);
-
-    // Pool2DOptions table: padding=VALID(0), stride_w, stride_h, filter_w, filter_h, activation=NONE(0)
-    let pool2d_opts = {
-        let start = fbb.start_table();
-        fbb.push_slot::<i8>(pool2d_options::PADDING, 0, 0); // VALID
-        // Same defaulting bug as Conv2DOptions above: 0 is TFLite's schema
-        // default, so a stride of 1 has to be written rather than omitted.
-        fbb.push_slot::<i32>(pool2d_options::STRIDE_W, shape.stride_w.max(1) as i32, 0);
-        fbb.push_slot::<i32>(pool2d_options::STRIDE_H, shape.stride_h.max(1) as i32, 0);
-        fbb.push_slot::<i32>(pool2d_options::FILTER_W, shape.kernel_w as i32, 1);
-        fbb.push_slot::<i32>(pool2d_options::FILTER_H, shape.kernel_h as i32, 1);
-        fbb.push_slot::<i32>(pool2d_options::ACTIVATION, 0, 0); // NONE
-        fbb.end_table(start)
-    };
-
-    let operator = {
-        let start = fbb.start_table();
-        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 0, 0);
-        fbb.push_slot_always(vt::operator::INPUTS, op_inputs);
-        fbb.push_slot_always(vt::operator::OUTPUTS, op_outputs);
-        fbb.push_slot::<u8>(
-            vt::operator::BUILTIN_OPTIONS_TYPE,
-            builtin_options_type::POOL_2D,
-            0,
-        );
-        fbb.push_slot_always(vt::operator::BUILTIN_OPTIONS, pool2d_opts);
-        fbb.end_table(start)
-    };
-    let operators = fbb.create_vector(&[operator]);
-
-    let subgraph = {
-        let start = fbb.start_table();
-        fbb.push_slot_always(vt::sub_graph::TENSORS, tensors);
-        fbb.push_slot_always(vt::sub_graph::INPUTS, sg_inputs);
-        fbb.push_slot_always(vt::sub_graph::OUTPUTS, sg_outputs);
-        fbb.push_slot_always(vt::sub_graph::OPERATORS, operators);
-        fbb.push_slot_always(vt::sub_graph::NAME, sg_name);
-        fbb.end_table(start)
-    };
-    let subgraphs = fbb.create_vector(&[subgraph]);
-
-    let model = {
-        let start = fbb.start_table();
-        fbb.push_slot::<u32>(vt::model::VERSION, 3, 0);
-        fbb.push_slot_always(vt::model::OPERATOR_CODES, operator_codes);
-        fbb.push_slot_always(vt::model::SUBGRAPHS, subgraphs);
-        fbb.push_slot_always(vt::model::DESCRIPTION, desc);
-        fbb.push_slot_always(vt::model::BUFFERS, buffers);
-        fbb.end_table(start)
-    };
-
-    fbb.finish(model, Some(TFLITE_FILE_ID));
-    fbb.finished_data().to_vec()
+    build_from_graph_desc(
+        &pool_graph(input, output, opcode, shape, graph_name, extent),
+        extent,
+    )
 }
 
-/// Build a TFLite model for attention:
-///   BATCH_MATMUL(Q,K) → DIV(scores, sqrt_dk) → SOFTMAX(beta=1.0) → BATCH_MATMUL(attn,V).
-///
-/// The `d_k` string is parsed to an f32; if parsing fails a fallback of 64.0 is used.
-/// NOTE: Unlike the ONNX and StableHLO backends which compute sqrt(d_k) dynamically
-/// from the query tensor's shape, TFLite lacks dynamic shape operators. The sqrt(d_k)
-/// value is embedded as a compile-time constant. When d_k is symbolic (a param name
-/// rather than a number), the fallback value of sqrt(64) = 8.0 is used.
+/// The graph a pool becomes. Shared with the fused path for the same reason
+/// the convolution's is: that path built a POOL_2D with no options at all,
+/// which is a stride of 0 and a window of 0 to TFLite's schema.
+fn pool_graph(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    opcode: i32,
+    shape: &PoolShape,
+    graph_name: &str,
+    extent: i32,
+) -> GraphDesc {
+    // Input and output do not have the same shape, and one vector was written
+    // to both. A pool with a window narrows its input; saying otherwise is the
+    // defect the convolution builder had, and it survived here only because
+    // the padding was wrong in the direction that hid it.
+    //
+    // `PoolShape` carries no padding, so these are VALID and sized for VALID:
+    // floor((in - k) / stride) + 1, which is what TFLite's own kernel computes.
+    // Writing it as (in - k + 1) / stride is a different function that agrees
+    // only at stride 1.
+    let n = extent.max(1);
+    let channels = extent.max(1);
+    let in_h = extent.max(1);
+    let in_w = extent.max(1);
+    let valid_out =
+        |input: i32, k: i32, stride: i32| ((input - k.max(1)) / stride.max(1) + 1).max(1);
+    let out_h = valid_out(in_h, shape.kernel_h as i32, shape.stride_h as i32);
+    let out_w = valid_out(in_w, shape.kernel_w as i32, shape.stride_w as i32);
+
+    GraphDesc {
+        tensors: vec![
+            TensorInfo::input(
+                input.name.clone(),
+                input.elem_type,
+                vec![n, in_h, in_w, channels],
+            ),
+            TensorInfo::input(
+                output.name.clone(),
+                output.elem_type,
+                vec![n, out_h, out_w, channels],
+            ),
+        ],
+        ops: vec![OpDesc {
+            opcode,
+            inputs: vec![0],
+            outputs: vec![1],
+            options: OpOptions::Pool2D {
+                // SAME is the schema default and so was written as absence;
+                // the comment here claimed VALID while the byte said SAME.
+                padding: padding::VALID,
+                stride_w: shape.stride_w as i32,
+                stride_h: shape.stride_h as i32,
+                filter_w: shape.kernel_w as i32,
+                filter_h: shape.kernel_h as i32,
+            },
+        }],
+        graph_inputs: vec![0],
+        graph_outputs: vec![1],
+        graph_name: graph_name.into(),
+    }
+}
+
 // The extent joins seven existing parameters; the same allow is already used
 // in the ONNX and StableHLO lowerings for the same reason.
 #[allow(clippy::too_many_arguments)]
@@ -3276,6 +3333,127 @@ mod tests {
         }
     }
 
+    /// Does the model contain this shape vector?
+    ///
+    /// A flatbuffer vector of i32 is a length followed by the elements, all
+    /// little-endian, so a shape is a findable byte sequence. Low-level, but
+    /// the alternative is asserting the file starts with `TFL3`, and that is
+    /// what let a convolution give its input, its weight and its output the
+    /// same shape for as long as this backend has existed.
+    fn has_shape(bytes: &[u8], dims: &[i32]) -> bool {
+        let mut needle = (dims.len() as i32).to_le_bytes().to_vec();
+        for d in dims {
+            needle.extend_from_slice(&d.to_le_bytes());
+        }
+        bytes.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn a_convolution_gives_each_tensor_its_own_shape() {
+        // NHWC input, [out, kh, kw, in] weight, [out] bias, NHWC output. At an
+        // extent of 8 with a 5x5 window and no padding the output is 4x4, and
+        // none of the four is the same vector as another.
+        let pattern = KernelPattern::Conv2D {
+            input: make_tensor("input", TensorRole::Input),
+            weight: make_tensor("weight", TensorRole::Input),
+            output: make_tensor("output", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "IC".into(),
+                channels_out: "OC".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                kernel_h_val: 5,
+                kernel_w_val: 5,
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 0,
+                pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
+            },
+            bias: None,
+        };
+        let bytes = build_model(&pattern, 8).unwrap();
+        assert!(has_shape(&bytes, &[8, 8, 8, 8]), "no input shape");
+        assert!(
+            has_shape(&bytes, &[8, 5, 5, 8]),
+            "the weight is not [out, kh, kw, in]"
+        );
+        assert!(has_shape(&bytes, &[8]), "no per-output-channel bias shape");
+        // The output shape is the assertion that catches a SAME padding
+        // written under a comment claiming VALID: SAME would leave it at 8x8.
+        assert!(
+            has_shape(&bytes, &[8, 4, 4, 8]),
+            "the output is not sized for VALID"
+        );
+    }
+
+    #[test]
+    fn a_convolution_whose_window_is_symbolic_still_narrows_its_output() {
+        // A window supplied through the params struct is unknown, so it takes
+        // the extent like any other symbolic dimension -- which makes it as
+        // wide as the image and the output a single pixel. Degenerate, but
+        // coherent; the incoherent version needed an im2col of 2^36 at an
+        // extent of 64 and no interpreter would load it.
+        let pattern = KernelPattern::Conv2D {
+            input: make_tensor("input", TensorRole::Input),
+            weight: make_tensor("weight", TensorRole::Input),
+            output: make_tensor("output", TensorRole::Output),
+            shape: Conv2DShape {
+                batch: "N".into(),
+                channels_in: "IC".into(),
+                channels_out: "OC".into(),
+                height: "H".into(),
+                width: "W".into(),
+                kernel_h: "KH".into(),
+                kernel_w: "KW".into(),
+                kernel_h_val: 0,
+                kernel_w_val: 0,
+                stride_h: 1,
+                stride_w: 1,
+                pad_h: 0,
+                pad_w: 0,
+                groups: 1,
+                dilation_h: 1,
+                dilation_w: 1,
+            },
+            bias: None,
+        };
+        let bytes = build_model(&pattern, 16).unwrap();
+        assert!(has_shape(&bytes, &[16, 16, 16, 16]), "no input shape");
+        assert!(
+            has_shape(&bytes, &[16, 1, 1, 16]),
+            "the output is not a single pixel"
+        );
+    }
+
+    #[test]
+    fn a_pool_narrows_its_input() {
+        // The same defect as the convolution's, in the builder next door: one
+        // shape vector written to the input and the output alike.
+        let pattern = KernelPattern::Pool {
+            kind: PoolKind::Max,
+            input: make_tensor("input", TensorRole::Input),
+            output: make_tensor("output", TensorRole::Output),
+            shape: PoolShape {
+                kernel_h: 2,
+                kernel_w: 2,
+                stride_h: 2,
+                stride_w: 2,
+            },
+        };
+        let bytes = build_model(&pattern, 8).unwrap();
+        assert!(has_shape(&bytes, &[8, 8, 8, 8]), "no input shape");
+        assert!(
+            has_shape(&bytes, &[8, 4, 4, 8]),
+            "a 2x2 window at stride 2 over 8 pixels is not 8 pixels out"
+        );
+    }
+
     #[test]
     fn conv2d_produces_valid_flatbuffer() {
         let pattern = KernelPattern::Conv2D {
@@ -3906,7 +4084,7 @@ mod tests {
         let pattern = KernelPattern::Unknown {
             reason: "test".into(),
         };
-        let result = collect_single_graph(&pattern);
+        let result = collect_single_graph(&pattern, 8);
         assert!(result.is_err());
     }
 
@@ -3924,7 +4102,7 @@ mod tests {
             num_kv_heads: 1,
             causal: false,
         };
-        let result = collect_single_graph(&pattern);
+        let result = collect_single_graph(&pattern, 8);
         assert!(result.is_err());
     }
 
@@ -3939,7 +4117,7 @@ mod tests {
             ],
             axis: 0,
         };
-        let result = collect_single_graph(&pattern);
+        let result = collect_single_graph(&pattern, 8);
         assert!(result.is_err());
     }
 
@@ -3985,6 +4163,7 @@ mod tests {
                 opcode: builtin_op::RELU,
                 inputs: vec![0],
                 outputs: vec![1],
+                options: OpOptions::None,
             }],
             graph_inputs: vec![0],
             graph_outputs: vec![1],
@@ -4009,11 +4188,13 @@ mod tests {
                     opcode: builtin_op::RELU,
                     inputs: vec![0],
                     outputs: vec![1],
+                    options: OpOptions::None,
                 },
                 OpDesc {
                     opcode: builtin_op::RELU,
                     inputs: vec![1],
                     outputs: vec![2],
+                    options: OpOptions::None,
                 },
             ],
             graph_inputs: vec![0],
@@ -4039,6 +4220,7 @@ mod tests {
                 opcode: builtin_op::RELU,
                 inputs: vec![0],
                 outputs: vec![1],
+                options: OpOptions::None,
             }],
             graph_inputs: vec![0],
             graph_outputs: vec![1],

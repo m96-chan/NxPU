@@ -11,10 +11,15 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 nxpu="$root/target/release/nxpu"
 ops="$root/vendor/web-xpu-ops/ops"
-# 16 rather than 64: every dimension takes the same extent, so a convolution
-# at 64 is a 64x64x64x64 one and its im2col overflows a 32-bit index. That is
-# the flag's doing, not the emitter's — the same kernel loads at 8 and at 16.
-extent="${1:-16}"
+# 64, matching what the device workflows compile at. This was 16, with a note
+# saying a convolution overflowed a 32-bit im2col at 64 because "every dimension
+# takes the same extent" and that this was "the flag's doing, not the emitter's".
+# The second half was wrong: the emitter wrote one shape vector to a
+# convolution's input, weight and output alike, so the model was incoherent at
+# every extent and merely small enough to load at 16. A MediaTek MT6899 refused
+# it on all four drivers while accepting the same operator from TensorFlow's
+# converter, which is how it was found.
+extent="${1:-64}"
 
 [ -x "$nxpu" ] || { echo "build first: cargo build --release -p nxpu-cli" >&2; exit 2; }
 [ -d "$ops" ] || { echo "submodule missing: git submodule update --init" >&2; exit 2; }

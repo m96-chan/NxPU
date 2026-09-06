@@ -42,6 +42,7 @@ pub mod builtin_op {
     pub const DEPTHWISE_CONV_2D: i32 = 4;
     pub const CUSTOM: i32 = 32;
     pub const CAST: i32 = 53;
+    pub const PAD: i32 = 34;
     pub const GELU: i32 = 150;
 }
 
@@ -105,12 +106,29 @@ pub mod builtin_options_type {
     pub const SOFTMAX: u8 = 9;
     pub const CONCATENATION: u8 = 10;
     pub const SPLIT: u8 = 35;
+    pub const PAD: u8 = 22;
 }
 
 /// VTable field offsets for `SoftmaxOptions`.
 #[allow(dead_code)]
 pub mod softmax_options {
     pub const BETA: u16 = 4;
+}
+
+/// `Padding`, which is an enum and not a flag.
+///
+/// SAME comes first, so it is zero and VALID is one. Both the convolution and
+/// the pooling builder wrote `0` under a comment saying VALID, which made every
+/// windowed operator this backend emitted SAME-padded -- and `push_slot` then
+/// omitted the field for matching its own default, so the mistake was invisible
+/// in the bytes. The kernels these come from compute `IW - KW + 1`, which is
+/// VALID; SAME kept the output at the input's size, and at a 64-wide symbolic
+/// extent that made a convolution's im2col 2^36 elements, past TFLite's 32-bit
+/// limit, before any delegate was asked.
+#[allow(dead_code)]
+pub mod padding {
+    pub const SAME: i8 = 0;
+    pub const VALID: i8 = 1;
 }
 
 /// VTable field offsets for `Conv2DOptions`.

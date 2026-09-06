@@ -68,16 +68,28 @@ def main() -> int:
         loader.write_text(LOADER)
         results = {}
         for wgsl in sorted((ROOT / "examples").glob("*.wgsl")):
-            model = pathlib.Path(tmp) / "m.tflite"
-            built = subprocess.run(
-                [str(NXPU), str(wgsl), "--target", "tflite", "--precision", "keep",
-                 "--symbolic-dim", "8", "-o", str(model)],
-                capture_output=True, text=True,
-            )
-            if built.returncode != 0:
-                results[wgsl.stem] = "does not compile"
-                continue
-            results[wgsl.stem] = classify(model, loader)
+            # Two extents, because a shape defect can be invisible at one.
+            # This ran only at 8, where a convolution whose every dimension had
+            # been given the same extent has an im2col of 8^6 -- comfortably
+            # inside TFLite's 32-bit limit. At 64 the same model needs 2^36 and
+            # no interpreter will load it, which is what a MediaTek MT6899
+            # reported and this check did not.
+            outcome = "ok"
+            for extent in ("8", "64"):
+                model = pathlib.Path(tmp) / f"m{extent}.tflite"
+                built = subprocess.run(
+                    [str(NXPU), str(wgsl), "--target", "tflite", "--precision", "keep",
+                     "--symbolic-dim", extent, "-o", str(model)],
+                    capture_output=True, text=True,
+                )
+                if built.returncode != 0:
+                    outcome = "does not compile"
+                    break
+                verdict = classify(model, loader)
+                if verdict != "ok":
+                    outcome = f"at --symbolic-dim {extent}: {verdict}"
+                    break
+            results[wgsl.stem] = outcome
 
     loads = sorted(k for k, v in results.items() if v == "ok")
     print(f"{len(loads)} of {len(results)} load\n")
