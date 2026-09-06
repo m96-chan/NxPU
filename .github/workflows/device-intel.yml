@@ -1,0 +1,77 @@
+name: Device Intel NPU
+
+# What does the Panther Lake machine actually have?
+#
+# Same order as the Hexagon and XDNA work: measure before designing. This one
+# runs under WSL2, where device passthrough is its own question — an NPU that
+# the host can see is not automatically one this kernel can.
+on:
+  push:
+    branches: [feat/device-intel-npu]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: What the machine has
+    runs-on: [self-hosted, Linux, soc-intel-pantherlake-356h]
+    steps:
+      - name: Kernel and environment
+        continue-on-error: true
+        run: |
+          uname -a
+          echo "--- WSL?"
+          grep -qi microsoft /proc/version && echo "running under WSL" || echo "not WSL"
+          echo "--- accel devices"
+          ls -l /dev/accel/ 2>/dev/null || echo "no /dev/accel"
+          ls -l /dev/dri/ 2>/dev/null | head -5 || echo "no /dev/dri"
+          echo "--- intel npu driver"
+          lsmod 2>/dev/null | grep -iE 'intel_vpu|ivpu' || echo "no intel_vpu module listed"
+
+      # The limit that stopped the XDNA machine, asked first here rather than
+      # after a confusing EAGAIN.
+      - name: Limits
+        continue-on-error: true
+        run: |
+          echo "max locked memory (KB): $(ulimit -l)"
+          free -m | head -2
+
+      - name: Level Zero and the NPU plugin
+        continue-on-error: true
+        run: |
+          ldconfig -p 2>/dev/null | grep -iE 'ze_loader|level_zero|npu' | head -10 \
+            || echo "no level-zero libraries in the loader cache"
+          ls /usr/lib/x86_64-linux-gnu/libze* 2>/dev/null | head -5 || true
+          command -v npu-smi && npu-smi info 2>&1 | head -10 || echo "no npu-smi"
+
+      - name: Python, OpenVINO and ONNX Runtime
+        continue-on-error: true
+        run: |
+          python3 --version
+          python3 -m pip --version 2>&1 | head -1 || echo "no pip"
+          python3 - <<'PY' || echo "openvino not importable"
+          import openvino as ov
+          core = ov.Core()
+          print("openvino", ov.__version__)
+          print("devices:", core.available_devices)
+          for d in core.available_devices:
+              print(" ", d, core.get_property(d, "FULL_DEVICE_NAME"))
+          PY
+          python3 - <<'PY' || echo "onnxruntime not importable"
+          import onnxruntime as ort
+          print("onnxruntime", ort.__version__, ort.get_available_providers())
+          PY
+
+      # The AMD backend's advice is Vitis AI; the Intel backend writes
+      # OpenVINO IR. Whether an "NPU" device is present is the question that
+      # decides whether that advice can be acted on here.
+      - name: Is there an NPU device to target
+        continue-on-error: true
+        run: |
+          python3 - <<'PY' || echo "could not enumerate devices"
+          import openvino as ov
+          devs = ov.Core().available_devices
+          print("NPU present:", any(d.startswith("NPU") for d in devs), devs)
+          PY
