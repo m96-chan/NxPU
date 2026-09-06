@@ -170,14 +170,17 @@ jobs:
           if-no-files-found: warn
 
   compare:
-    name: ULP histogram
+    name: Histogram for ${{ matrix.set }}
     needs: [fetch, device]
     if: always()
+    strategy:
+      matrix:
+        set: [baseline, signed, odd, resolution]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: ulp-fixtures
+          name: ulp-fixtures-${{ matrix.set }}
           path: fixtures
       - uses: actions/download-artifact@v8
         with:
