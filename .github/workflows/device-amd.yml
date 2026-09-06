@@ -1,0 +1,66 @@
+name: Device AMD XDNA
+
+# What does the XDNA2 machine actually have?
+#
+# The same order the Hexagon work took: find out what the device exposes
+# before designing anything for it. Every assumption made about that phone
+# from the outside — which libraries were loadable, which delegate reached the
+# NPU — turned out to be wrong in at least one direction, and each was one
+# command away from being known.
+on:
+  push:
+    branches: [feat/device-amd-xdna]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: What the machine has
+    runs-on: [self-hosted, Linux, amd-npu]
+    steps:
+      - name: The device itself
+        continue-on-error: true
+        run: |
+          echo "--- kernel driver"
+          ls -l /dev/accel/ 2>/dev/null || echo "no /dev/accel"
+          lsmod 2>/dev/null | grep -iE 'amdxdna|xdna' || echo "no xdna module listed"
+          echo "--- amdxdna in dmesg (may need privileges)"
+          dmesg 2>/dev/null | grep -i xdna | tail -5 || echo "dmesg unavailable"
+
+      - name: XRT
+        continue-on-error: true
+        run: |
+          command -v xrt-smi && xrt-smi examine 2>&1 | head -30 || echo "no xrt-smi"
+          command -v xbutil && xbutil examine 2>&1 | head -20 || echo "no xbutil"
+          ls /opt/xilinx/xrt/lib 2>/dev/null | head -10 || echo "no /opt/xilinx/xrt"
+
+      - name: Python and ONNX Runtime
+        continue-on-error: true
+        run: |
+          python3 --version
+          python3 - <<'PY' || echo "onnxruntime not importable"
+          import onnxruntime as ort
+          print("onnxruntime", ort.__version__)
+          print("providers:", ort.get_available_providers())
+          PY
+
+      - name: Vitis AI / Ryzen AI
+        continue-on-error: true
+        run: |
+          ls /opt/xilinx/vitis_ai 2>/dev/null | head || echo "no vitis_ai"
+          python3 -c "import vai_q_onnx; print('vai_q_onnx', vai_q_onnx.__version__)" 2>/dev/null \
+            || echo "no vai_q_onnx"
+          ls ~/.local/lib/python*/site-packages 2>/dev/null | grep -iE 'vitis|ryzen|voe' || true
+
+      # Deliberately last and deliberately allowed to fail: it says whether
+      # anything here can run a graph at all, which is the question the rest
+      # of the pipeline depends on.
+      - name: Can it run an ONNX graph
+        continue-on-error: true
+        run: |
+          python3 - <<'PY' || echo "could not run a graph"
+          import numpy as np, onnxruntime as ort
+          print("providers in this session:", ort.get_available_providers())
+          PY
