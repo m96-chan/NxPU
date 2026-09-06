@@ -32,7 +32,7 @@ pub mod builtin_op {
     pub const SUB: i32 = 41;
     pub const DIV: i32 = 42;
     pub const REDUCE_MAX: i32 = 82;
-    pub const REDUCE_MIN: i32 = 83;
+    pub const REDUCE_MIN: i32 = 89; // 83 is REDUCE_PROD
     pub const SUM: i32 = 74;
     pub const CONCATENATION: i32 = 2;
     pub const SPLIT: i32 = 49;
@@ -41,6 +41,7 @@ pub mod builtin_op {
     pub const SCATTER_ND: i32 = 122;
     pub const DEPTHWISE_CONV_2D: i32 = 4;
     pub const CUSTOM: i32 = 32;
+    pub const GELU: i32 = 150;
 }
 
 /// VTable field slot offsets for each TFLite FlatBuffer table.

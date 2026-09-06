@@ -111,14 +111,24 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
                 op,
                 ActivationOp::Gelu | ActivationOp::Silu | ActivationOp::Mish
             ) {
-                // No direct TFLite op for GELU/SiLU/Mish -- use CUSTOM
+                // GELU is builtin 150. It went out as CUSTOM with no
+                // custom_code, which no interpreter can register — the model
+                // was rejected before anything looked at what it computed.
+                // SiLU and Mish have no builtin and remain custom, and remain
+                // unloadable for the same reason; naming them here is the
+                // honest half.
                 let shapes = [vec![-1i32], vec![-1]];
+                let opcode = if matches!(op, ActivationOp::Gelu) {
+                    builtin_op::GELU
+                } else {
+                    builtin_op::CUSTOM
+                };
                 build_tflite_unary(
                     input,
                     output,
                     &shapes[0],
                     &shapes[1],
-                    builtin_op::CUSTOM,
+                    opcode,
                     &format!("{}_1d", op.op_name().to_lowercase()),
                     extent,
                 )
@@ -221,9 +231,16 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
             output,
             ..
         } => {
+            // TFLite refuses UINT32 positions. WGSL indexes with u32, and
+            // for a non-negative index the bytes are identical, so what has
+            // to change is the declared type rather than the data.
+            let indices_i32 = TensorBinding {
+                elem_type: data_type::INT32,
+                ..indices.clone()
+            };
             let shapes = [vec![-1i32], vec![-1], vec![-1]];
             build_tflite(
-                &[data, indices],
+                &[data, &indices_i32],
                 output,
                 &shapes,
                 builtin_op::GATHER,
@@ -761,7 +778,11 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                 ActivationOp::Sigmoid => builtin_op::LOGISTIC,
                 ActivationOp::Tanh => builtin_op::TANH,
                 ActivationOp::Softmax => builtin_op::SOFTMAX,
-                ActivationOp::Gelu | ActivationOp::Silu | ActivationOp::Mish => builtin_op::CUSTOM,
+                // GELU is builtin 150. It used to go out as CUSTOM with no
+                // custom_code, which no interpreter can register; Silu and
+                // Mish have no builtin and stay custom.
+                ActivationOp::Gelu => builtin_op::GELU,
+                ActivationOp::Silu | ActivationOp::Mish => builtin_op::CUSTOM,
             };
             let shape_1d = vec![-1i32];
             Ok(GraphDesc {
@@ -968,7 +989,10 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                     },
                     TensorInfo {
                         name: indices.name.clone(),
-                        elem_type: indices.elem_type,
+                        // TFLite refuses UINT32 positions. WGSL indexes with
+                        // u32, and for a non-negative index the bytes are the
+                        // same, so the declared type is what has to change.
+                        elem_type: data_type::INT32,
                         shape: shape_1d.clone(),
                     },
                     TensorInfo {
@@ -1650,16 +1674,24 @@ fn build_tflite_conv2d(
     let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1], extent);
     // Per-output-channel, so one dimension rather than four.
     let shape_1d = shape_vector(&mut fbb, &[-1i32], extent);
-    let name_bias = bias.map(|b| fbb.create_string(&b.name));
-
-    // With a bias the output tensor moves to index 3, because the bias is
-    // appended before it.
-    let out_index = if bias.is_some() { 3i32 } else { 2 };
-    let op_inputs = if bias.is_some() {
-        fbb.create_vector(&[0i32, 1, 2])
+    // TFLite's CONV_2D kernel requires three inputs — `has_bias was not true`
+    // is a hard failure, not a fallback — so a convolution whose source has no
+    // bias still gets one here, as a constant of zeros.
+    let bias_name = bias
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|| "bias".into());
+    let name_bias = fbb.create_string(&bias_name);
+    let zero_bias = if bias.is_none() {
+        let zeros = vec![0u8; (extent.max(1) as usize) * 4];
+        Some(fbb.create_vector(&zeros))
     } else {
-        fbb.create_vector(&[0i32, 1])
+        None
     };
+
+    // Always three inputs and the output at index 3. When the bias is
+    // synthesised it is a constant, so it is not a graph input.
+    let out_index = 3i32;
+    let op_inputs = fbb.create_vector(&[0i32, 1, 2]);
     let op_outputs = fbb.create_vector(&[out_index]);
     let sg_inputs = if bias.is_some() {
         fbb.create_vector(&[0i32, 1, 2])
@@ -1668,11 +1700,20 @@ fn build_tflite_conv2d(
     };
     let sg_outputs = fbb.create_vector(&[out_index]);
 
-    // sentinel + input + weight + output, and the bias when there is one
-    let buffer_count = if bias.is_some() { 5 } else { 4 };
+    // sentinel + input + weight + bias + output
     let mut buffer_offsets = Vec::new();
-    for _ in 0..buffer_count {
+    for i in 0..5 {
         let start = fbb.start_table();
+        // Buffer 3 is the bias. When it was synthesised it carries zeros;
+        // when it came from the kernel it is a graph input and stays empty.
+        // Nested rather than a let-chain: those are stable from 1.88 and
+        // this workspace's rust-version is 1.87.
+        #[allow(clippy::collapsible_if)]
+        if i == 3 {
+            if let Some(data) = zero_bias {
+                fbb.push_slot_always(vt::buffer::DATA, data);
+            }
+        }
         buffer_offsets.push(fbb.end_table(start));
     }
     let buffers = fbb.create_vector(&buffer_offsets);
@@ -1693,31 +1734,30 @@ fn build_tflite_conv2d(
         fbb.push_slot_always(vt::tensor::NAME, name_w);
         fbb.end_table(start)
     };
-    let tensor_bias = name_bias.map(|name| {
+    let tensor_bias = {
         let start = fbb.start_table();
         fbb.push_slot_always(vt::tensor::SHAPE, shape_1d);
+        // A synthesised bias is f32 whatever the inputs are; TFLite requires
+        // the bias to match the accumulator, not the operands.
         fbb.push_slot::<i8>(
             vt::tensor::TYPE,
-            onnx_to_tflite_type(bias.expect("name implies binding").elem_type),
+            bias.map_or(tensor_type::FLOAT32, |b| onnx_to_tflite_type(b.elem_type)),
             0,
         );
         fbb.push_slot::<u32>(vt::tensor::BUFFER, 3, 0);
-        fbb.push_slot_always(vt::tensor::NAME, name);
+        fbb.push_slot_always(vt::tensor::NAME, name_bias);
         fbb.end_table(start)
-    });
+    };
 
     let tensor_out = {
         let start = fbb.start_table();
         fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
         fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
-        fbb.push_slot::<u32>(vt::tensor::BUFFER, buffer_count as u32 - 1, 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 4, 0);
         fbb.push_slot_always(vt::tensor::NAME, name_out);
         fbb.end_table(start)
     };
-    let tensors = match tensor_bias {
-        Some(b) => fbb.create_vector(&[tensor_in, tensor_w, b, tensor_out]),
-        None => fbb.create_vector(&[tensor_in, tensor_w, tensor_out]),
-    };
+    let tensors = fbb.create_vector(&[tensor_in, tensor_w, tensor_bias, tensor_out]);
 
     let deprecated_code = if builtin_op::CONV_2D <= 127 {
         builtin_op::CONV_2D as i8
@@ -2083,7 +2123,15 @@ fn build_tflite_attention(
     // Operator codes: BATCH_MATMUL(0), DIV(1), SOFTMAX(2)
     let matmul_code = {
         let start = fbb.start_table();
-        fbb.push_slot::<i8>(vt::operator_code::DEPRECATED_BUILTIN_CODE, 127, 0);
+        // TFLite resolves an operator as `max(builtin_code, deprecated_builtin_code)`,
+        // so 127 here does not mean "read the other field" — it wins, and 127
+        // is PLACEHOLDER_FOR_GREATER_OP_CODES. Writing the real code in both
+        // is what the reader expects for anything that fits in a byte.
+        fbb.push_slot::<i8>(
+            vt::operator_code::DEPRECATED_BUILTIN_CODE,
+            builtin_op::BATCH_MATMUL as i8,
+            0,
+        );
         fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
         fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, builtin_op::BATCH_MATMUL, 0);
         fbb.end_table(start)
