@@ -137,7 +137,7 @@ jobs:
           if-no-files-found: error
 
   sweep:
-    name: Ask the NX729J
+    name: Ask ${{ inputs.phone || 'soc-qti-sm8550-qcom' }}
     needs: models
     # The `soc-*` label picks one handset. Vendor labels are not enough: two
     # Snapdragons share them, and one of them once served results from a stale
