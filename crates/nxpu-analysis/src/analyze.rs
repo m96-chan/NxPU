@@ -498,6 +498,45 @@ pub enum KernelPattern {
         output: TensorBinding,
         axis: i64,
     },
+    /// A matrix multiplication whose right operand arrives as integer codes
+    /// with one scale per output channel: `output = input @ (weight * scale)ᵀ`.
+    ///
+    /// This is not [`Self::MatMul`] with an odd element type. A dense matmul
+    /// has two operands; this has three, and the third is not a second matrix.
+    /// `scale` carries one factor per *row of the weight*, so it multiplies the
+    /// contraction's result rather than participating in the contraction.
+    /// Lowering it as a MatMul over `weight` and dropping `scale` would produce
+    /// a graph whose every output is wrong by a per-channel factor, which is
+    /// the failure a refusal is preferable to.
+    ///
+    /// The weight's rows are the *output* channels, so the contraction runs
+    /// along the second axis of both operands and the lowerings transpose it.
+    /// That is the layout every quantized kernel in the vendored corpus uses,
+    /// and the one per-channel quantization is defined against: a scale per row
+    /// is a scale per output feature only if a row is an output feature.
+    ///
+    /// `weight` is reported with an element type of `INT8` although the buffer
+    /// the kernel binds is `array<u32>`. Four two's-complement codes are packed
+    /// per word, least-significant byte first, which is the byte layout of a
+    /// contiguous `i8` row. The packing is how the GPU kernel buys four columns
+    /// per memory transaction; it is not part of what the kernel computes, and
+    /// the graph names the codes rather than the words they arrived in.
+    QuantizedMatMul {
+        /// The f32 activations, `[m, k]`.
+        input: TensorBinding,
+        /// The integer codes, `[n, k]` — one row per output channel.
+        weight: TensorBinding,
+        /// f32, `[n]` — one scale per weight row, applied after the contraction.
+        scale: TensorBinding,
+        /// A per-output-channel addend the kernel fuses onto the result.
+        ///
+        /// `matvec/q8_residual` adds a residual after the row scale. Optional
+        /// because a quantized matmul need not have one, not because dropping
+        /// it is acceptable — the same rule [`Self::Conv2D`]'s bias carries.
+        bias: Option<TensorBinding>,
+        output: TensorBinding,
+        shape: MatMulShape,
+    },
     /// Unrecognized pattern — classification could not determine a known op.
     Unknown { reason: String },
 }
@@ -506,6 +545,10 @@ impl fmt::Display for KernelPattern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MatMul { shape, .. } => write!(f, "{shape}"),
+            Self::QuantizedMatMul { shape, bias, .. } => {
+                let fused = if bias.is_some() { " + bias" } else { "" };
+                write!(f, "Quantized{shape} (int8, per-channel scale){fused}")
+            }
             Self::ElementWise { op, .. } => write!(f, "{op}"),
             Self::ElementWiseChain { cast, steps, .. } => f.write_str(&chain_summary(*cast, steps)),
             Self::Conv2D { shape, .. } => write!(f, "{shape}"),
@@ -846,6 +889,24 @@ pub fn pattern_op_names(pattern: &KernelPattern) -> Vec<String> {
             .map(String::from)
             .collect(),
         KernelPattern::MatMul { .. } => vec!["MatMul".into()],
+        // Named by the nodes the backends emit, the same rule the chain
+        // follows. Neither output format has a fused quantized-matmul
+        // operator and neither backend emits one: the weight is dequantized,
+        // transposed into contraction order, and multiplied. A vendor matrix
+        // that does not list `DequantizeLinear` is telling the truth about
+        // that hardware, and answering only "MatMul" here would hide two of
+        // the nodes the graph contains.
+        KernelPattern::QuantizedMatMul { bias, .. } => {
+            let mut names = vec![
+                "Transpose".to_string(),
+                "DequantizeLinear".to_string(),
+                "MatMul".to_string(),
+            ];
+            if bias.is_some() {
+                names.push("Add".to_string());
+            }
+            names
+        }
         KernelPattern::ElementWise { op, .. } => vec![op.op_name().into()],
         KernelPattern::Conv2D { .. } => vec!["Conv".into()],
         KernelPattern::Pool { kind, .. } => vec![kind.op_name().into()],
@@ -945,6 +1006,7 @@ pub fn classify_entry_point(
     let mut outputs: Vec<(Handle<GlobalVariable>, &GlobalVariable)> = Vec::new();
     let mut init_globals: Vec<(Handle<GlobalVariable>, &GlobalVariable)> = Vec::new();
     let mut params_members: Option<&[nxpu_ir::StructMember]> = None;
+    let mut params_global: Option<Handle<GlobalVariable>> = None;
 
     for (handle, gv) in module.global_variables.iter() {
         match &gv.space {
@@ -958,6 +1020,7 @@ pub fn classify_entry_point(
             AddressSpace::Uniform => {
                 if let TypeInner::Struct { members, .. } = &module.types[gv.ty].inner {
                     params_members = Some(members);
+                    params_global = Some(handle);
                 }
             }
             _ => {
@@ -987,6 +1050,18 @@ pub fn classify_entry_point(
                 .iter()
                 .filter(|m| is_integer_member(module, m))
                 .filter_map(|m| m.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Every member's name, by position, so an index read out of the IR names
+    // the right one. `shape_names` above has the non-integer members filtered
+    // out and so cannot be indexed by member position.
+    let param_names: Vec<String> = params_members
+        .map(|members| {
+            members
+                .iter()
+                .map(|m| m.name.clone().unwrap_or_default())
                 .collect()
         })
         .unwrap_or_default();
@@ -1191,8 +1266,29 @@ pub fn classify_entry_point(
         ));
     }
 
-    // 3+ inputs: check for Attention, Normalization, Scatter
+    // 3+ inputs: check for a quantized matmul, Attention, Normalization, Scatter
     if num_inputs >= 3 {
+        // First, because it is the most specific thing here: a kernel that
+        // unpacks integer codes out of a weight buffer is not any of the
+        // patterns below, and the ones it is not go on to be tested normally
+        // because this returns `None` for a kernel that unpacks nothing.
+        //
+        // Only in this arm. The corpus's quantized kernels bind a weight, a
+        // scale and an activation at least, so none of them arrives with two
+        // inputs, and `dequant_transpose` — which does unpack codes with two
+        // inputs — is a movement of values that this pattern would misread.
+        if let Some(pattern) = match_quantized_matmul(
+            module,
+            ep,
+            &inputs,
+            &outputs,
+            params_global,
+            &param_names,
+            &shape_names,
+        ) {
+            return Ok(pattern);
+        }
+
         // Attention heuristic: 3 inputs + has loop + contains Exp + Sqrt.
         // NOTE: This is fragile — any 3-input kernel with loop + exp() + sqrt()
         // will match. A false positive is possible for custom kernels that
@@ -1679,6 +1775,841 @@ pub fn classify_entry_point(
         output: output_c,
         shape,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Quantized matrix multiplication
+//
+// The six quantized kernels in the vendored corpus all reached the classifier
+// with three or more inputs and no recogniser, because there was no pattern
+// that could carry a weight arriving as integer codes plus the scale that
+// turns them back into numbers. What follows is the evidence that a kernel is
+// one, keyed on what it computes rather than on how many buffers it binds:
+//
+//   1. It unpacks a field out of a word loaded from a storage buffer. That is
+//      `extractBits`, and nothing else in the corpus does it inside a loop.
+//   2. The unpacked code meets a value out of another buffer in a multiply —
+//      either the activation it is contracted against, or the scale that
+//      dequantizes it. Codes unpacked and never multiplied are not a matmul.
+//   3. A buffer is read at *exactly* the index that selects the weight's row.
+//      That is the definition of a per-channel scale, and it is also the test
+//      that separates the two kernels this can represent from the two it
+//      cannot: `q4_g128`'s scale is read at `row * groups + k / 128`, which
+//      contains the row and is not the row, and a scale that varies along the
+//      contraction is a block-wise scale that neither output format expresses.
+// ---------------------------------------------------------------------------
+
+/// One unpacking of an integer code out of a packed weight buffer.
+struct PackedCodes {
+    /// The storage buffer the packed word was loaded from.
+    weight: Handle<GlobalVariable>,
+    /// The index the packed word was loaded at.
+    address: Handle<Expression>,
+    /// The field width `extractBits` was asked for, in bits.
+    code_bits: u32,
+    /// The unpacked code, as an expression of the entry point.
+    value: Handle<Expression>,
+}
+
+/// Functions that exist to pull one integer code out of a packed word.
+///
+/// Returned as (function, which argument holds the word, how wide the code is).
+/// Every quantized kernel in the corpus spells the unpack as a helper —
+/// `unpack_i8`, `unpack_i4` — and nothing inlines it, so looking only at the
+/// entry point's own expressions finds no `extractBits` at all.
+fn packed_code_helpers(module: &Module) -> Vec<(Handle<nxpu_ir::Function>, u32, u32)> {
+    let mut found = Vec::new();
+    for (handle, func) in module.functions.iter() {
+        for (_, expr) in func.expressions.iter() {
+            let Expression::Math {
+                fun: MathFunction::ExtractBits,
+                arg,
+                arg2: Some(width),
+                ..
+            } = expr
+            else {
+                continue;
+            };
+            // The word reaches `extractBits` through a bitcast: the codes are
+            // two's complement, and a signed base is what makes the extract
+            // sign-extend rather than mask.
+            let Expression::FunctionArgument(index) =
+                func.expressions[strip_casts(&func.expressions, *arg)]
+            else {
+                continue;
+            };
+            if let Some(bits) = literal_u32(&func.expressions, *width) {
+                found.push((handle, index, bits));
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Every place the entry point unpacks a code out of one of `inputs`.
+fn find_packed_codes(
+    module: &Module,
+    ep: &nxpu_ir::EntryPoint,
+    inputs: &[Handle<GlobalVariable>],
+) -> Vec<PackedCodes> {
+    fn walk(
+        body: &[Statement],
+        exprs: &Arena<Expression>,
+        helpers: &[(Handle<nxpu_ir::Function>, u32, u32)],
+        inputs: &[Handle<GlobalVariable>],
+        out: &mut Vec<PackedCodes>,
+    ) {
+        for stmt in body {
+            match stmt {
+                Statement::Call {
+                    function,
+                    arguments,
+                    result: Some(value),
+                } => {
+                    let Some(&(_, arg_index, code_bits)) =
+                        helpers.iter().find(|(f, ..)| f == function)
+                    else {
+                        continue;
+                    };
+                    let Some(&word) = arguments.get(arg_index as usize) else {
+                        continue;
+                    };
+                    if let Some((weight, address)) = input_load(exprs, word, inputs) {
+                        out.push(PackedCodes {
+                            weight,
+                            address,
+                            code_bits,
+                            value: *value,
+                        });
+                    }
+                }
+                Statement::If { accept, reject, .. } => {
+                    walk(accept, exprs, helpers, inputs, out);
+                    walk(reject, exprs, helpers, inputs, out);
+                }
+                Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    walk(body, exprs, helpers, inputs, out);
+                    walk(continuing, exprs, helpers, inputs, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let exprs = &ep.function.expressions;
+    let mut out = Vec::new();
+
+    // The unpack written inline, without a helper. No kernel in the corpus
+    // spells it this way, but the pattern is about what is computed and a
+    // kernel that inlines its own `extractBits` computes the same thing.
+    for (handle, expr) in exprs.iter() {
+        let Expression::Math {
+            fun: MathFunction::ExtractBits,
+            arg,
+            arg2: Some(width),
+            ..
+        } = expr
+        else {
+            continue;
+        };
+        let Some(bits) = literal_u32(exprs, *width) else {
+            continue;
+        };
+        if let Some((weight, address)) = input_load(exprs, strip_casts(exprs, *arg), inputs) {
+            out.push(PackedCodes {
+                weight,
+                address,
+                code_bits: bits,
+                value: handle,
+            });
+        }
+    }
+
+    walk(
+        &ep.function.body,
+        exprs,
+        &packed_code_helpers(module),
+        inputs,
+        &mut out,
+    );
+    out
+}
+
+/// If `handle` loads out of one of `inputs`, which buffer and at which index.
+fn input_load(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    inputs: &[Handle<GlobalVariable>],
+) -> Option<(Handle<GlobalVariable>, Handle<Expression>)> {
+    let Expression::Load { pointer } = exprs.try_get(strip_casts(exprs, handle))? else {
+        return None;
+    };
+    let Expression::Access { base, index } = exprs.try_get(*pointer)? else {
+        return None;
+    };
+    let global = access_base_global(exprs, *base)?;
+    inputs.contains(&global).then_some((global, *index))
+}
+
+/// A `u32` literal, in either of the spellings a bit width arrives in.
+fn literal_u32(exprs: &Arena<Expression>, handle: Handle<Expression>) -> Option<u32> {
+    match exprs.try_get(handle)? {
+        Expression::Literal(Literal::U32(n)) => Some(*n),
+        Expression::Literal(Literal::I32(n)) if *n >= 0 => Some(*n as u32),
+        Expression::Literal(Literal::AbstractInt(n)) if *n >= 0 => Some(*n as u32),
+        _ => None,
+    }
+}
+
+/// The two factors of the multiply in `a * b + c`, in either spelling.
+///
+/// `-O0` writes the multiply and the add as separate expressions; `FmaFusion`
+/// at `-O1` rewrites them into one `fma`, and it does so for the *integer*
+/// address arithmetic as well as for the float arithmetic — the weight address
+/// `row * words_per_row + word_index` is a `Binary(Add, Binary(Mul, ..), ..)`
+/// at `-O0` and a `Math(Fma, ..)` at `-O2`. Reading only one of the two is how
+/// a classifier comes to give different answers at different levels.
+fn multiply_factors(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+) -> Option<(Handle<Expression>, Handle<Expression>)> {
+    match exprs.try_get(handle)? {
+        Expression::Math {
+            fun: MathFunction::Fma,
+            arg,
+            arg1: Some(b),
+            ..
+        } => Some((*arg, *b)),
+        Expression::Binary {
+            op: BinaryOp::Multiply,
+            left,
+            right,
+        } => Some((*left, *right)),
+        Expression::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => multiply_factors(exprs, *left).or_else(|| multiply_factors(exprs, *right)),
+        _ => None,
+    }
+}
+
+/// The addend of `a * b + c`, in either spelling. `None` when there is no add.
+fn multiply_addend(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+) -> Option<Handle<Expression>> {
+    match exprs.try_get(handle)? {
+        Expression::Math {
+            fun: MathFunction::Fma,
+            arg2: Some(c),
+            ..
+        } => Some(*c),
+        Expression::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => {
+            if multiply_factors(exprs, *left).is_some() {
+                Some(*right)
+            } else if multiply_factors(exprs, *right).is_some() {
+                Some(*left)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Are these two expressions the same computation?
+///
+/// Handle equality alone is not enough. `-O1` runs common-subexpression
+/// elimination, so an index spelled by two handles before it is spelled by one
+/// after, and a test that compared handles would answer differently at the two
+/// levels about the same kernel.
+fn same_expression(
+    exprs: &Arena<Expression>,
+    a: Handle<Expression>,
+    b: Handle<Expression>,
+    depth: u32,
+) -> bool {
+    if a == b {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let (Some(ea), Some(eb)) = (exprs.try_get(a), exprs.try_get(b)) else {
+        return false;
+    };
+    let same =
+        |x: Handle<Expression>, y: Handle<Expression>| same_expression(exprs, x, y, depth - 1);
+    let same_opt = |x: &Option<Handle<Expression>>, y: &Option<Handle<Expression>>| match (x, y) {
+        (None, None) => true,
+        (Some(x), Some(y)) => same_expression(exprs, *x, *y, depth - 1),
+        _ => false,
+    };
+    match (ea, eb) {
+        (Expression::Literal(x), Expression::Literal(y)) => same_literal(x, y),
+        (Expression::FunctionArgument(x), Expression::FunctionArgument(y)) => x == y,
+        (Expression::GlobalVariable(x), Expression::GlobalVariable(y)) => x == y,
+        (Expression::LocalVariable(x), Expression::LocalVariable(y)) => x == y,
+        (Expression::CallResult(x), Expression::CallResult(y)) => x == y,
+        (Expression::Load { pointer: x }, Expression::Load { pointer: y }) => same(*x, *y),
+        (
+            Expression::Access {
+                base: xb,
+                index: xi,
+            },
+            Expression::Access {
+                base: yb,
+                index: yi,
+            },
+        ) => same(*xb, *yb) && same(*xi, *yi),
+        (
+            Expression::AccessIndex {
+                base: xb,
+                index: xi,
+            },
+            Expression::AccessIndex {
+                base: yb,
+                index: yi,
+            },
+        ) => xi == yi && same(*xb, *yb),
+        (Expression::Unary { op: xo, expr: xe }, Expression::Unary { op: yo, expr: ye }) => {
+            xo == yo && same(*xe, *ye)
+        }
+        (
+            Expression::Binary {
+                op: xo,
+                left: xl,
+                right: xr,
+            },
+            Expression::Binary {
+                op: yo,
+                left: yl,
+                right: yr,
+            },
+        ) => xo == yo && same(*xl, *yl) && same(*xr, *yr),
+        (
+            Expression::As {
+                expr: xe,
+                kind: xk,
+                convert: xc,
+            },
+            Expression::As {
+                expr: ye,
+                kind: yk,
+                convert: yc,
+            },
+        ) => xk == yk && xc == yc && same(*xe, *ye),
+        (
+            Expression::Math {
+                fun: xf,
+                arg: xa,
+                arg1: xa1,
+                arg2: xa2,
+                arg3: xa3,
+            },
+            Expression::Math {
+                fun: yf,
+                arg: ya,
+                arg1: ya1,
+                arg2: ya2,
+                arg3: ya3,
+            },
+        ) => {
+            xf == yf
+                && same(*xa, *ya)
+                && same_opt(xa1, ya1)
+                && same_opt(xa2, ya2)
+                && same_opt(xa3, ya3)
+        }
+        _ => false,
+    }
+}
+
+/// `Literal` carries an `f32`, so it cannot derive `PartialEq`; bit equality is
+/// the right test for two spellings of the same constant anyway.
+fn same_literal(a: &Literal, b: &Literal) -> bool {
+    match (a, b) {
+        (Literal::Bool(x), Literal::Bool(y)) => x == y,
+        (Literal::I32(x), Literal::I32(y)) => x == y,
+        (Literal::U32(x), Literal::U32(y)) => x == y,
+        (Literal::F32(x), Literal::F32(y)) => x.to_bits() == y.to_bits(),
+        (Literal::F64(x), Literal::F64(y)) => x.to_bits() == y.to_bits(),
+        (Literal::AbstractInt(x), Literal::AbstractInt(y)) => x == y,
+        (Literal::AbstractFloat(x), Literal::AbstractFloat(y)) => x.to_bits() == y.to_bits(),
+        _ => false,
+    }
+}
+
+/// Does `haystack` compute `needle` somewhere inside it?
+///
+/// Iterative with a visited set, for [`reads_global`]'s reason: an expression
+/// arena is a DAG, and an address built from shared subexpressions — which
+/// every one of these addresses is, after `-O1` runs common-subexpression
+/// elimination — is walked exponentially by the naive spelling.
+fn expression_contains(
+    exprs: &Arena<Expression>,
+    haystack: Handle<Expression>,
+    needle: Handle<Expression>,
+) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![haystack];
+    while let Some(handle) = stack.pop() {
+        if !seen.insert(handle.index()) {
+            continue;
+        }
+        if same_expression(exprs, handle, needle, EXPR_MATCH_DEPTH) {
+            return true;
+        }
+        if let Some(expr) = exprs.try_get(handle) {
+            push_operands(expr, &mut stack);
+        }
+    }
+    false
+}
+
+/// How deep [`same_expression`] walks.
+///
+/// An address is a handful of nodes; the limit is here so a cyclic or
+/// pathological arena cannot make classification hang, which is a property the
+/// corpus test asserts.
+const EXPR_MATCH_DEPTH: u32 = 24;
+
+/// One load out of a storage input.
+struct InputLoad {
+    global: Handle<GlobalVariable>,
+    index: Handle<Expression>,
+    value: Handle<Expression>,
+}
+
+/// Every load out of one of `inputs`, anywhere in the entry point.
+fn collect_input_loads(
+    exprs: &Arena<Expression>,
+    inputs: &[Handle<GlobalVariable>],
+) -> Vec<InputLoad> {
+    exprs
+        .iter()
+        .filter_map(|(handle, expr)| {
+            let Expression::Load { pointer } = expr else {
+                return None;
+            };
+            let Expression::Access { base, index } = exprs.try_get(*pointer)? else {
+                return None;
+            };
+            let global = access_base_global(exprs, *base)?;
+            inputs.contains(&global).then_some(InputLoad {
+                global,
+                index: *index,
+                value: handle,
+            })
+        })
+        .collect()
+}
+
+/// The members of the uniform params struct this expression reads.
+fn uniform_members_read(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    params: Option<Handle<GlobalVariable>>,
+) -> Vec<u32> {
+    let Some(params) = params else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut members = Vec::new();
+    let mut stack = vec![handle];
+    while let Some(handle) = stack.pop() {
+        if !seen.insert(handle.index()) {
+            continue;
+        }
+        let Some(expr) = exprs.try_get(handle) else {
+            continue;
+        };
+        #[allow(clippy::collapsible_if)]
+        if let Expression::AccessIndex { base, index } = expr {
+            if matches!(exprs.try_get(*base), Some(Expression::GlobalVariable(g)) if *g == params)
+                && !members.contains(index)
+            {
+                members.push(*index);
+            }
+        }
+        push_operands(expr, &mut stack);
+    }
+    members
+}
+
+/// The one store into `output`, as (index written, value stored).
+///
+/// Not [`find_lone_store`]: every one of these kernels also writes workgroup
+/// memory, several times, and the store that says what the kernel produces is
+/// the one that lands in the output buffer.
+fn find_store_into(
+    body: &[Statement],
+    exprs: &Arena<Expression>,
+    output: Handle<GlobalVariable>,
+) -> Option<(Handle<Expression>, Handle<Expression>)> {
+    fn walk(
+        body: &[Statement],
+        exprs: &Arena<Expression>,
+        output: Handle<GlobalVariable>,
+        found: &mut Vec<(Handle<Expression>, Handle<Expression>)>,
+    ) {
+        for stmt in body {
+            match stmt {
+                Statement::Store { pointer, value } => {
+                    if access_base_global(exprs, *pointer) == Some(output) {
+                        match exprs.try_get(*pointer) {
+                            Some(Expression::Access { index, .. }) => found.push((*index, *value)),
+                            _ => found.push((*pointer, *value)),
+                        }
+                    }
+                }
+                Statement::If { accept, reject, .. } => {
+                    walk(accept, exprs, output, found);
+                    walk(reject, exprs, output, found);
+                }
+                Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    walk(body, exprs, output, found);
+                    walk(continuing, exprs, output, found);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(body, exprs, output, &mut found);
+    match found.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    }
+}
+
+/// Recognise a matrix multiplication against packed integer weight codes.
+///
+/// `None` when the kernel unpacks nothing, so every other pattern is still on
+/// the table. `Some(Unknown { .. })` when it does unpack codes but into a shape
+/// no backend here can emit — a refusal that names the format is worth more
+/// than a graph that runs and computes something else.
+fn match_quantized_matmul(
+    module: &Module,
+    ep: &nxpu_ir::EntryPoint,
+    inputs: &[(Handle<GlobalVariable>, &GlobalVariable)],
+    outputs: &[(Handle<GlobalVariable>, &GlobalVariable)],
+    params_global: Option<Handle<GlobalVariable>>,
+    // `param_names` is every params-struct member's name, indexed by member
+    // position, so an index read out of the IR names the right one.
+    // `shape_names` is the integer members only — `eps` sits in the same struct
+    // and is not a dimension, so it must not be a candidate extent.
+    param_names: &[String],
+    shape_names: &[String],
+) -> Option<KernelPattern> {
+    let exprs = &ep.function.expressions;
+    let input_handles: Vec<Handle<GlobalVariable>> = inputs.iter().map(|(h, _)| *h).collect();
+    let codes = find_packed_codes(module, ep, &input_handles);
+    if codes.is_empty() {
+        return None;
+    }
+    let refuse = |reason: String| Some(KernelPattern::Unknown { reason });
+
+    // One packed weight. `matvec/q8_ffn` unpacks two — a gate projection and
+    // an up projection sharing one activation, with a SiLU and a multiply on
+    // top. That is two quantized matmuls and two more operators, not one
+    // matmul with a wider weight, and this carries one of each.
+    let weights = dedup_globals(codes.iter().map(|c| c.weight));
+    if weights.len() != 1 {
+        return refuse(format!(
+            "{} separate packed weight buffers unpacked in one kernel — several \
+             quantized projections fused together, which needs a pattern per \
+             projection and an operator for whatever combines them; this one \
+             carries a single weight, a single scale and a single contraction",
+            weights.len()
+        ));
+    }
+    let weight_handle = weights[0];
+    let code_bits = codes[0].code_bits;
+    if codes.iter().any(|c| c.code_bits != code_bits) {
+        return refuse(
+            "the packed weight is unpacked at two different code widths, so no \
+             single element type describes it"
+                .into(),
+        );
+    }
+    if outputs.len() != 1 {
+        return refuse(format!(
+            "a quantized matmul writes one result and this kernel writes {}",
+            outputs.len()
+        ));
+    }
+    if !has_loop(&ep.function.body) {
+        return refuse(
+            "integer codes unpacked without a loop — there is no contraction \
+             here, so this is a dequantization rather than a matmul"
+                .into(),
+        );
+    }
+
+    // The unpacked code has to meet a value out of a buffer in a multiply:
+    // the activation it is contracted against, or the scale that turns it back
+    // into a number. Codes unpacked and never multiplied are something else.
+    let loads = collect_input_loads(exprs, &input_handles);
+    let multiplied = exprs.iter().any(|(_, expr)| {
+        let Some((a, b)) = (match expr {
+            Expression::Binary {
+                op: BinaryOp::Multiply,
+                left,
+                right,
+            } => Some((*left, *right)),
+            Expression::Math {
+                fun: MathFunction::Fma,
+                arg,
+                arg1: Some(b),
+                ..
+            } => Some((*arg, *b)),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let is_code = |h: Handle<Expression>| {
+            codes
+                .iter()
+                .any(|c| same_expression(exprs, strip_casts(exprs, h), c.value, EXPR_MATCH_DEPTH))
+        };
+        let is_input = |h: Handle<Expression>| {
+            let h = strip_casts(exprs, h);
+            loads.iter().any(|l| l.value == h)
+        };
+        (is_code(a) && is_input(b)) || (is_code(b) && is_input(a))
+    });
+    if !multiplied {
+        return refuse(
+            "integer codes unpacked but never multiplied by a value from another \
+             buffer — nothing dequantizes them and nothing contracts them"
+                .into(),
+        );
+    }
+
+    // The weight's address is `channel * stride + position`. Of the two
+    // factors, the one that reads the params struct is the row stride —
+    // `ceil(K / codes_per_word)` — and the other one selects the row.
+    let Some((f0, f1)) = multiply_factors(exprs, codes[0].address) else {
+        return refuse(
+            "the packed weight is addressed without a row stride, so which axis \
+             of it is an output channel cannot be established"
+                .into(),
+        );
+    };
+    let m0 = uniform_members_read(exprs, f0, params_global);
+    let m1 = uniform_members_read(exprs, f1, params_global);
+    let (channel, stride_members) = match (m0.is_empty(), m1.is_empty()) {
+        (true, false) => (f0, m1),
+        (false, true) => (f1, m0),
+        _ => {
+            return refuse(
+                "the packed weight's row stride cannot be told from its row index \
+                 — both, or neither, are built from the dispatch parameters"
+                    .into(),
+            );
+        }
+    };
+    let [k_member] = stride_members[..] else {
+        return refuse(
+            "the packed weight's row stride is built from more than one dispatch \
+             parameter, so the contracted extent is not named by any one of them"
+                .into(),
+        );
+    };
+    let Some(k_name) = param_names.get(k_member as usize).cloned() else {
+        return refuse(
+            "the packed weight's row stride reads a dispatch parameter with no name".into(),
+        );
+    };
+
+    // The output store, and the addend fused onto it if there is one.
+    let output_handle = outputs[0].0;
+    let Some((store_index, store_value)) = find_store_into(&ep.function.body, exprs, output_handle)
+    else {
+        return refuse(
+            "the result is written in more than one place, so what this kernel \
+             produces is not one matmul"
+                .into(),
+        );
+    };
+    let bias_load = multiply_addend(exprs, store_value).and_then(|addend| {
+        let addend = strip_casts(exprs, addend);
+        loads.iter().find(|l| {
+            l.value == addend && same_expression(exprs, l.index, store_index, EXPR_MATCH_DEPTH)
+        })
+    });
+    let bias_handle = bias_load.map(|l| l.global);
+
+    // The per-channel scale: read at *exactly* the index that selects the
+    // weight's row. A scale read at anything wider varies along the
+    // contraction, which is a block-wise scale — see the refusal below.
+    let per_channel: Vec<Handle<GlobalVariable>> = dedup_globals(loads.iter().filter_map(|l| {
+        (l.global != weight_handle
+            && Some(l.global) != bias_handle
+            && same_expression(exprs, l.index, channel, EXPR_MATCH_DEPTH))
+        .then_some(l.global)
+    }));
+    let [scale_handle] = per_channel[..] else {
+        let block_scaled: Vec<Handle<GlobalVariable>> =
+            dedup_globals(loads.iter().filter_map(|l| {
+                (l.global != weight_handle
+                    && !same_expression(exprs, l.index, channel, EXPR_MATCH_DEPTH)
+                    && expression_contains(exprs, l.index, channel))
+                .then_some(l.global)
+            }));
+        if per_channel.is_empty() && !block_scaled.is_empty() {
+            return refuse(format!(
+                "the {code_bits}-bit codes are scaled by a factor read at the \
+                 weight's row *and* the contracted position — one scale per block \
+                 of columns rather than one per output channel. Per-channel \
+                 quantization is what `DequantizeLinear` with an axis and what a \
+                 TFLite per-channel tensor express; a block-wise scale needs a \
+                 blocked dequantization neither backend here emits"
+            ));
+        }
+        return refuse(format!(
+            "{} buffers are read at exactly the weight's row index, and a \
+             quantized matmul has one such buffer — the per-channel scale",
+            per_channel.len()
+        ));
+    };
+
+    // Only int8 survives. A 4-bit code is an INT4 tensor: ONNX has one from
+    // opset 21 and this backend declares 13, and the TFLite writer here has no
+    // sub-byte tensor type at all. Widening the codes to int8 on the way out
+    // would be a different graph with a weight four times the size, which is
+    // not what the kernel was written to run.
+    if code_bits != 8 {
+        return refuse(format!(
+            "{code_bits}-bit weight codes. The formats this compiler writes carry \
+             int8 weights; a {code_bits}-bit one needs a sub-byte tensor type — \
+             ONNX INT4 arrived in opset 21 and this backend emits 13, and the \
+             TFLite writer here has no sub-byte type"
+        ));
+    }
+
+    // Whatever is left is the activation, and there has to be exactly one of
+    // it. Counting the inputs is not what decided any of the roles above; this
+    // is the check that every input was accounted for by one of them.
+    let assigned = [Some(weight_handle), Some(scale_handle), bias_handle];
+    let rest: Vec<&(Handle<GlobalVariable>, &GlobalVariable)> = inputs
+        .iter()
+        .filter(|(h, _)| !assigned.contains(&Some(*h)))
+        .collect();
+    let [(activation_handle, activation_gv)] = rest[..] else {
+        return refuse(format!(
+            "{} buffers are left over once the weight, its scale and its addend \
+             are accounted for, and a quantized matmul contracts against one set \
+             of activations",
+            rest.len()
+        ));
+    };
+    let input = make_binding(module, *activation_handle, activation_gv, TensorRole::Input);
+    if input.elem_type != data_type::FLOAT {
+        return refuse(
+            "the activations are not f32, so the contraction is integer on both \
+             sides — an integer matmul with its own accumulator width, which this \
+             pattern does not describe"
+                .into(),
+        );
+    }
+
+    // The shape. `k` is already known from the weight's row stride. The output
+    // store says the rest: `output[row * M + col]` names `M` as the number of
+    // output channels, and a store at the row index alone is one row of
+    // results, so `m` is 1.
+    let (n_name, m_name) = if let Some((g0, g1)) = multiply_factors(exprs, store_index) {
+        let n0 = uniform_members_read(exprs, g0, params_global);
+        let n1 = uniform_members_read(exprs, g1, params_global);
+        let members = match (n0.is_empty(), n1.is_empty()) {
+            (true, false) => n1,
+            (false, true) => n0,
+            _ => Vec::new(),
+        };
+        let [n_member] = members[..] else {
+            return refuse(
+                "the result's row stride is not a single dispatch parameter, so \
+                 the number of output channels is not named"
+                    .into(),
+            );
+        };
+        let Some(n_name) = param_names.get(n_member as usize).cloned() else {
+            return refuse("the result's row stride reads an unnamed parameter".into());
+        };
+        let remaining: Vec<&String> = shape_names
+            .iter()
+            .filter(|p| **p != k_name && **p != n_name)
+            .collect();
+        let [m_name] = remaining[..] else {
+            return refuse(format!(
+                "{} dispatch parameters are left once the contracted extent and \
+                 the output-channel count are named, and the number of rows has \
+                 to be exactly one of them",
+                remaining.len()
+            ));
+        };
+        (n_name, m_name.clone())
+    } else {
+        // The result is written at the row index alone, so it is one row.
+        let remaining: Vec<&String> = shape_names.iter().filter(|p| **p != k_name).collect();
+        let [n_name] = remaining[..] else {
+            return refuse(format!(
+                "the result is one row, so the remaining dispatch parameter is \
+                 the output-channel count — and {} remain",
+                remaining.len()
+            ));
+        };
+        (n_name.clone(), "1".to_string())
+    };
+
+    // The codes, not the words they arrived in: four two's-complement bytes
+    // per `u32`, least-significant first, is the byte layout of a contiguous
+    // int8 row, and int8 is what the graph's consumer has to be told it holds.
+    let weight_gv = inputs.iter().find(|(h, _)| *h == weight_handle)?.1;
+    let mut weight = make_binding(module, weight_handle, weight_gv, TensorRole::Input);
+    weight.elem_type = data_type::INT8;
+    let scale_gv = inputs.iter().find(|(h, _)| *h == scale_handle)?.1;
+    let bias = bias_handle.and_then(|h| {
+        inputs
+            .iter()
+            .find(|(g, _)| *g == h)
+            .map(|(g, gv)| make_binding(module, *g, gv, TensorRole::Input))
+    });
+
+    Some(KernelPattern::QuantizedMatMul {
+        input,
+        weight,
+        scale: make_binding(module, scale_handle, scale_gv, TensorRole::Input),
+        bias,
+        output: make_binding(module, outputs[0].0, outputs[0].1, TensorRole::Output),
+        shape: MatMulShape {
+            m: m_name,
+            n: n_name,
+            k: k_name,
+        },
+    })
+}
+
+/// Collect handles, dropping repeats and keeping the order they arrived in.
+fn dedup_globals(it: impl Iterator<Item = Handle<GlobalVariable>>) -> Vec<Handle<GlobalVariable>> {
+    let mut out: Vec<Handle<GlobalVariable>> = Vec::new();
+    for h in it {
+        if !out.contains(&h) {
+            out.push(h);
+        }
+    }
+    out
 }
 
 /// Extract literal U32 values from loop break conditions.

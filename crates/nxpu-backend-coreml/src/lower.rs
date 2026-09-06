@@ -194,6 +194,20 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<Model, Back
                 nxpu_analysis::analyze::chain_summary(*cast, steps)
             )));
         }
+        // Four MIL operations — a dequantize, a transpose, a matmul and
+        // sometimes an add — where this builder emits one, and one of the
+        // operands is int8 while the feature descriptions below are written
+        // from a single element type. CoreML has `constexpr_affine_dequantize`
+        // for exactly this shape, but only for a *constant* weight, and here
+        // the weight and its scales are supplied per dispatch.
+        KernelPattern::QuantizedMatMul { .. } => {
+            return Err(BackendError::Unsupported(
+                "cannot lower a quantized matmul to CoreML: it is several MIL \
+                 operations over operands of two element types, and this builder \
+                 emits one operation per entry point"
+                    .into(),
+            ));
+        }
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
                 "cannot lower Unknown pattern to CoreML: {reason}"

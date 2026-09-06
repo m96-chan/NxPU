@@ -234,6 +234,17 @@ fn pattern_summary(pattern: &analyze::KernelPattern) -> std::borrow::Cow<'static
             return Cow::Owned(analyze::chain_summary(*cast, steps));
         }
         analyze::KernelPattern::MatMul { .. } => "BATCH_MATMUL",
+        // Named by the whole graph rather than by its last operator: there is
+        // no quantized matmul operator here, and reporting "BATCH_MATMUL"
+        // would describe one node out of five and hide the dequantization
+        // that makes the answer right.
+        analyze::KernelPattern::QuantizedMatMul { bias, .. } => {
+            if bias.is_some() {
+                "TRANSPOSE+CAST+BATCH_MATMUL+MUL+ADD (int8 weights, per-channel scale)"
+            } else {
+                "TRANSPOSE+CAST+BATCH_MATMUL+MUL (int8 weights, per-channel scale)"
+            }
+        }
         analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
         analyze::KernelPattern::Conv2D { .. } => "CONV_2D",
         analyze::KernelPattern::Pool { kind, .. } => kind.op_name(),

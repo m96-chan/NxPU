@@ -83,9 +83,9 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
                 extent,
             )
         }
-        // Several operators, so it goes through the multi-op builder rather
+        // Several operators, so these go through the multi-op builder rather
         // than through `build_tflite`, which emits exactly one.
-        KernelPattern::ElementWiseChain { .. } => {
+        KernelPattern::ElementWiseChain { .. } | KernelPattern::QuantizedMatMul { .. } => {
             let desc = collect_single_graph(pattern)?;
             build_from_graph_desc(&desc, extent)
         }
@@ -282,7 +282,11 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
                 elem_type: data_type::INT32,
                 ..indices.clone()
             };
-            build_tflite_scatter(&indices_i32, output, &[-1i32], &[-1i32], updates, extent)
+            // SCATTER_ND checks its operands against each other:
+            // `updates.rank - outer_dims == shape.Dims(0) - indices.Dims(last)`.
+            // For a flat output that balances when the indices are `[N, 1]` —
+            // N index vectors of length one — and the updates are `[N]`.
+            build_tflite_scatter(&indices_i32, output, &[-1i32, 1], &[-1i32], updates, extent)
         }
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
@@ -300,6 +304,37 @@ struct TensorInfo {
     name: String,
     elem_type: i32,
     shape: Vec<i32>,
+    /// Contents, little-endian, for a tensor whose value is fixed at compile
+    /// time — a `TRANSPOSE` permutation, say.
+    ///
+    /// A tensor is constant to TFLite exactly when its buffer carries data,
+    /// and it is a graph input exactly when its index is in `graph_inputs`; a
+    /// constant must be one and not the other, which is the caller's to get
+    /// right. Before this field the only way to write a constant was a bespoke
+    /// builder, which is why there are ten of them below.
+    data: Option<Vec<u8>>,
+}
+
+impl TensorInfo {
+    /// A tensor the caller supplies at inference time.
+    fn input(name: impl Into<String>, elem_type: i32, shape: Vec<i32>) -> Self {
+        Self {
+            name: name.into(),
+            elem_type,
+            shape,
+            data: None,
+        }
+    }
+
+    /// A tensor whose contents are fixed now.
+    fn constant(name: impl Into<String>, elem_type: i32, shape: Vec<i32>, data: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            elem_type,
+            shape,
+            data: Some(data),
+        }
+    }
 }
 
 /// An operator descriptor used when building multi-op TFLite subgraphs.
@@ -359,11 +394,26 @@ fn build_from_graph_desc(desc: &GraphDesc, extent: i32) -> Vec<u8> {
     let sg_inputs_vec = fbb.create_vector(&desc.graph_inputs);
     let sg_outputs_vec = fbb.create_vector(&desc.graph_outputs);
 
+    // --- constant contents, written before the buffer tables that hold them ---
+    //
+    // FlatBuffers cannot start a vector while a table is open, so every
+    // constant's bytes have to exist before the loop below runs.
+    let data_offsets: Vec<Option<_>> = desc
+        .tensors
+        .iter()
+        .map(|t| t.data.as_ref().map(|d| fbb.create_vector(d)))
+        .collect();
+
     // --- buffers: sentinel(0) + one per tensor ---
     let num_tensors = desc.tensors.len();
     let mut buf_offsets = Vec::with_capacity(num_tensors + 1);
-    for _ in 0..=num_tensors {
+    for i in 0..=num_tensors {
         let start = fbb.start_table();
+        // Buffer 0 is the sentinel and holds nothing; buffer i + 1 belongs to
+        // tensor i.
+        if let Some(data) = i.checked_sub(1).and_then(|t| data_offsets[t]) {
+            fbb.push_slot_always(vt::buffer::DATA, data);
+        }
         buf_offsets.push(fbb.end_table(start));
     }
     let buffers_vec = fbb.create_vector(&buf_offsets);
@@ -501,41 +551,13 @@ fn collect_conv_batchnorm_graph(
 
     Ok(GraphDesc {
         tensors: vec![
-            TensorInfo {
-                name: input.name.clone(),
-                elem_type: input.elem_type,
-                shape: shape_4d.clone(),
-            }, // 0
-            TensorInfo {
-                name: weight.name.clone(),
-                elem_type: weight.elem_type,
-                shape: shape_4d.clone(),
-            }, // 1
-            TensorInfo {
-                name: scale.name.clone(),
-                elem_type: scale.elem_type,
-                shape: shape_1d.clone(),
-            }, // 2
-            TensorInfo {
-                name: bias.name.clone(),
-                elem_type: bias.elem_type,
-                shape: shape_1d.clone(),
-            }, // 3
-            TensorInfo {
-                name: "conv_out".into(),
-                elem_type: input.elem_type,
-                shape: shape_4d.clone(),
-            }, // 4
-            TensorInfo {
-                name: "bn_mul".into(),
-                elem_type: input.elem_type,
-                shape: shape_4d.clone(),
-            }, // 5
-            TensorInfo {
-                name: output.name.clone(),
-                elem_type: output.elem_type,
-                shape: shape_4d,
-            }, // 6
+            TensorInfo::input(input.name.clone(), input.elem_type, shape_4d.clone()), // 0
+            TensorInfo::input(weight.name.clone(), weight.elem_type, shape_4d.clone()), // 1
+            TensorInfo::input(scale.name.clone(), scale.elem_type, shape_1d.clone()), // 2
+            TensorInfo::input(bias.name.clone(), bias.elem_type, shape_1d.clone()),   // 3
+            TensorInfo::input("conv_out", input.elem_type, shape_4d.clone()),         // 4
+            TensorInfo::input("bn_mul", input.elem_type, shape_4d.clone()),           // 5
+            TensorInfo::input(output.name.clone(), output.elem_type, shape_4d),       // 6
         ],
         ops: vec![
             OpDesc {
@@ -596,31 +618,23 @@ fn collect_matmul_bias_graph(
 
     Ok(GraphDesc {
         tensors: vec![
-            TensorInfo {
-                name: mm_inputs[0].name.clone(),
-                elem_type: mm_inputs[0].elem_type,
-                shape: shape_2d.clone(),
-            }, // 0: A
-            TensorInfo {
-                name: mm_inputs[1].name.clone(),
-                elem_type: mm_inputs[1].elem_type,
-                shape: shape_2d.clone(),
-            }, // 1: B
-            TensorInfo {
-                name: bias.name.clone(),
-                elem_type: bias.elem_type,
-                shape: shape_1d,
-            }, // 2: bias
-            TensorInfo {
-                name: mm_output.name.clone(),
-                elem_type: mm_output.elem_type,
-                shape: shape_2d.clone(),
-            }, // 3: mm_out
-            TensorInfo {
-                name: output.name.clone(),
-                elem_type: output.elem_type,
-                shape: shape_2d,
-            }, // 4: output
+            TensorInfo::input(
+                mm_inputs[0].name.clone(),
+                mm_inputs[0].elem_type,
+                shape_2d.clone(),
+            ), // 0: A
+            TensorInfo::input(
+                mm_inputs[1].name.clone(),
+                mm_inputs[1].elem_type,
+                shape_2d.clone(),
+            ), // 1: B
+            TensorInfo::input(bias.name.clone(), bias.elem_type, shape_1d), // 2: bias
+            TensorInfo::input(
+                mm_output.name.clone(),
+                mm_output.elem_type,
+                shape_2d.clone(),
+            ), // 3: mm_out
+            TensorInfo::input(output.name.clone(), output.elem_type, shape_2d), // 4: output
         ],
         ops: vec![
             OpDesc {
@@ -656,11 +670,11 @@ fn collect_elementwise_chain_graph(
     let vector = vec![-1i32];
     let scalar: Vec<i32> = Vec::new();
 
-    let mut tensors = vec![TensorInfo {
-        name: base.name.clone(),
-        elem_type: base.elem_type,
-        shape: vector.clone(),
-    }];
+    let mut tensors = vec![TensorInfo::input(
+        base.name.clone(),
+        base.elem_type,
+        vector.clone(),
+    )];
     let mut graph_inputs = vec![0i32];
     let mut ops: Vec<OpDesc> = Vec::new();
     let mut acc = 0i32;
@@ -670,11 +684,11 @@ fn collect_elementwise_chain_graph(
     if let Some(to) = cast {
         acc_type = to;
         let idx = tensors.len() as i32;
-        tensors.push(TensorInfo {
-            name: format!("{}_cast", base.name),
-            elem_type: to,
-            shape: vector.clone(),
-        });
+        tensors.push(TensorInfo::input(
+            format!("{}_cast", base.name),
+            to,
+            vector.clone(),
+        ));
         ops.push(OpDesc {
             opcode: builtin_op::CAST,
             inputs: vec![acc],
@@ -692,33 +706,25 @@ fn collect_elementwise_chain_graph(
         };
         let operand_idx = tensors.len() as i32;
         match &step.operand {
-            ChainOperand::Tensor(t) => tensors.push(TensorInfo {
-                name: t.name.clone(),
-                elem_type: t.elem_type,
-                shape: vector.clone(),
-            }),
-            ChainOperand::Scalar(s) => tensors.push(TensorInfo {
-                name: s.name.clone(),
-                elem_type: s.elem_type,
-                shape: scalar.clone(),
-            }),
+            ChainOperand::Tensor(t) => tensors.push(TensorInfo::input(
+                t.name.clone(),
+                t.elem_type,
+                vector.clone(),
+            )),
+            ChainOperand::Scalar(s) => tensors.push(TensorInfo::input(
+                s.name.clone(),
+                s.elem_type,
+                scalar.clone(),
+            )),
         }
         graph_inputs.push(operand_idx);
 
         let last = i + 1 == steps.len();
         let result_idx = tensors.len() as i32;
         tensors.push(if last {
-            TensorInfo {
-                name: output.name.clone(),
-                elem_type: output.elem_type,
-                shape: vector.clone(),
-            }
+            TensorInfo::input(output.name.clone(), output.elem_type, vector.clone())
         } else {
-            TensorInfo {
-                name: format!("{}_step{i}", output.name),
-                elem_type: acc_type,
-                shape: vector.clone(),
-            }
+            TensorInfo::input(format!("{}_step{i}", output.name), acc_type, vector.clone())
         });
         ops.push(OpDesc {
             opcode,
@@ -743,6 +749,152 @@ fn collect_elementwise_chain_graph(
     })
 }
 
+/// Build a [`GraphDesc`] for a quantized matmul:
+/// `TRANSPOSE → CAST → BATCH_MATMUL → MUL(scale) → ADD(bias)`.
+///
+/// **Why five operators and not one.** TFLite does have per-channel quantized
+/// tensors, and this does not use them, because it cannot: a quantized
+/// tensor's scales live in `Tensor.quantization`, which is model metadata
+/// written when the file is written, and here the scales arrive in a storage
+/// buffer the host fills per dispatch. Baking whatever `--symbolic-dim` says
+/// into that field would be inventing the weights. So the dequantization is
+/// spelled out — the codes are cast to f32 and multiplied by the scale tensor,
+/// which is a graph input like any other.
+///
+/// **Why the scale multiplies after the contraction.** `out[m][n]` is
+/// `sum_k a[m][k] * w[n][k] * scale[n]`, and `scale[n]` does not depend on `k`,
+/// so it comes out of the sum. That is exactly the hoist `matvec/q8.wgsl` does
+/// (`shared_sum[0] * scale[row]`), it saves a multiply per contracted position,
+/// and it lets the scale broadcast over the result's last axis with no reshape:
+/// `[m, n] * [n]` is a TFLite broadcast, `[n, k] * [n]` is not.
+///
+/// **Why the transpose, and why it comes first.** The weight's rows are output
+/// channels, so the contraction runs along its second axis, and `BATCH_MATMUL`
+/// contracts the second operand's *first* axis. `BatchMatMulOptions.adj_y`
+/// would say so in one flag instead, but that options table is a new
+/// `BuiltinOptions` union index and this file's own history says those get
+/// written wrong; a `TRANSPOSE` with a constant permutation is the same graph
+/// out of parts already proven to load. Transposing the codes rather than the
+/// dequantized floats moves a quarter of the bytes, and it is the order the
+/// ONNX graph has to use — onnxruntime's transpose optimizer mis-types a
+/// transpose that sits after a `DequantizeLinear` — so the two backends emit
+/// the same operators in the same order.
+fn collect_quantized_matmul_graph(
+    input: &TensorBinding,
+    weight: &TensorBinding,
+    scale: &TensorBinding,
+    bias: Option<&TensorBinding>,
+    output: &TensorBinding,
+    shape: &nxpu_analysis::analyze::MatMulShape,
+) -> GraphDesc {
+    // A matvec is a matmul over one row, and the classifier says so by naming
+    // the row count `1` rather than a dispatch parameter. That dimension is
+    // known, so it is written rather than left to `--symbolic-dim`.
+    let rows: i32 = if shape.m == "1" { 1 } else { -1 };
+    let matrix = vec![-1i32, -1];
+    let result = vec![rows, -1];
+
+    let mut tensors = vec![
+        TensorInfo::input(input.name.clone(), input.elem_type, vec![rows, -1]),
+        TensorInfo::input(weight.name.clone(), weight.elem_type, matrix.clone()),
+        TensorInfo::input(scale.name.clone(), scale.elem_type, vec![-1i32]),
+    ];
+    let mut graph_inputs = vec![0, 1, 2];
+    if let Some(bias) = bias {
+        tensors.push(TensorInfo::input(
+            bias.name.clone(),
+            bias.elem_type,
+            vec![-1i32],
+        ));
+        graph_inputs.push(3);
+    }
+
+    let perm = tensors.len() as i32;
+    tensors.push(TensorInfo::constant(
+        format!("{}_perm", weight.name),
+        data_type::INT32,
+        vec![2],
+        [1i32, 0].iter().flat_map(|d| d.to_le_bytes()).collect(),
+    ));
+    let transposed = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        format!("{}_contraction_major", weight.name),
+        weight.elem_type,
+        matrix.clone(),
+    ));
+    let dequantized = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        format!("{}_dequantized", weight.name),
+        output.elem_type,
+        matrix,
+    ));
+    let contracted = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        format!("{}_unscaled", output.name),
+        output.elem_type,
+        result.clone(),
+    ));
+
+    let mut ops = vec![
+        OpDesc {
+            opcode: builtin_op::TRANSPOSE,
+            inputs: vec![1, perm],
+            outputs: vec![transposed],
+        },
+        OpDesc {
+            opcode: builtin_op::CAST,
+            inputs: vec![transposed],
+            outputs: vec![dequantized],
+        },
+        OpDesc {
+            opcode: builtin_op::BATCH_MATMUL,
+            inputs: vec![0, dequantized],
+            outputs: vec![contracted],
+        },
+    ];
+
+    // The last operator writes the tensor the kernel's output buffer is named
+    // after, so that whichever of the two it is, the graph's output keeps the
+    // kernel's own name.
+    let scaled = tensors.len() as i32;
+    tensors.push(TensorInfo::input(
+        if bias.is_some() {
+            format!("{}_unbiased", output.name)
+        } else {
+            output.name.clone()
+        },
+        output.elem_type,
+        result.clone(),
+    ));
+    ops.push(OpDesc {
+        opcode: builtin_op::MUL,
+        inputs: vec![contracted, 2],
+        outputs: vec![scaled],
+    });
+    let mut last = scaled;
+    if bias.is_some() {
+        last = tensors.len() as i32;
+        tensors.push(TensorInfo::input(
+            output.name.clone(),
+            output.elem_type,
+            result,
+        ));
+        ops.push(OpDesc {
+            opcode: builtin_op::ADD,
+            inputs: vec![scaled, 3],
+            outputs: vec![last],
+        });
+    }
+
+    GraphDesc {
+        tensors,
+        ops,
+        graph_inputs,
+        graph_outputs: vec![last],
+        graph_name: format!("quantized_matmul_{}x{}x{}", shape.m, shape.n, shape.k),
+    }
+}
+
 /// Build a [`GraphDesc`] for a single [`KernelPattern`].
 ///
 /// Handles the patterns that can be represented as a simple 1-op (or
@@ -759,21 +911,17 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
             let shape_2d = vec![-1i32, -1];
             Ok(GraphDesc {
                 tensors: vec![
-                    TensorInfo {
-                        name: inputs[0].name.clone(),
-                        elem_type: inputs[0].elem_type,
-                        shape: shape_2d.clone(),
-                    },
-                    TensorInfo {
-                        name: inputs[1].name.clone(),
-                        elem_type: inputs[1].elem_type,
-                        shape: shape_2d.clone(),
-                    },
-                    TensorInfo {
-                        name: output.name.clone(),
-                        elem_type: output.elem_type,
-                        shape: shape_2d,
-                    },
+                    TensorInfo::input(
+                        inputs[0].name.clone(),
+                        inputs[0].elem_type,
+                        shape_2d.clone(),
+                    ),
+                    TensorInfo::input(
+                        inputs[1].name.clone(),
+                        inputs[1].elem_type,
+                        shape_2d.clone(),
+                    ),
+                    TensorInfo::input(output.name.clone(), output.elem_type, shape_2d),
                 ],
                 ops: vec![OpDesc {
                     opcode: builtin_op::BATCH_MATMUL,
@@ -785,6 +933,21 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                 graph_name: format!("matmul_{}x{}x{}", shape.m, shape.n, shape.k),
             })
         }
+        KernelPattern::QuantizedMatMul {
+            input,
+            weight,
+            scale,
+            bias,
+            output,
+            shape,
+        } => Ok(collect_quantized_matmul_graph(
+            input,
+            weight,
+            scale,
+            bias.as_ref(),
+            output,
+            shape,
+        )),
         KernelPattern::ElementWise {
             op, inputs, output, ..
         } => {
@@ -797,21 +960,17 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
             let shape_1d = vec![-1i32];
             Ok(GraphDesc {
                 tensors: vec![
-                    TensorInfo {
-                        name: inputs[0].name.clone(),
-                        elem_type: inputs[0].elem_type,
-                        shape: shape_1d.clone(),
-                    },
-                    TensorInfo {
-                        name: inputs[1].name.clone(),
-                        elem_type: inputs[1].elem_type,
-                        shape: shape_1d.clone(),
-                    },
-                    TensorInfo {
-                        name: output.name.clone(),
-                        elem_type: output.elem_type,
-                        shape: shape_1d,
-                    },
+                    TensorInfo::input(
+                        inputs[0].name.clone(),
+                        inputs[0].elem_type,
+                        shape_1d.clone(),
+                    ),
+                    TensorInfo::input(
+                        inputs[1].name.clone(),
+                        inputs[1].elem_type,
+                        shape_1d.clone(),
+                    ),
+                    TensorInfo::input(output.name.clone(), output.elem_type, shape_1d),
                 ],
                 ops: vec![OpDesc {
                     opcode,
@@ -832,21 +991,9 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
             let shape_4d = vec![-1i32, -1, -1, -1];
             Ok(GraphDesc {
                 tensors: vec![
-                    TensorInfo {
-                        name: input.name.clone(),
-                        elem_type: input.elem_type,
-                        shape: shape_4d.clone(),
-                    },
-                    TensorInfo {
-                        name: weight.name.clone(),
-                        elem_type: weight.elem_type,
-                        shape: shape_4d.clone(),
-                    },
-                    TensorInfo {
-                        name: output.name.clone(),
-                        elem_type: output.elem_type,
-                        shape: shape_4d,
-                    },
+                    TensorInfo::input(input.name.clone(), input.elem_type, shape_4d.clone()),
+                    TensorInfo::input(weight.name.clone(), weight.elem_type, shape_4d.clone()),
+                    TensorInfo::input(output.name.clone(), output.elem_type, shape_4d),
                 ],
                 ops: vec![OpDesc {
                     opcode: builtin_op::CONV_2D,
@@ -871,16 +1018,8 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
             let shape_4d = vec![-1i32, -1, -1, -1];
             Ok(GraphDesc {
                 tensors: vec![
-                    TensorInfo {
-                        name: input.name.clone(),
-                        elem_type: input.elem_type,
-                        shape: shape_4d.clone(),
-                    },
-                    TensorInfo {
-                        name: output.name.clone(),
-                        elem_type: output.elem_type,
-                        shape: shape_4d,
-                    },
+                    TensorInfo::input(input.name.clone(), input.elem_type, shape_4d.clone()),
+                    TensorInfo::input(output.name.clone(), output.elem_type, shape_4d),
                 ],
                 ops: vec![OpDesc {
                     opcode,
@@ -909,16 +1048,8 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
             let shape_1d = vec![-1i32];
             Ok(GraphDesc {
                 tensors: vec![
-                    TensorInfo {
-                        name: input.name.clone(),
-                        elem_type: input.elem_type,
-                        shape: shape_1d.clone(),
-                    },
-                    TensorInfo {
-                        name: output.name.clone(),
-                        elem_type: output.elem_type,
-                        shape: shape_1d,
-                    },
+                    TensorInfo::input(input.name.clone(), input.elem_type, shape_1d.clone()),
+                    TensorInfo::input(output.name.clone(), output.elem_type, shape_1d),
                 ],
                 ops: vec![OpDesc {
                     opcode,
@@ -941,16 +1072,8 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
             };
             Ok(GraphDesc {
                 tensors: vec![
-                    TensorInfo {
-                        name: input.name.clone(),
-                        elem_type: input.elem_type,
-                        shape: vec![-1, -1],
-                    },
-                    TensorInfo {
-                        name: output.name.clone(),
-                        elem_type: output.elem_type,
-                        shape: vec![-1],
-                    },
+                    TensorInfo::input(input.name.clone(), input.elem_type, vec![-1, -1]),
+                    TensorInfo::input(output.name.clone(), output.elem_type, vec![-1]),
                 ],
                 ops: vec![OpDesc {
                     opcode,
@@ -964,16 +1087,8 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
         }
         KernelPattern::Transpose { input, output, .. } => Ok(GraphDesc {
             tensors: vec![
-                TensorInfo {
-                    name: input.name.clone(),
-                    elem_type: input.elem_type,
-                    shape: vec![-1, -1],
-                },
-                TensorInfo {
-                    name: output.name.clone(),
-                    elem_type: output.elem_type,
-                    shape: vec![-1, -1],
-                },
+                TensorInfo::input(input.name.clone(), input.elem_type, vec![-1, -1]),
+                TensorInfo::input(output.name.clone(), output.elem_type, vec![-1, -1]),
             ],
             ops: vec![OpDesc {
                 opcode: builtin_op::TRANSPOSE,
@@ -986,16 +1101,8 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
         }),
         KernelPattern::Reshape { input, output, .. } => Ok(GraphDesc {
             tensors: vec![
-                TensorInfo {
-                    name: input.name.clone(),
-                    elem_type: input.elem_type,
-                    shape: vec![-1],
-                },
-                TensorInfo {
-                    name: output.name.clone(),
-                    elem_type: output.elem_type,
-                    shape: vec![-1],
-                },
+                TensorInfo::input(input.name.clone(), input.elem_type, vec![-1]),
+                TensorInfo::input(output.name.clone(), output.elem_type, vec![-1]),
             ],
             ops: vec![OpDesc {
                 opcode: builtin_op::RESHAPE,
@@ -1018,31 +1125,11 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
             let shape_1d = vec![-1i32];
             Ok(GraphDesc {
                 tensors: vec![
-                    TensorInfo {
-                        name: input.name.clone(),
-                        elem_type: input.elem_type,
-                        shape: shape_4d.clone(),
-                    }, // 0
-                    TensorInfo {
-                        name: scale.name.clone(),
-                        elem_type: scale.elem_type,
-                        shape: shape_1d.clone(),
-                    }, // 1
-                    TensorInfo {
-                        name: bias.name.clone(),
-                        elem_type: bias.elem_type,
-                        shape: shape_1d,
-                    }, // 2
-                    TensorInfo {
-                        name: "batchnorm_mul".into(),
-                        elem_type: input.elem_type,
-                        shape: shape_4d.clone(),
-                    }, // 3
-                    TensorInfo {
-                        name: output.name.clone(),
-                        elem_type: output.elem_type,
-                        shape: shape_4d,
-                    }, // 4
+                    TensorInfo::input(input.name.clone(), input.elem_type, shape_4d.clone()), // 0
+                    TensorInfo::input(scale.name.clone(), scale.elem_type, shape_1d.clone()), // 1
+                    TensorInfo::input(bias.name.clone(), bias.elem_type, shape_1d),           // 2
+                    TensorInfo::input("batchnorm_mul", input.elem_type, shape_4d.clone()),    // 3
+                    TensorInfo::input(output.name.clone(), output.elem_type, shape_4d),       // 4
                 ],
                 ops: vec![
                     OpDesc {
@@ -1070,17 +1157,13 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
             let shape_1d = vec![-1i32];
             let mut tensors: Vec<TensorInfo> = inputs
                 .iter()
-                .map(|t| TensorInfo {
-                    name: t.name.clone(),
-                    elem_type: t.elem_type,
-                    shape: shape_1d.clone(),
-                })
+                .map(|t| TensorInfo::input(t.name.clone(), t.elem_type, shape_1d.clone()))
                 .collect();
-            tensors.push(TensorInfo {
-                name: output.name.clone(),
-                elem_type: output.elem_type,
-                shape: shape_1d,
-            });
+            tensors.push(TensorInfo::input(
+                output.name.clone(),
+                output.elem_type,
+                shape_1d,
+            ));
             let n = inputs.len() as i32;
             let input_indices: Vec<i32> = (0..n).collect();
             Ok(GraphDesc {
@@ -1104,24 +1187,12 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
             let shape_1d = vec![-1i32];
             Ok(GraphDesc {
                 tensors: vec![
-                    TensorInfo {
-                        name: data.name.clone(),
-                        elem_type: data.elem_type,
-                        shape: shape_1d.clone(),
-                    },
-                    TensorInfo {
-                        name: indices.name.clone(),
-                        // TFLite refuses UINT32 positions. WGSL indexes with
-                        // u32, and for a non-negative index the bytes are the
-                        // same, so the declared type is what has to change.
-                        elem_type: data_type::INT32,
-                        shape: shape_1d.clone(),
-                    },
-                    TensorInfo {
-                        name: output.name.clone(),
-                        elem_type: output.elem_type,
-                        shape: shape_1d,
-                    },
+                    TensorInfo::input(data.name.clone(), data.elem_type, shape_1d.clone()),
+                    // TFLite refuses UINT32 positions. WGSL indexes with u32,
+                    // and for a non-negative index the bytes are the same, so
+                    // the declared type is what has to change.
+                    TensorInfo::input(indices.name.clone(), data_type::INT32, shape_1d.clone()),
+                    TensorInfo::input(output.name.clone(), output.elem_type, shape_1d),
                 ],
                 ops: vec![OpDesc {
                     opcode: builtin_op::GATHER,
@@ -1143,26 +1214,10 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
             let shape_1d = vec![-1i32];
             Ok(GraphDesc {
                 tensors: vec![
-                    TensorInfo {
-                        name: data.name.clone(),
-                        elem_type: data.elem_type,
-                        shape: shape_1d.clone(),
-                    },
-                    TensorInfo {
-                        name: indices.name.clone(),
-                        elem_type: indices.elem_type,
-                        shape: shape_1d.clone(),
-                    },
-                    TensorInfo {
-                        name: updates.name.clone(),
-                        elem_type: updates.elem_type,
-                        shape: shape_1d.clone(),
-                    },
-                    TensorInfo {
-                        name: output.name.clone(),
-                        elem_type: output.elem_type,
-                        shape: shape_1d,
-                    },
+                    TensorInfo::input(data.name.clone(), data.elem_type, shape_1d.clone()),
+                    TensorInfo::input(indices.name.clone(), indices.elem_type, shape_1d.clone()),
+                    TensorInfo::input(updates.name.clone(), updates.elem_type, shape_1d.clone()),
+                    TensorInfo::input(output.name.clone(), output.elem_type, shape_1d),
                 ],
                 ops: vec![OpDesc {
                     opcode: builtin_op::SCATTER_ND,
@@ -1215,11 +1270,11 @@ fn append_activation(
 ) {
     let old_out_idx = *desc.graph_outputs.last().unwrap();
     let old_out = &desc.tensors[old_out_idx as usize];
-    let act_tensor = TensorInfo {
-        name: format!("{}_act", old_out.name),
-        elem_type: old_out.elem_type,
-        shape: old_out.shape.clone(),
-    };
+    let act_tensor = TensorInfo::input(
+        format!("{}_act", old_out.name),
+        old_out.elem_type,
+        old_out.shape.clone(),
+    );
     let act_tensor_idx = desc.tensors.len() as i32;
     desc.tensors.push(act_tensor);
     desc.ops.push(OpDesc {
@@ -3923,16 +3978,8 @@ mod tests {
     fn build_from_graph_desc_simple() {
         let desc = GraphDesc {
             tensors: vec![
-                TensorInfo {
-                    name: "in".into(),
-                    elem_type: data_type::FLOAT,
-                    shape: vec![-1],
-                },
-                TensorInfo {
-                    name: "out".into(),
-                    elem_type: data_type::FLOAT,
-                    shape: vec![-1],
-                },
+                TensorInfo::input("in", data_type::FLOAT, vec![-1]),
+                TensorInfo::input("out", data_type::FLOAT, vec![-1]),
             ],
             ops: vec![OpDesc {
                 opcode: builtin_op::RELU,
@@ -3953,21 +4000,9 @@ mod tests {
         // Two ops with the same opcode should result in one entry in operator_codes
         let desc = GraphDesc {
             tensors: vec![
-                TensorInfo {
-                    name: "a".into(),
-                    elem_type: data_type::FLOAT,
-                    shape: vec![-1],
-                },
-                TensorInfo {
-                    name: "b".into(),
-                    elem_type: data_type::FLOAT,
-                    shape: vec![-1],
-                },
-                TensorInfo {
-                    name: "c".into(),
-                    elem_type: data_type::FLOAT,
-                    shape: vec![-1],
-                },
+                TensorInfo::input("a", data_type::FLOAT, vec![-1]),
+                TensorInfo::input("b", data_type::FLOAT, vec![-1]),
+                TensorInfo::input("c", data_type::FLOAT, vec![-1]),
             ],
             ops: vec![
                 OpDesc {
@@ -3997,16 +4032,8 @@ mod tests {
 
         let mut desc = GraphDesc {
             tensors: vec![
-                TensorInfo {
-                    name: "in".into(),
-                    elem_type: data_type::FLOAT,
-                    shape: vec![-1],
-                },
-                TensorInfo {
-                    name: "out".into(),
-                    elem_type: data_type::FLOAT,
-                    shape: vec![-1],
-                },
+                TensorInfo::input("in", data_type::FLOAT, vec![-1]),
+                TensorInfo::input("out", data_type::FLOAT, vec![-1]),
             ],
             ops: vec![OpDesc {
                 opcode: builtin_op::RELU,
