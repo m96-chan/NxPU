@@ -15,8 +15,20 @@ Two sources of models, because they answer two different questions.
 
 `reference` — built by TensorFlow's own converter at conventional NHWC shapes,
 one operator per model, restricted to the builtin operators NxPU's TFLite
-backend actually emits. This measures the driver: whether this silicon takes
-CONV_2D at all.
+backend actually emits. This measures the driver.
+
+It does not measure "whether this silicon takes CONV_2D", which is what that
+sentence used to say and what a reader will assume anyway. Every weight below
+is a `tf.constant`, and on MT6899 that is the difference between accelerated
+and refused: `mtk-neuron_shim` takes a convolution whose filter is a constant
+and refuses the same convolution, at the same shapes, whose filter is a graph
+input. So the row measures CONV_2D *with a constant filter*, which is one
+instance of the operator and not the operator.
+
+That is not a flaw in the row. It is the reason the two tables exist and are
+kept apart: a driver's answer is about the model it was handed, and two
+matrices can disagree about "CONV_2D" while both being correct because they
+handed it different models.
 
 `nxpu` — the bytes `nxpu --target tflite` produces for the kernels in
 `examples/`, ingested from a directory the caller has already filled. This

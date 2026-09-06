@@ -4,6 +4,23 @@ Each file here is what **one phone** answered when it was asked, one operator at
 a time, whether it would take that operator. They are measurements, not
 documentation.
 
+**A cell is a claim about a model, not about an operator.** It is silent on
+several axes at once — the shape the operator was given, whether it was fused
+with anything, how fast it ran, and every phone that was not this one. To those,
+add the one this project found the hard way:
+
+> **How an operand is supplied.** Every weight in the converter-built reference
+> models is a compile-time constant, because that is what a converter emits. A
+> driver can require that: on MT6899, `mtk-neuron_shim` accelerates a
+> convolution whose filter is a constant and refuses the same convolution, at
+> the same shapes, whose filter is a graph input.
+
+So `CONV_2D | float32 | accelerated` means *this driver took that model*. It
+does not mean the driver takes every CONV_2D, and reading it that way cost a day
+of device sweeps before the rule was found. Two matrices can disagree about
+"CONV_2D on `mtk-neuron_shim`" and both be right, because they handed it
+different convolutions.
+
 **They are not vendor documentation, and they are not a substitute for it.** A
 vendor's table describes a family of parts across driver versions and shapes; a
 file in this directory describes one handset, on one driver, on one day, at one
@@ -22,13 +39,19 @@ because it would look measured while being narrower than the datasheet it lost.
 
 | file | device | SoC | drivers |
 | --- | --- | --- | --- |
-| _(none yet)_ | | | |
+| `xiaomi-2511fpc34g.json` | Xiaomi 2511FPC34G | Mediatek MT6899 | `mtk-neuron_shim`, `mtk-mdla_shim`, `mtk-dsp_shim`, `nnapi-reference` |
 
-The **Operator matrix** workflow has not yet been run on a device, so no table
-has been committed. See "Regenerating one" below; the header of every file
-written here names the device, the SoC, the Android SDK level and the
-DroidRunner build that answered, because a table nobody can trace back to a
-build is a table nobody should stand behind.
+The header of every file written here names the device, the SoC, the Android
+SDK level and the DroidRunner build that answered, because a table nobody can
+trace back to a build is a table nobody should stand behind.
+
+Two accelerators a phone has are **not** in these files, because they are not
+NNAPI drivers and `droidrunner-device devices` does not list them: `gpu`,
+TFLite's own GPU delegate, and `qnn-htp`, Qualcomm's runtime. On MT6899 the GPU
+accepts more of what this compiler emits than any NNAPI driver does — 18 of 19
+against the best driver's 15 — so a reader treating this table as the list of
+ways to reach the silicon is missing the widest one. Pass them to the workflow's
+`drivers` input by name.
 
 ## Regenerating one
 
