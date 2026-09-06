@@ -143,20 +143,29 @@ def device_of(capabilities_path):
 
 
 def mark_of(cell):
-    """The cell as one field: the mark, and the time when there is one.
+    """The cell as one field: the mark, the time, and how far the tail runs.
 
     A timed sweep answers a different question from an untimed one -- not
-    whether an engine will take the operator but which engine is faster -- and
-    the second question is the one that decides whether routing operators
-    between two engines is worth anything. Both belong in the same cell,
-    because a time without an attribution is a number about the CPU as often
-    as not.
+    whether an engine will take the operator but which engine is faster. Both
+    belong in the same cell, because a time without an attribution is a number
+    about the CPU as often as not.
+
+    The tail is here because the median alone gives the wrong answer. On an
+    MT6899 the GPU beats the NPU in the middle on 8 of 12 operators and is
+    twice as spread at p99, with `conditions.stable` true throughout -- so it
+    is contention and not a throttle. It is the engine the display composites
+    on, and occupying it is not free to the rest of the device in a way no
+    cell in this table can show.
     """
     mark = MARK[cell["status"]]
     median = cell.get("medianUs")
     if median is None:
         return mark
-    return f"{mark} {median / 1000:.2f}ms"
+    cell_text = f"{mark} {median / 1000:.2f}ms"
+    p90 = cell.get("p90Us")
+    if p90 and median:
+        cell_text += f" p90 {p90 / median:.1f}x"
+    return cell_text
 
 
 def table(lines, rows, drivers, first_column, cell_of):
@@ -218,6 +227,17 @@ def main():
             median = (row or {}).get("medianUs")
             if median is not None:
                 cell["medianUs"] = median
+            # The tail, because on this silicon it is where the two engines
+            # actually differ. Measured on MT6899 with `conditions.stable` true
+            # throughout, so not a throttle: the GPU is faster than the NPU in
+            # the middle on 8 of 12 operators and is twice as spread at p99 --
+            # 2.04x its own median against the NPU's 1.27x, worst case 6.23x
+            # against 2.69x. It is the engine the display composites on, so it
+            # is contended by construction, and a schedule chosen on medians
+            # alone picks it every time.
+            p90 = (row or {}).get("p90Us")
+            if p90 is not None:
+                cell["p90Us"] = p90
             cells[driver] = cell
         rows.append({"operator": row_name(model), "precision": model["precision"],
                      "id": model["id"], "usable": usable,

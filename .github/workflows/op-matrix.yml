@@ -185,6 +185,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          # A self-hosted runner keeps its workspace between jobs, so a sweep
+          # for a driver this run did not ask about survives from the last one
+          # and is uploaded with the artifact. `reduce.py` reads `drivers.txt`
+          # and so is unaffected, but anyone opening the artifact sees files
+          # that answer a question nobody asked in this run.
+          rm -f sweep-*.json manifest-*.json drivers.txt
+
           # One entry per model. `iterations: 0` by default: the question is
           # whether the graph was accepted, and that is answered once tensors
           # are allocated. Timing every model on every driver turns a two-minute
