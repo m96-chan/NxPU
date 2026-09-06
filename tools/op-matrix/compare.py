@@ -118,8 +118,20 @@ def main():
         if before_status in TAKEN and after_status not in TAKEN:
             # A phone that could not say what state it was in has not earned
             # the right to fail somebody's build.
-            if now[1].get("stable") is False or was[1].get("stable") is False:
+            now_stable, was_stable = now[1].get("stable"), was[1].get("stable")
+            if now_stable is False or was_stable is False:
                 change["reason"] = "the run was not thermally stable"
+                unverified.append(change)
+            elif now_stable is None or was_stable is None:
+                # DroidRunner's RESULT-CONTRACT.md: "stable is the blunt
+                # version and the field to branch on: true only when both
+                # ends reported a thermal status and the two agree. A device
+                # that would not say counts as unstable — silence is not a
+                # yes, and a gate must not read 'we could not tell' as 'it
+                # was fine'." A missing field used to fall all the way
+                # through to `regressions` below, which is exactly that
+                # misreading.
+                change["reason"] = "the device did not report its conditions"
                 unverified.append(change)
             elif not same_build:
                 change["reason"] = f"builds differ: {build_before} -> {build_after}"
