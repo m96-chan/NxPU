@@ -1,0 +1,2131 @@
+{
+  "schema": 1,
+  "device": {
+    "manufacturer": "Xiaomi",
+    "model": "2511FPC34G",
+    "soc": "Mediatek MT6899 mt6899",
+    "sdk": 36,
+    "droidrunner": "0.0.0-dev 8581313"
+  },
+  "drivers": [
+    "mtk-neuron_shim",
+    "mtk-mdla_shim",
+    "mtk-dsp_shim",
+    "nnapi-reference"
+  ],
+  "generatedBy": "tensorflow 2.20.0",
+  "skippedModels": [
+    {
+      "id": "nxpu-attention",
+      "operator": "BATCH_MATMUL+DIV+SOFTMAX+BATCH_MATMUL",
+      "precision": "float32",
+      "source": "nxpu",
+      "reason": "the kernel lowers to 4 operators (BATCH_MATMUL, DIV, SOFTMAX, BATCH_MATMUL); a refusal could not be attributed to one of them"
+    },
+    {
+      "id": "nxpu-batchnorm",
+      "operator": "MUL+ADD",
+      "precision": "float32",
+      "source": "nxpu",
+      "reason": "the kernel lowers to 2 operators (MUL, ADD); a refusal could not be attributed to one of them"
+    },
+    {
+      "id": "nxpu-causal_attention",
+      "operator": "BATCH_MATMUL+DIV+SOFTMAX+BATCH_MATMUL",
+      "precision": "float32",
+      "source": "nxpu",
+      "reason": "the kernel lowers to 4 operators (BATCH_MATMUL, DIV, SOFTMAX, BATCH_MATMUL); a refusal could not be attributed to one of them"
+    },
+    {
+      "id": "nxpu-layernorm",
+      "operator": "MUL+ADD",
+      "precision": "float32",
+      "source": "nxpu",
+      "reason": "the kernel lowers to 2 operators (MUL, ADD); a refusal could not be attributed to one of them"
+    },
+    {
+      "id": "nxpu-multihead_attention",
+      "operator": "BATCH_MATMUL+DIV+SOFTMAX+BATCH_MATMUL",
+      "precision": "float32",
+      "source": "nxpu",
+      "reason": "the kernel lowers to 4 operators (BATCH_MATMUL, DIV, SOFTMAX, BATCH_MATMUL); a refusal could not be attributed to one of them"
+    }
+  ],
+  "rows": [
+    {
+      "operator": "ADD",
+      "precision": "float32",
+      "id": "ref-add-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "ADD",
+      "kernel": null,
+      "nxpuOp": "Add",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "ADD",
+      "precision": "int8",
+      "id": "ref-add-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "ADD",
+      "kernel": null,
+      "nxpuOp": "Add",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SUB",
+      "precision": "float32",
+      "id": "ref-sub-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "SUB",
+      "kernel": null,
+      "nxpuOp": "Sub",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SUB",
+      "precision": "int8",
+      "id": "ref-sub-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "SUB",
+      "kernel": null,
+      "nxpuOp": "Sub",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "MUL",
+      "precision": "float32",
+      "id": "ref-mul-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "MUL",
+      "kernel": null,
+      "nxpuOp": "Mul",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "MUL",
+      "precision": "int8",
+      "id": "ref-mul-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "MUL",
+      "kernel": null,
+      "nxpuOp": "Mul",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "DIV",
+      "precision": "float32",
+      "id": "ref-div-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "DIV",
+      "kernel": null,
+      "nxpuOp": "Div",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "DIV",
+      "precision": "int8",
+      "id": "ref-div-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "DIV",
+      "kernel": null,
+      "nxpuOp": "Div",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "CONV_2D",
+      "precision": "float32",
+      "id": "ref-conv_2d-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "CONV_2D",
+      "kernel": null,
+      "nxpuOp": "Conv",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "CONV_2D",
+      "precision": "int8",
+      "id": "ref-conv_2d-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "CONV_2D",
+      "kernel": null,
+      "nxpuOp": "Conv",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "AVERAGE_POOL_2D",
+      "precision": "float32",
+      "id": "ref-average_pool_2d-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "AVERAGE_POOL_2D",
+      "kernel": null,
+      "nxpuOp": "AveragePool",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "AVERAGE_POOL_2D",
+      "precision": "int8",
+      "id": "ref-average_pool_2d-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "AVERAGE_POOL_2D",
+      "kernel": null,
+      "nxpuOp": "AveragePool",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "MAX_POOL_2D",
+      "precision": "float32",
+      "id": "ref-max_pool_2d-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "MAX_POOL_2D",
+      "kernel": null,
+      "nxpuOp": "MaxPool",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "MAX_POOL_2D",
+      "precision": "int8",
+      "id": "ref-max_pool_2d-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "MAX_POOL_2D",
+      "kernel": null,
+      "nxpuOp": "MaxPool",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "MEAN",
+      "precision": "float32",
+      "id": "ref-mean-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "MEAN",
+      "kernel": null,
+      "nxpuOp": "ReduceMean",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "MEAN",
+      "precision": "int8",
+      "id": "ref-mean-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "MEAN",
+      "kernel": null,
+      "nxpuOp": "ReduceMean",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SUM",
+      "precision": "float32",
+      "id": "ref-sum-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "SUM",
+      "kernel": null,
+      "nxpuOp": "ReduceSum",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SUM",
+      "precision": "int8",
+      "id": "ref-sum-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "SUM",
+      "kernel": null,
+      "nxpuOp": "ReduceSum",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "REDUCE_MAX",
+      "precision": "float32",
+      "id": "ref-reduce_max-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "REDUCE_MAX",
+      "kernel": null,
+      "nxpuOp": "ReduceMax",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "REDUCE_MAX",
+      "precision": "int8",
+      "id": "ref-reduce_max-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "REDUCE_MAX",
+      "kernel": null,
+      "nxpuOp": "ReduceMax",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "REDUCE_MIN",
+      "precision": "float32",
+      "id": "ref-reduce_min-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "REDUCE_MIN",
+      "kernel": null,
+      "nxpuOp": "ReduceMin",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "REDUCE_MIN",
+      "precision": "int8",
+      "id": "ref-reduce_min-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "REDUCE_MIN",
+      "kernel": null,
+      "nxpuOp": "ReduceMin",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SOFTMAX",
+      "precision": "float32",
+      "id": "ref-softmax-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "SOFTMAX",
+      "kernel": null,
+      "nxpuOp": "Softmax",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SOFTMAX",
+      "precision": "int8",
+      "id": "ref-softmax-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "SOFTMAX",
+      "kernel": null,
+      "nxpuOp": "Softmax",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "LOGISTIC",
+      "precision": "float32",
+      "id": "ref-logistic-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "LOGISTIC",
+      "kernel": null,
+      "nxpuOp": "Sigmoid",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "LOGISTIC",
+      "precision": "int8",
+      "id": "ref-logistic-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "LOGISTIC",
+      "kernel": null,
+      "nxpuOp": "Sigmoid",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "TANH",
+      "precision": "float32",
+      "id": "ref-tanh-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "TANH",
+      "kernel": null,
+      "nxpuOp": "Tanh",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "TANH",
+      "precision": "int8",
+      "id": "ref-tanh-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "TANH",
+      "kernel": null,
+      "nxpuOp": "Tanh",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "RELU",
+      "precision": "float32",
+      "id": "ref-relu-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "RELU",
+      "kernel": null,
+      "nxpuOp": "Relu",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "RELU",
+      "precision": "int8",
+      "id": "ref-relu-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "RELU",
+      "kernel": null,
+      "nxpuOp": "Relu",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "CONCATENATION",
+      "precision": "float32",
+      "id": "ref-concatenation-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "CONCATENATION",
+      "kernel": null,
+      "nxpuOp": "Concat",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "CONCATENATION",
+      "precision": "int8",
+      "id": "ref-concatenation-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "CONCATENATION",
+      "kernel": null,
+      "nxpuOp": "Concat",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "RESHAPE",
+      "precision": "float32",
+      "id": "ref-reshape-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "RESHAPE",
+      "kernel": null,
+      "nxpuOp": "Reshape",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "RESHAPE",
+      "precision": "int8",
+      "id": "ref-reshape-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "RESHAPE",
+      "kernel": null,
+      "nxpuOp": "Reshape",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "TRANSPOSE",
+      "precision": "float32",
+      "id": "ref-transpose-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "TRANSPOSE",
+      "kernel": null,
+      "nxpuOp": "Transpose",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "TRANSPOSE",
+      "precision": "int8",
+      "id": "ref-transpose-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "TRANSPOSE",
+      "kernel": null,
+      "nxpuOp": "Transpose",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "BATCH_MATMUL",
+      "precision": "float32",
+      "id": "ref-batch_matmul-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "BATCH_MATMUL",
+      "kernel": null,
+      "nxpuOp": "MatMul",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "BATCH_MATMUL",
+      "precision": "int8",
+      "id": "ref-batch_matmul-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "BATCH_MATMUL",
+      "kernel": null,
+      "nxpuOp": "MatMul",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SPLIT",
+      "precision": "float32",
+      "id": "ref-split-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "SPLIT",
+      "kernel": null,
+      "nxpuOp": "Split",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SPLIT",
+      "precision": "int8",
+      "id": "ref-split-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "SPLIT",
+      "kernel": null,
+      "nxpuOp": "Split",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-mdla_shim",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "GATHER",
+      "precision": "float32",
+      "id": "ref-gather-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "GATHER",
+      "kernel": null,
+      "nxpuOp": "Gather",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "GATHER",
+      "precision": "int8",
+      "id": "ref-gather-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "GATHER",
+      "kernel": null,
+      "nxpuOp": "Gather",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SCATTER_ND",
+      "precision": "float32",
+      "id": "ref-scatter_nd-float32",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "SCATTER_ND",
+      "kernel": null,
+      "nxpuOp": "ScatterND",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SCATTER_ND",
+      "precision": "int8",
+      "id": "ref-scatter_nd-int8",
+      "usable": true,
+      "controlDetail": null,
+      "source": "reference",
+      "builtin": "SCATTER_ND",
+      "kernel": null,
+      "nxpuOp": "ScatterND",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "CONCATENATION (nxpu:concat)",
+      "precision": "float32",
+      "id": "nxpu-concat",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "CONCATENATION",
+      "kernel": "concat",
+      "nxpuOp": "Concat",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "CONCATENATION (nxpu:concat_axis1)",
+      "precision": "float32",
+      "id": "nxpu-concat_axis1",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "CONCATENATION",
+      "kernel": "concat_axis1",
+      "nxpuOp": "Concat",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "CONV_2D (nxpu:conv2d)",
+      "precision": "float32",
+      "id": "nxpu-conv2d",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "CONV_2D",
+      "kernel": "conv2d",
+      "nxpuOp": "Conv",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "CONV_2D (nxpu:conv2d_5x5)",
+      "precision": "float32",
+      "id": "nxpu-conv2d_5x5",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "CONV_2D",
+      "kernel": "conv2d_5x5",
+      "nxpuOp": "Conv",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "CONV_2D (nxpu:depthwise_conv)",
+      "precision": "float32",
+      "id": "nxpu-depthwise_conv",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "CONV_2D",
+      "kernel": "depthwise_conv",
+      "nxpuOp": "Conv",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "GATHER (nxpu:gather)",
+      "precision": "float32",
+      "id": "nxpu-gather",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "GATHER",
+      "kernel": "gather",
+      "nxpuOp": "Gather",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "GELU (nxpu:gelu)",
+      "precision": "float32",
+      "id": "nxpu-gelu",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "GELU",
+      "kernel": "gelu",
+      "nxpuOp": null,
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "BATCH_MATMUL (nxpu:matmul)",
+      "precision": "float32",
+      "id": "nxpu-matmul",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "BATCH_MATMUL",
+      "kernel": "matmul",
+      "nxpuOp": "MatMul",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "MAX_POOL_2D (nxpu:maxpool)",
+      "precision": "float32",
+      "id": "nxpu-maxpool",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "MAX_POOL_2D",
+      "kernel": "maxpool",
+      "nxpuOp": "MaxPool",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SUM (nxpu:reduce_sum)",
+      "precision": "float32",
+      "id": "nxpu-reduce_sum",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "SUM",
+      "kernel": "reduce_sum",
+      "nxpuOp": "ReduceSum",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "cpu",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "RELU (nxpu:relu)",
+      "precision": "float32",
+      "id": "nxpu-relu",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "RELU",
+      "kernel": "relu",
+      "nxpuOp": "Relu",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SCATTER_ND (nxpu:scatter)",
+      "precision": "float32",
+      "id": "nxpu-scatter",
+      "usable": false,
+      "controlDetail": "Internal error: Unexpected failure when preparing tensor allocations: tensorflow/lite/kernels/scatter_nd.cc:65 updates.DimensionsCount() - outer_dims != shape_shape.Dims(0) - ix (1 != -63)\nNode number 0 (SCATTER_ND) failed to prepare.\nFailed to apply the default TensorFlow Lite delegate indexed at 0.",
+      "source": "nxpu",
+      "builtin": "SCATTER_ND",
+      "kernel": "scatter",
+      "nxpuOp": "ScatterND",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "excluded",
+          "detail": "Internal error: Unexpected failure when preparing tensor allocations: tensorflow/lite/kernels/scatter_nd.cc:65 updates.DimensionsCount() - outer_dims != shape_shape.Dims(0) - ix (1 != -63)\nNode number 0 (SCATTER_ND) failed to prepare.\nFailed to apply the default TensorFlow Lite delegate indexed at 0."
+        },
+        "mtk-mdla_shim": {
+          "status": "excluded",
+          "detail": "Internal error: Unexpected failure when preparing tensor allocations: tensorflow/lite/kernels/scatter_nd.cc:65 updates.DimensionsCount() - outer_dims != shape_shape.Dims(0) - ix (1 != -63)\nNode number 0 (SCATTER_ND) failed to prepare.\nFailed to apply the default TensorFlow Lite delegate indexed at 0."
+        },
+        "mtk-dsp_shim": {
+          "status": "excluded",
+          "detail": "Internal error: Unexpected failure when preparing tensor allocations: tensorflow/lite/kernels/scatter_nd.cc:65 updates.DimensionsCount() - outer_dims != shape_shape.Dims(0) - ix (1 != -63)\nNode number 0 (SCATTER_ND) failed to prepare.\nFailed to apply the default TensorFlow Lite delegate indexed at 0."
+        },
+        "nnapi-reference": {
+          "status": "excluded",
+          "detail": "Internal error: Unexpected failure when preparing tensor allocations: tensorflow/lite/kernels/scatter_nd.cc:65 updates.DimensionsCount() - outer_dims != shape_shape.Dims(0) - ix (1 != -63)\nNode number 0 (SCATTER_ND) failed to prepare.\nFailed to apply the default TensorFlow Lite delegate indexed at 0."
+        }
+      }
+    },
+    {
+      "operator": "SPLIT (nxpu:split)",
+      "precision": "float32",
+      "id": "nxpu-split",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "SPLIT",
+      "kernel": "split",
+      "nxpuOp": "Split",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SPLIT (nxpu:split_axis1)",
+      "precision": "float32",
+      "id": "nxpu-split_axis1",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "SPLIT",
+      "kernel": "split_axis1",
+      "nxpuOp": "Split",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "TANH (nxpu:tanh_act)",
+      "precision": "float32",
+      "id": "nxpu-tanh_act",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "TANH",
+      "kernel": "tanh_act",
+      "nxpuOp": "Tanh",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "ADD (nxpu:vecadd)",
+      "precision": "float32",
+      "id": "nxpu-vecadd",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "ADD",
+      "kernel": "vecadd",
+      "nxpuOp": "Add",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "ADD (nxpu:vecadd_const)",
+      "precision": "float32",
+      "id": "nxpu-vecadd_const",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "ADD",
+      "kernel": "vecadd_const",
+      "nxpuOp": "Add",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "MUL (nxpu:vecmul)",
+      "precision": "float32",
+      "id": "nxpu-vecmul",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "MUL",
+      "kernel": "vecmul",
+      "nxpuOp": "Mul",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-dsp_shim",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    },
+    {
+      "operator": "SUB (nxpu:vecsub)",
+      "precision": "float32",
+      "id": "nxpu-vecsub",
+      "usable": true,
+      "controlDetail": null,
+      "source": "nxpu",
+      "builtin": "SUB",
+      "kernel": "vecsub",
+      "nxpuOp": "Sub",
+      "drivers": {
+        "mtk-neuron_shim": {
+          "status": "accelerated",
+          "detail": "TfLiteNnapiDelegate:mtk-neuron_shim",
+          "stable": true
+        },
+        "mtk-mdla_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "mtk-dsp_shim": {
+          "status": "unsupported",
+          "detail": "TfLiteXNNPackDelegate",
+          "stable": true
+        },
+        "nnapi-reference": {
+          "status": "unsupported",
+          "detail": "TfLiteNnapiDelegate:nnapi-reference",
+          "stable": true
+        }
+      }
+    }
+  ]
+}
