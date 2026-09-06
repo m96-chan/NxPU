@@ -1,0 +1,185 @@
+name: Device ULP
+
+# Run DroidRunner's own ULP fixtures on this repository's phone.
+#
+# The point is that the bytes are identical to the ones their SM8650 was
+# measured with, so V73 and V75 compare like for like rather than as two
+# experiments that happen to be about the same thing. Nothing here generates
+# a fixture; generating our own is how two measurements stop being comparable.
+on:
+  workflow_dispatch:
+    inputs:
+      set:
+        description: "Fixture set: baseline, signed, odd or resolution"
+        required: true
+        default: baseline
+
+permissions:
+  contents: read
+
+env:
+  # Pinned rather than tracking their default branch: a fixture that changes
+  # under us turns a comparison into a coincidence.
+  DROIDRUNNER_REF: main
+  SET: ${{ inputs.set || 'baseline' }}
+
+jobs:
+  fetch:
+    name: Fetch the fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/m96-chan/DroidRunner/${DROIDRUNNER_REF}/tools/ulp/fixtures"
+          mkdir -p fixtures
+          case "$SET" in
+            baseline)   prefix="" ;;
+            signed)     prefix="signed-" ;;
+            odd)        prefix="odd-" ;;
+            resolution) prefix="resolution-" ;;
+            *) echo "::error::unknown fixture set: $SET"; exit 1 ;;
+          esac
+          curl -fsSL -o fixtures/add-f32.tflite "$base/add-f32.tflite"
+          for f in input-0 input-1 expected; do
+            curl -fsSL -o "fixtures/$f.bin" "$base/${prefix}${f}.bin"
+          done
+          ls -l fixtures/
+          # A fixture that silently came back as an HTML error page would make
+          # the comparison meaningless rather than failing it.
+          test "$(stat -c%s fixtures/input-0.bin)" -ge 1024
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ulp-fixtures
+          path: fixtures/
+          if-no-files-found: error
+
+  device:
+    name: Run on V73
+    needs: fetch
+    runs-on: [self-hosted, android, soc-qti-sm8550-qcom]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ulp-fixtures
+          path: fixtures
+
+      - name: What the phone has
+        run: droidrunner-device capabilities
+
+      - name: The fixtures arrived
+        run: |
+          test -f fixtures/add-f32.tflite
+          ls -l fixtures/
+
+      # The CPU control first. If the reference and the harness do not agree
+      # bit for bit, nothing the accelerator says afterwards means anything —
+      # this is the step that makes the rest publishable.
+      - name: CPU control
+        id: cpu
+        uses: m96-chan/DroidRunner/actions/run-model@main
+        with:
+          model: fixtures/add-f32.tflite
+          iterations: 5
+          inputs: |
+            fixtures/input-0.bin
+            fixtures/input-1.bin
+          output-dir: out-cpu
+          results-path: cpu.json
+
+      - name: On the Hexagon
+        id: htp
+        continue-on-error: true
+        uses: m96-chan/DroidRunner/actions/run-model@main
+        with:
+          model: fixtures/add-f32.tflite
+          device: qnn-htp
+          iterations: 5
+          inputs: |
+            fixtures/input-0.bin
+            fixtures/input-1.bin
+          output-dir: out-htp
+          results-path: htp.json
+
+      - name: What came back
+        if: always()
+        run: |
+          echo "cpu: executed=${{ steps.cpu.outputs.executed }} by=${{ steps.cpu.outputs.executed-by }}"
+          echo "htp: executed=${{ steps.htp.outputs.executed }} by=${{ steps.htp.outputs.executed-by }} stable=${{ steps.htp.outputs.stable }}"
+          ls -l out-cpu out-htp 2>/dev/null || true
+
+      - name: Verdict
+        if: always()
+        run: |
+          # A device step allowed to fail must not make the job green.
+          if [ -z "${{ steps.cpu.outputs.executed }}" ]; then
+            echo "::error::the CPU control did not run; the rest is unreadable"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ulp-result
+          path: |
+            out-cpu/
+            out-htp/
+            cpu.json
+            htp.json
+          if-no-files-found: warn
+
+  compare:
+    name: ULP histogram
+    needs: [fetch, device]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ulp-fixtures
+          path: fixtures
+      - uses: actions/download-artifact@v8
+        with:
+          name: ulp-result
+          path: result
+        continue-on-error: true
+
+      - name: Compare
+        run: |
+          set -euo pipefail
+          if [ ! -f result/out-cpu/output-0.bin ]; then
+            echo "::error::no CPU output; nothing to compare"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import struct, collections, pathlib
+          words = lambda p: struct.unpack(f"<{p.stat().st_size//4}I", p.read_bytes())
+          floats = lambda p: struct.unpack(f"<{p.stat().st_size//4}f", p.read_bytes())
+          want = pathlib.Path("fixtures/expected.bin")
+
+          def report(name, got):
+              # Compared as raw words: the deviation Qualcomm's path shows is
+              # defined on the encoding, not on the value, so a signed result
+              # moves away from zero. Counting in "ULP toward positive" hides
+              # that.
+              d = [g - w for w, g in zip(words(want), words(got))]
+              hist = dict(sorted(collections.Counter(d).items()))
+              exact = sum(1 for x in d if x == 0)
+              print(f"{name}: {exact} of {len(d)} bit-exact, histogram {hist}")
+              return d
+
+          cpu = report("cpu", pathlib.Path("result/out-cpu/output-0.bin"))
+          htp_path = pathlib.Path("result/out-htp/output-0.bin")
+          if htp_path.exists():
+              report("qnn-htp", htp_path)
+          else:
+              print("qnn-htp: no output — the delegate refused or was not reached")
+
+          # The control is the load-bearing assertion. If the CPU is not exact
+          # against the reference then the reference, the harness or the
+          # fixture is wrong, and the accelerator's numbers say nothing.
+          if any(x != 0 for x in cpu):
+              raise SystemExit("the CPU control is not bit-exact; the comparison is void")
+          print("CPU control bit-exact")
+          PY
