@@ -1108,8 +1108,26 @@ pub fn classify_entry_point(
             }
         }
 
+        let input_handles: Vec<Handle<GlobalVariable>> = inputs.iter().map(|(h, _)| *h).collect();
+        let output_handles_3: Vec<Handle<GlobalVariable>> =
+            outputs.iter().map(|(h, _)| *h).collect();
+
         // Scatter: 3 inputs + 1 output + no loop (simple scatter write)
-        if num_inputs == 3 && outputs.len() == 1 && !has_loop {
+        //
+        // A scatter takes its write address out of a buffer. Three inputs, one
+        // output and no loop was the whole test, and it reported a snake
+        // activation — `x + (1/(β+ε))·sin²(αx)` with per-channel α and β — as
+        // SCATTER_ND, which writes elsewhere entirely.
+        if num_inputs == 3
+            && outputs.len() == 1
+            && !has_loop
+            && detect_indexed_write(
+                &ep.function.body,
+                &ep.function.expressions,
+                &input_handles,
+                &output_handles_3,
+            )
+        {
             let data = make_binding(module, inputs[0].0, inputs[0].1, TensorRole::Input);
             let indices = make_binding(module, inputs[1].0, inputs[1].1, TensorRole::Input);
             let updates = make_binding(module, inputs[2].0, inputs[2].1, TensorRole::Input);
@@ -1120,6 +1138,19 @@ pub fn classify_entry_point(
                 updates,
                 output,
                 axis: 0,
+            });
+        }
+
+        // Three inputs and no loop, writing where the thread id says: a
+        // per-element function of three tensors. `Activation` carries one
+        // input and no learned parameters, and `ElementWise` carries two, so
+        // there is nothing here to hold a snake's alpha and beta.
+        if num_inputs == 3 && outputs.len() == 1 && !has_loop {
+            return Ok(KernelPattern::Unknown {
+                reason: "3 inputs combined per element, with no operator here \
+                         that takes three — an activation carries one input \
+                         and no parameters, and ElementWise carries two"
+                    .into(),
             });
         }
 
@@ -1249,6 +1280,19 @@ pub fn classify_entry_point(
                 inputs: vec![input_a, input_b],
                 output: output_c,
                 axis,
+            });
+        }
+
+        // An element-wise op writes element i from element i. rope writes a
+        // rotated pair at `base` and `base + 1`; a dequantizing transpose
+        // writes at `col * width + row`. Both were reported as `Mul`, which
+        // keeps their arithmetic and discards their movement.
+        if !stores_at_the_index_it_read(&ep.function.body, &ep.function.expressions) {
+            return Ok(KernelPattern::Unknown {
+                reason: "2 inputs and no loop, but the store index is not the \
+                         index it read from — the values move as well as \
+                         combine, and no operator here does both"
+                    .into(),
             });
         }
 
@@ -2591,6 +2635,116 @@ enum IndexedRead {
     Block,
 }
 
+/// Whether the kernel writes each output element from the same position it
+/// read, at a single position per invocation.
+///
+/// Two rules, and the second was learned by breaking the first. Element *i* of
+/// the output has to be a function of element *i* of at least one input — a
+/// dequantizing transpose writes at `col * width + row` and fails this — but
+/// *not* of element *i* of every input, because a broadcast is element-wise
+/// and reads its second operand at a row index.
+///
+/// And an element-wise invocation writes one place. rope writes a rotated
+/// pair at `base` and `base + 1`, each from both, which is a movement of
+/// values between positions however element-wise the arithmetic looks.
+fn stores_at_the_index_it_read(body: &[Statement], exprs: &Arena<Expression>) -> bool {
+    fn walk(
+        body: &[Statement],
+        exprs: &Arena<Expression>,
+        ok: &mut bool,
+        seen: &mut Vec<Handle<Expression>>,
+    ) {
+        for stmt in body {
+            match stmt {
+                Statement::Store { pointer, value } => {
+                    let Some(store_index) = access_index(exprs, *pointer) else {
+                        *ok = false;
+                        return;
+                    };
+                    // Branches of an `if` are alternatives, not a sequence, so
+                    // the same index appearing in both is still one write.
+                    if seen.iter().all(|i| *i != store_index) {
+                        seen.push(store_index);
+                    }
+                    let mut reads = Vec::new();
+                    collect_load_indices(exprs, *value, &mut reads, 32);
+                    // Reading nothing is a generator; reading only elsewhere
+                    // is a move.
+                    if !reads.contains(&store_index) {
+                        *ok = false;
+                        return;
+                    }
+                }
+                Statement::If { accept, reject, .. } => {
+                    walk(accept, exprs, ok, seen);
+                    walk(reject, exprs, ok, seen);
+                }
+                Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    walk(body, exprs, ok, seen);
+                    walk(continuing, exprs, ok, seen);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut ok = true;
+    let mut seen = Vec::new();
+    walk(body, exprs, &mut ok, &mut seen);
+    ok && seen.len() == 1
+}
+
+/// The index expression of an `Access` into a global, if that is what this is.
+fn access_index(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+) -> Option<Handle<Expression>> {
+    match exprs.try_get(handle)? {
+        Expression::Access { base, index } => {
+            matches!(exprs.try_get(*base)?, Expression::GlobalVariable(_)).then_some(*index)
+        }
+        _ => None,
+    }
+}
+
+/// Every index a storage load in this expression reads at.
+fn collect_load_indices(
+    exprs: &Arena<Expression>,
+    handle: Handle<Expression>,
+    out: &mut Vec<Handle<Expression>>,
+    depth: u32,
+) {
+    if depth == 0 {
+        return;
+    }
+    match exprs.try_get(handle) {
+        Some(Expression::Load { pointer }) => {
+            if let Some(index) = access_index(exprs, *pointer) {
+                out.push(index);
+            }
+        }
+        Some(Expression::Binary { left, right, .. }) => {
+            collect_load_indices(exprs, *left, out, depth - 1);
+            collect_load_indices(exprs, *right, out, depth - 1);
+        }
+        Some(Expression::Unary { expr, .. }) => collect_load_indices(exprs, *expr, out, depth - 1),
+        Some(Expression::Math {
+            arg,
+            arg1,
+            arg2,
+            arg3,
+            ..
+        }) => {
+            collect_load_indices(exprs, *arg, out, depth - 1);
+            for a in [arg1, arg2, arg3].into_iter().flatten() {
+                collect_load_indices(exprs, *a, out, depth - 1);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Walk a pointer expression down to the global variable it addresses.
 fn access_base_global(
     exprs: &Arena<Expression>,
@@ -2964,7 +3118,7 @@ mod tests {
             },
         });
 
-        module.global_variables.append(GlobalVariable {
+        let a_gv = module.global_variables.append(GlobalVariable {
             name: Some("a".into()),
             space: AddressSpace::Storage {
                 access: StorageAccess::LOAD,
@@ -2977,7 +3131,7 @@ mod tests {
             init: None,
             layout: None,
         });
-        module.global_variables.append(GlobalVariable {
+        let b_gv = module.global_variables.append(GlobalVariable {
             name: Some("b".into()),
             space: AddressSpace::Storage {
                 access: StorageAccess::LOAD,
@@ -2990,7 +3144,7 @@ mod tests {
             init: None,
             layout: None,
         });
-        module.global_variables.append(GlobalVariable {
+        let out_gv = module.global_variables.append(GlobalVariable {
             name: Some("c".into()),
             space: AddressSpace::Storage {
                 access: StorageAccess::LOAD | StorageAccess::STORE,
@@ -3015,20 +3169,34 @@ mod tests {
             layout: None,
         });
 
-        // Entry point with Store of Binary (no loop → ElementWise).
+        // `out[i] = a[i] op b[i]`.
+        //
+        // This used to combine two float literals and store the result through
+        // a third, addressing nothing and reading nothing — it described a
+        // shape no kernel has, and passed because classification did not look
+        // at where the values came from.
         let mut func = Function::new("main");
-        let left = func
+        let idx = func
             .expressions
-            .append(Expression::Literal(Literal::F32(1.0)));
-        let right = func
-            .expressions
-            .append(Expression::Literal(Literal::F32(2.0)));
+            .append(Expression::Literal(Literal::U32(0)));
+        let load_from = |func: &mut Function, gv| {
+            let base = func.expressions.append(Expression::GlobalVariable(gv));
+            let access = func
+                .expressions
+                .append(Expression::Access { base, index: idx });
+            func.expressions
+                .append(Expression::Load { pointer: access })
+        };
+        let left = load_from(&mut func, a_gv);
+        let right = load_from(&mut func, b_gv);
         let binary = func
             .expressions
             .append(Expression::Binary { op, left, right });
-        let ptr = func
-            .expressions
-            .append(Expression::Literal(Literal::F32(0.0)));
+        let out_base = func.expressions.append(Expression::GlobalVariable(out_gv));
+        let ptr = func.expressions.append(Expression::Access {
+            base: out_base,
+            index: idx,
+        });
         func.body.push(Statement::Store {
             pointer: ptr,
             value: binary,
