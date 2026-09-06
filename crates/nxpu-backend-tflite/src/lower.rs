@@ -1738,11 +1738,19 @@ fn build_tflite_conv2d(
     let operator_codes = fbb.create_vector(&[opcode_table]);
 
     // Conv2DOptions table: stride_w, stride_h, dilation_w=1, dilation_h=1, padding=VALID(0)
+    //
+    // The stride defaults are 0, not 1. `push_slot` omits a field whose value
+    // equals the default it is given, and TFLite's schema default for a stride
+    // is 0 — so passing 1 here meant a stride of 1, the most common stride
+    // there is, was written as absent and read back as zero. Every convolution
+    // this backend emitted at stride 1 was rejected by TFLite's own kernel
+    // with `params->stride_height > 0 was not true`, before any delegate saw
+    // it.
     let conv2d_opts = {
         let start = fbb.start_table();
         fbb.push_slot::<i8>(conv2d_options::PADDING, 0, 0); // VALID
-        fbb.push_slot::<i32>(conv2d_options::STRIDE_W, shape.stride_w as i32, 1);
-        fbb.push_slot::<i32>(conv2d_options::STRIDE_H, shape.stride_h as i32, 1);
+        fbb.push_slot::<i32>(conv2d_options::STRIDE_W, shape.stride_w.max(1) as i32, 0);
+        fbb.push_slot::<i32>(conv2d_options::STRIDE_H, shape.stride_h.max(1) as i32, 0);
         fbb.push_slot::<i32>(conv2d_options::ACTIVATION, 0, 0); // NONE
         fbb.push_slot::<i32>(conv2d_options::DILATION_W, 1, 1);
         fbb.push_slot::<i32>(conv2d_options::DILATION_H, 1, 1);
@@ -1856,8 +1864,10 @@ fn build_tflite_pool(
     let pool2d_opts = {
         let start = fbb.start_table();
         fbb.push_slot::<i8>(pool2d_options::PADDING, 0, 0); // VALID
-        fbb.push_slot::<i32>(pool2d_options::STRIDE_W, shape.stride_w as i32, 1);
-        fbb.push_slot::<i32>(pool2d_options::STRIDE_H, shape.stride_h as i32, 1);
+        // Same defaulting bug as Conv2DOptions above: 0 is TFLite's schema
+        // default, so a stride of 1 has to be written rather than omitted.
+        fbb.push_slot::<i32>(pool2d_options::STRIDE_W, shape.stride_w.max(1) as i32, 0);
+        fbb.push_slot::<i32>(pool2d_options::STRIDE_H, shape.stride_h.max(1) as i32, 0);
         fbb.push_slot::<i32>(pool2d_options::FILTER_W, shape.kernel_w as i32, 1);
         fbb.push_slot::<i32>(pool2d_options::FILTER_H, shape.kernel_h as i32, 1);
         fbb.push_slot::<i32>(pool2d_options::ACTIVATION, 0, 0); // NONE

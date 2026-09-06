@@ -56,6 +56,24 @@ jobs:
       - name: Check
         run: cargo check --workspace
 
+  tflite-loadable:
+    name: TFLite loadability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the CLI
+        run: cargo build --release -p nxpu-cli
+      - name: Install a TFLite interpreter
+        run: pip install --quiet ai-edge-litert
+      # Asserting that a file begins with TFL3 is how models that no
+      # interpreter could load stayed green for months. This loads them.
+      - name: Load every emitted model
+        run: tools/tflite-loadable.py
+
   license-audit:
     name: License Audit
     runs-on: ubuntu-latest

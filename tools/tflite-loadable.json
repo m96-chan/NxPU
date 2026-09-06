@@ -1,0 +1,16 @@
+{
+  "loads": [
+    "batchnorm",
+    "concat",
+    "layernorm",
+    "matmul",
+    "maxpool",
+    "relu",
+    "split",
+    "tanh_act",
+    "vecadd",
+    "vecadd_const",
+    "vecmul",
+    "vecsub"
+  ]
+}

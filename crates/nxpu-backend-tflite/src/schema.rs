@@ -86,12 +86,23 @@ pub mod vt {
 /// TFLite `BuiltinOptionsType` enum values (union discriminant stored in operator.builtin_options_type).
 #[allow(dead_code)]
 pub mod builtin_options_type {
+    // Union member indices from TFLite's `BuiltinOptions`, which are unrelated
+    // to the builtin operator codes above and do not follow them.
+    //
+    // Three of these were wrong, and each produced a different failure because
+    // the index selects how TFLite *interprets the options table*: POOL_2D was
+    // 22, which is PadOptions, so a pool's strides were read as absent and
+    // came back zero; SPLIT was 13, LocalResponseNormalizationOptions, and
+    // reading a SplitOptions table as one segfaulted the interpreter;
+    // CONCATENATION was 2, DepthwiseConv2DOptions, which happened to load.
+    //
+    // Verified against `tflite.BuiltinOptions` rather than reasoned about.
     pub const NONE: u8 = 0;
     pub const CONV_2D: u8 = 1;
-    pub const CONCATENATION: u8 = 2;
+    pub const POOL_2D: u8 = 5;
     pub const SOFTMAX: u8 = 9;
-    pub const SPLIT: u8 = 13;
-    pub const POOL_2D: u8 = 22;
+    pub const CONCATENATION: u8 = 10;
+    pub const SPLIT: u8 = 35;
 }
 
 /// VTable field offsets for `SoftmaxOptions`.
