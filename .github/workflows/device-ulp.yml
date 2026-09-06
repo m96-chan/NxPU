@@ -7,6 +7,10 @@ name: Device ULP
 # experiments that happen to be about the same thing. Nothing here generates
 # a fixture; generating our own is how two measurements stop being comparable.
 on:
+  # Dispatch needs the file on the default branch, so the branch push trigger
+  # is how this runs before it is merged. Remove it when it is.
+  push:
+    branches: [feat/device-numerics]
   workflow_dispatch:
     inputs:
       set:

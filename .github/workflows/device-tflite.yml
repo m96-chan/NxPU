@@ -8,8 +8,6 @@ name: Device TFLite
 # Exploratory on purpose. Nothing here gates anything until we know what the
 # device actually answers.
 on:
-  push:
-    branches: [feat/device-tflite-verification]
   workflow_dispatch:
     inputs:
       example:
