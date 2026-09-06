@@ -63,6 +63,7 @@ The analysis module classifies entry points into known kernel patterns:
 |---------|-------------|
 | `MatMul` | Loop + accumulation over 2 input arrays + 1 output array |
 | `ElementWise` | Binary operation on arrays (Add, Sub, Mul, Div) |
+| `ElementWiseChain` | One tensor, an optional conversion, and a sequence of element-wise steps whose operands are whole tensors or dispatch-time scalars (`y + a*x`, `f32(q) * s1 * s2`) |
 | `Conv2D` | 2D convolution: nested loops + kernel window + accumulation |
 | `Pool` | Pooling: nested loops + reduction over spatial window (Max, Avg) |
 | `Activation` | Unary activation function (Relu, Sigmoid, Tanh, Softmax) |

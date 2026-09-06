@@ -333,6 +333,19 @@ fn generic_io(pattern: &KernelPattern) -> (Vec<TensorBinding>, String) {
             vec![data.clone(), indices.clone(), updates.clone()],
             "ScatterND".into(),
         ),
+        // Every arm above is one layer. A chain is several — a `Convert` and
+        // one `Multiply` or `Add` per step, threaded through intermediates —
+        // and this writer emits one layer per pattern, so it says so instead
+        // of writing a layer type OpenVINO has no operation for. The ONNX
+        // file emitted alongside `model.xml` does carry the real graph.
+        KernelPattern::ElementWiseChain { cast, steps, .. } => (
+            vec![],
+            format!(
+                "Unknown(element-wise chain {}: several layers, and this writer \
+                 emits one)",
+                nxpu_analysis::analyze::chain_summary(*cast, steps)
+            ),
+        ),
         KernelPattern::Unknown { reason } => (vec![], format!("Unknown({reason})")),
         // Covered patterns should not reach here.
         _ => (vec![], "Unknown".into()),

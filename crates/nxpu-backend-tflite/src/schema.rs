@@ -41,6 +41,7 @@ pub mod builtin_op {
     pub const SCATTER_ND: i32 = 122;
     pub const DEPTHWISE_CONV_2D: i32 = 4;
     pub const CUSTOM: i32 = 32;
+    pub const CAST: i32 = 53;
 }
 
 /// VTable field slot offsets for each TFLite FlatBuffer table.

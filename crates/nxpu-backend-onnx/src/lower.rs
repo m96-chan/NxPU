@@ -5,8 +5,9 @@
 
 use crate::proto::*;
 use nxpu_analysis::analyze::{
-    ActivationOp, Conv2DShape, ElementWiseOp, EmbeddedWeight, KernelPattern, MatMulShape, NormType,
-    PoolKind, PoolShape, ReduceOp, TensorBinding, normalize_axis,
+    ActivationOp, ChainOperand, ChainStep, Conv2DShape, ElementWiseOp, EmbeddedWeight,
+    KernelPattern, MatMulShape, NormType, PoolKind, PoolShape, ReduceOp, TensorBinding,
+    normalize_axis,
 };
 use nxpu_analysis::fusion::{FusedActivation, FusedPattern};
 use nxpu_backend_core::BackendError;
@@ -29,6 +30,13 @@ pub fn build_model(
             output,
             dim_name,
         } => build_elementwise_graph(*op, inputs, output, dim_name, ep_name),
+        KernelPattern::ElementWiseChain {
+            base,
+            cast,
+            steps,
+            output,
+            dim_name,
+        } => build_elementwise_chain_graph(base, *cast, steps, output, dim_name, ep_name),
         KernelPattern::Conv2D {
             input,
             weight,
@@ -542,6 +550,79 @@ fn build_elementwise_graph(
             c_name,
             output.elem_type,
             vec![TensorShapeDimension::symbolic(dim_name)],
+        )],
+    }
+}
+
+/// Build the graph for an element-wise chain: an optional `Cast`, then one
+/// node per step.
+///
+/// The scalars become rank-0 graph inputs — a tensor with no dimensions — not
+/// initializers. Their values are written per dispatch (`axpy`'s `a` changes
+/// every step; `dequantize`'s scales come from the quantizer), so folding them
+/// into the graph as constants would bake in whatever they happened to be when
+/// the kernel was compiled. ONNX broadcasts a rank-0 operand over the other
+/// side of every one of these operators.
+fn build_elementwise_chain_graph(
+    base: &TensorBinding,
+    cast: Option<i32>,
+    steps: &[ChainStep],
+    output: &TensorBinding,
+    dim_name: &str,
+    ep_name: &str,
+) -> GraphProto {
+    let vector = || vec![TensorShapeDimension::symbolic(dim_name)];
+
+    let mut inputs = vec![ValueInfoProto::tensor(&base.name, base.elem_type, vector())];
+    let mut nodes = Vec::with_capacity(steps.len() + 1);
+    let mut acc = base.name.clone();
+
+    if let Some(to) = cast {
+        let cast_name = format!("{}_cast", base.name);
+        nodes.push(NodeProto::with_attrs(
+            "Cast",
+            "cast_0",
+            vec![acc],
+            vec![cast_name.clone()],
+            vec![AttributeProto::int("to", i64::from(to))],
+        ));
+        acc = cast_name;
+    }
+
+    for (i, step) in steps.iter().enumerate() {
+        let operand_name = match &step.operand {
+            ChainOperand::Tensor(t) => {
+                inputs.push(ValueInfoProto::tensor(&t.name, t.elem_type, vector()));
+                t.name.clone()
+            }
+            ChainOperand::Scalar(s) => {
+                inputs.push(ValueInfoProto::tensor(&s.name, s.elem_type, vec![]));
+                s.name.clone()
+            }
+        };
+        let result = if i + 1 == steps.len() {
+            output.name.clone()
+        } else {
+            format!("{}_step{i}", output.name)
+        };
+        nodes.push(NodeProto::simple(
+            step.op.op_name(),
+            format!("{}_{i}", step.op.op_name().to_lowercase()),
+            vec![acc, operand_name],
+            vec![result.clone()],
+        ));
+        acc = result;
+    }
+
+    GraphProto {
+        name: ep_name.into(),
+        initializer: vec![],
+        node: nodes,
+        input: inputs,
+        output: vec![ValueInfoProto::tensor(
+            &output.name,
+            output.elem_type,
+            vector(),
         )],
     }
 }

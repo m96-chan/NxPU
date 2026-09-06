@@ -179,6 +179,21 @@ pub fn build_model(pattern: &KernelPattern, ep_name: &str) -> Result<Model, Back
             }];
             (inputs, outputs, operations)
         }
+        // Every op below is one MIL operation with a fixed operand list, and
+        // this builder emits exactly one of them per entry point. A chain is
+        // several, with an intermediate value between each pair and a rank-0
+        // operand on some of them, and neither the operation list nor the
+        // `multi_array(-1, -1)` feature descriptions below can carry that.
+        // Refusing says so; emitting the first step and dropping the rest
+        // would be a model that runs and computes something else.
+        KernelPattern::ElementWiseChain { cast, steps, .. } => {
+            return Err(BackendError::Unsupported(format!(
+                "cannot lower an element-wise chain ({}) to CoreML: this builder \
+                 emits one MIL operation per entry point, with no intermediate \
+                 values and no rank-0 operands",
+                nxpu_analysis::analyze::chain_summary(*cast, steps)
+            )));
+        }
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
                 "cannot lower Unknown pattern to CoreML: {reason}"

@@ -73,6 +73,7 @@ impl Backend for CoreMlBackend {
                 analyze::KernelPattern::Attention { .. } => "scaled_dot_product_attention",
                 analyze::KernelPattern::Gather { .. } => "gather",
                 analyze::KernelPattern::Scatter { .. } => "scatter",
+                analyze::KernelPattern::ElementWiseChain { .. } => "element-wise chain",
                 analyze::KernelPattern::Unknown { .. } => "Unknown",
             };
 
