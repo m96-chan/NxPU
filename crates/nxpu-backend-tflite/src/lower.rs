@@ -2462,10 +2462,15 @@ fn conv2d_graph(
     };
 
     let weight_index = tensors.len() as i32;
-    tensors.push(TensorInfo::input(
+    // PROBE ONLY, not for merge: the filter as a constant of zeros rather than
+    // a graph input, to find out whether that is why every MediaTek driver
+    // refuses our convolutions and accelerates the converter's at the same
+    // shapes. It computes zeros; the question is only whether it is taken.
+    tensors.push(TensorInfo::constant(
         weight.name.clone(),
         weight.elem_type,
         vec![channels_out, kernel_h, kernel_w, channels_in],
+        vec![0u8; (channels_out * kernel_h * kernel_w * channels_in) as usize * 4],
     ));
 
     // TFLite's CONV_2D kernel requires three inputs — `has_bias was not true`
@@ -2515,7 +2520,8 @@ fn conv2d_graph(
 
     // A constant is not a graph input; the synthesised bias and the paddings
     // are constants, and listing either here makes the model invalid.
-    let mut graph_inputs = vec![0, weight_index];
+    let mut graph_inputs = vec![0];
+    let _ = weight_index;
     if bias.is_some() {
         graph_inputs.push(bias_index);
     }
