@@ -1,0 +1,322 @@
+name: Operator matrix
+
+# Which operators a phone's accelerators actually take, and whether they will
+# take what NxPU emits.
+#
+# `crates/nxpu-backend-*/src/support.rs` holds hundreds of operator support
+# entries across eight vendors, every one read off a datasheet and never once
+# checked against silicon. This asks a phone instead, one operator at a time,
+# because a whole network cannot answer it: one refused node pushes its entire
+# partition back to the CPU and the result never says which node it was.
+#
+# Nothing here writes to `support.rs`. The output is evidence about one handset;
+# deciding how a measurement becomes a compiler's belief is a separate
+# judgement, and a table that quietly overwrote a vendor's documented behaviour
+# would be worse than the hand-written one.
+#
+# One handset per run, chosen by `soc-*` label. The drivers are per handset
+# too, and the two vendors here are arranged oppositely: Qualcomm ships no
+# NNAPI driver, so its Hexagon is reachable only through `qnn-htp`, while
+# MediaTek's accelerators *are* NNAPI drivers and are named as
+# `droidrunner-device devices` lists them.
+#
+# Dispatch-only. The device job costs the user's phone time.
+on:
+  workflow_dispatch:
+    inputs:
+      phone:
+        description: >-
+          Which handset to ask, by its `soc-*` runner label. Vendor labels are
+          not enough: two Snapdragons share them, and one of them once served
+          results from a stale build.
+        required: true
+        default: soc-qti-sm8550-qcom
+        type: choice
+        options:
+          - soc-qti-sm8550-qcom
+          - soc-mediatek-mt6899-mt6899
+      drivers:
+        description: >-
+          Accelerators to ask, space separated, and they are per handset. On a
+          Snapdragon the answer is `qnn-htp` -- Qualcomm's own runtime, not an
+          NNAPI device name, and it never appears in `droidrunner-device
+          devices`. On MT6899 the accelerators *are* NNAPI drivers and are
+          named as that command lists them: `mtk-neuron_shim mtk-mdla_shim
+          mtk-dsp_shim nnapi-reference`.
+        required: true
+        default: "qnn-htp"
+      symbolic-dim:
+        description: >-
+          Concrete extent for the dimensions an NxPU kernel leaves symbolic. A
+          WGSL kernel over `array<f32>` carries no length, and TFLite will not
+          load a model without one.
+        required: true
+        default: "64"
+
+permissions:
+  contents: read
+
+# Dispatch inputs reach the shell through the environment and never through
+# `${{ }}` inside a `run:` block, where the expansion happens before bash sees
+# the script and a value with a quote in it becomes a command.
+env:
+  SYMBOLIC_DIM: ${{ inputs.symbolic-dim || '64' }}
+  DRIVERS: ${{ inputs.drivers || 'qnn-htp' }}
+  PHONE: ${{ inputs.phone || 'soc-qti-sm8550-qcom' }}
+
+jobs:
+  # TensorFlow's converter and cargo both need a real machine. The phone's one
+  # scarce resource is the phone.
+  models:
+    name: Build the models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet "tensorflow-cpu==2.20.0"
+
+      - name: Build the CLI
+        run: cargo build --release -p nxpu-cli
+
+      # Half the matrix is what NxPU itself emits, so it is emitted here rather
+      # than approximated by a graph that looks similar. A compile that fails
+      # is recorded and not fatal: an example the backend refuses is a fact
+      # about the compiler, and the sweep still has everything else to ask.
+      - name: Compile every example to TFLite
+        run: |
+          mkdir -p nxpu-models
+          failed=0
+          for wgsl in examples/*.wgsl; do
+            name="$(basename "$wgsl" .wgsl)"
+            if ./target/release/nxpu "$wgsl" --target tflite --precision keep \
+                 --symbolic-dim "$SYMBOLIC_DIM" -o "nxpu-models/$name.tflite" \
+                 2> "nxpu-models/$name.err"; then
+              echo "ok   $name"
+            else
+              failed=$((failed + 1))
+              rm -f "nxpu-models/$name.tflite"
+              echo "::warning::nxpu would not compile $name to TFLite"
+              sed 's/^/    /' "nxpu-models/$name.err"
+            fi
+          done
+          rm -f nxpu-models/*.err
+          echo "$failed example(s) did not compile"
+          # Nothing to measure is not a measurement. Said here, before a phone
+          # is woken for it.
+          test -n "$(ls -A nxpu-models)"
+
+      # Flat, on purpose, and asserted. `upload-artifact` uploads the *contents*
+      # of a path, so a generator writing into `models/sub/` becomes
+      # `models/sub/` again on the device once the download path is joined —
+      # every path wrong, every row excluded, and the build green. Silence is
+      # the failure mode here, so the layout is checked rather than assumed.
+      - name: Build one model per operator, and take ours as they are
+        run: |
+          python tools/op-matrix/generate.py --out models --nxpu nxpu-models
+          test -s models/models.index
+          test -s models/models.json
+          test -z "$(find models -mindepth 1 -type d)" \
+            || { echo "::error::models/ must be flat"; exit 1; }
+          cut -f2 models/models.index | while read -r file; do
+            test -f "models/$file" || { echo "::error::$file is indexed and absent"; exit 1; }
+          done
+          echo "$(wc -l < models/models.index) models"
+          cat models/models.index
+
+      # Last, because it uploads what every step above wrote. Adding a path to
+      # an upload that runs before the step producing it can never work, and
+      # loses the artifact silently.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: op-matrix-models
+          path: models/
+          if-no-files-found: error
+
+  sweep:
+    name: Ask the NX729J
+    needs: models
+    # The `soc-*` label picks one handset. Vendor labels are not enough: two
+    # Snapdragons share them, and one of them once served results from a stale
+    # build. `env` is not available in `runs-on`, so this reads `inputs`.
+    runs-on:
+      - self-hosted
+      - android
+      - ${{ inputs.phone || 'soc-qti-sm8550-qcom' }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: op-matrix-models
+          path: models
+
+      - name: The models arrived
+        run: |
+          test -f models/models.index
+          test -s models/models.index
+          echo "$(wc -l < models/models.index) models, $(ls models/*.tflite | wc -l) files"
+
+      # Makes the QNN prerequisite visible in the log rather than implied by a
+      # sweep of refusals: the runtime is fetched on the phone after a licence
+      # acceptance, and a reflashed device silently loses it.
+      - name: What this phone has
+        run: |
+          droidrunner-device capabilities --output capabilities.json
+          test -s capabilities.json
+          droidrunner-device devices
+
+      # The phone has no python3 and no jq. Everything here is bash, and the
+      # reduction happens where the models were built.
+      - name: Ask every driver about every model
+        run: |
+          set -euo pipefail
+
+          # One entry per model, `iterations: 0` throughout: the question is
+          # whether the graph was accepted, and that is answered once tensors
+          # are allocated. Timing every model on every driver turns a two-minute
+          # sweep into an evening, for numbers nobody asked for.
+          manifest() {  # manifest [device]
+            local separator=""
+            printf '['
+            while IFS=$'\t' read -r id file operator precision source; do
+              printf '%s{"id":"%s","path":"%s/models/%s","iterations":0' \
+                "$separator" "$id" "$PWD" "$file"
+              if [ -n "${1:-}" ]; then printf ',"device":"%s"' "$1"; fi
+              printf '}'
+              separator=","
+            done < models/models.index
+            printf ']\n'
+          }
+
+          # The control: every model with no device at all. A model that will
+          # not run on the CPU either is a defect of ours, and filing it as an
+          # operator a driver refuses would put that defect into a table other
+          # people compile against.
+          manifest > manifest-cpu.json
+          droidrunner-device test batch manifest-cpu.json --budget-ms 900000 \
+            --output sweep-cpu.json > /dev/null
+          echo "control: $(grep -o '"id":' sweep-cpu.json | wc -l) rows"
+
+          # Every model failing on the CPU means the models never arrived, or
+          # arrived somewhere the agent will not read from. Whatever the
+          # drivers then say is meaningless, and stopping here says so instead
+          # of producing a green run and an empty table.
+          if ! grep -q '"ok": *true' sweep-cpu.json; then
+            echo "::error::the control sweep ran nothing at all"
+            head -c 600 sweep-cpu.json
+            exit 1
+          fi
+
+          # Deliberately unquoted below: the input is a space-separated list and
+          # is meant to split. Every name is checked before it is used.
+          for driver in $DRIVERS; do
+            case "$driver" in
+              *[!a-zA-Z0-9._-]*)
+                echo "::error::not a driver name: $driver"; exit 1 ;;
+            esac
+          done
+          echo "$DRIVERS" > drivers.txt
+          for driver in $DRIVERS; do
+            echo "=== $driver"
+            manifest "$driver" > "manifest-$driver.json"
+            droidrunner-device test batch "manifest-$driver.json" \
+              --budget-ms 900000 --output "sweep-$driver.json" > /dev/null
+            test -s "sweep-$driver.json"
+            rows=$(grep -o '"id":' "sweep-$driver.json" | wc -l)
+            took=$(grep -o '"delegated":' "sweep-$driver.json" | wc -l)
+            echo "$driver: $rows rows, $took with a delegation reported"
+            # `budgetExhausted` means the sweep stopped early and the rows that
+            # never ran are absent, not refused. A table built from a truncated
+            # sweep reads as a driver that refuses everything after row N.
+            if grep -q '"budgetExhausted": *true' "sweep-$driver.json"; then
+              echo "::error::$driver ran out of budget; the sweep is incomplete"
+              grep -o '"stoppedAt":[^,}]*' "sweep-$driver.json" || true
+              exit 1
+            fi
+          done
+
+      # Last in this job, for the same reason as in the one above.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: op-matrix-sweep
+          path: |
+            sweep-*.json
+            drivers.txt
+            capabilities.json
+          if-no-files-found: error
+
+  matrix:
+    name: Reduce it to a table
+    needs: [models, sweep]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: op-matrix-models
+          path: models
+      - uses: actions/download-artifact@v8
+        with:
+          name: op-matrix-sweep
+          path: sweep
+
+      - name: Reduce the sweep to a matrix
+        run: |
+          sweeps=""
+          for driver in $(cat sweep/drivers.txt); do
+            test -s "sweep/sweep-$driver.json"
+            sweeps="$sweeps --sweep $driver=sweep/sweep-$driver.json"
+          done
+          python tools/op-matrix/reduce.py \
+            --models models/models.json \
+            --control sweep/sweep-cpu.json \
+            --capabilities sweep/capabilities.json \
+            $sweeps --out matrix
+
+      - name: Put it where the run can be read
+        run: cat matrix/matrix.md >> "$GITHUB_STEP_SUMMARY"
+
+      # A driver arrives with the system image and is replaced by OTA updates
+      # nobody asks permission for, so the same question asked twice is the only
+      # way to notice it changed its mind.
+      - name: Against the table last committed for this phone
+        run: |
+          baseline="$(python tools/op-matrix/baseline-path.py matrix/matrix.json)"
+          if [ ! -f "$baseline" ]; then
+            echo "no baseline for this phone yet; to start one, take"
+            echo "matrix.json from this run's op-matrix artifact and commit it as"
+            echo "  $baseline"
+            exit 0
+          fi
+          status=0
+          python tools/op-matrix/compare.py "$baseline" matrix/matrix.json \
+            --json matrix/comparison.json | tee comparison.txt || status=$?
+          {
+            echo
+            echo '## Against the committed baseline'
+            echo
+            echo '```'
+            cat comparison.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 1 is a driver that stopped taking an operator; 2 is a comparison
+          # that could not happen. Neither is the other.
+          case $status in
+            0) ;;
+            1) echo "::error::a driver stopped taking an operator it used to take" ;;
+            *) echo "::error::the two matrices could not be compared" ;;
+          esac
+          exit $status
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: op-matrix
+          path: matrix/
+          if-no-files-found: error
