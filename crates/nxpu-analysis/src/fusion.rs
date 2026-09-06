@@ -373,6 +373,7 @@ mod tests {
                     dilation_w: 1,
                 },
                 bias: None,
+                activation: None,
             },
             KernelPattern::Normalization {
                 input: make_tensor("conv_out", TensorRole::Input),
@@ -450,6 +451,7 @@ mod tests {
                     dilation_w: 1,
                 },
                 bias: None,
+                activation: None,
             },
             KernelPattern::Normalization {
                 input: make_tensor("conv_out", TensorRole::Input),
@@ -712,6 +714,7 @@ mod tests {
                     dilation_w: 1,
                 },
                 bias: None,
+                activation: None,
             },
             norm: Box::new(KernelPattern::Normalization {
                 input: make_tensor("conv_out", TensorRole::Input),
@@ -823,6 +826,7 @@ mod tests {
                     dilation_w: 1,
                 },
                 bias: None,
+                activation: None,
             },
             norm: Box::new(KernelPattern::Normalization {
                 input: make_tensor("conv_out", TensorRole::Input),
@@ -1077,6 +1081,7 @@ mod tests {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         }];
 
         let fused = fuse_patterns(patterns);
@@ -1138,6 +1143,7 @@ mod tests {
                     dilation_w: 1,
                 },
                 bias: None,
+                activation: None,
             },
             KernelPattern::ElementWise {
                 op: ElementWiseOp::Add,

@@ -435,6 +435,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         };
         let norm = KernelPattern::Normalization {
             input: make_tensor("conv_out", TensorRole::Input),
@@ -549,6 +550,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         };
         let norm = KernelPattern::Normalization {
             input: make_tensor("conv_out", TensorRole::Input),
@@ -654,6 +656,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     dilation_w: 1,
                 },
                 bias: None,
+                activation: None,
             },
             norm: Box::new(KernelPattern::Normalization {
                 input: make_tensor("conv_out", TensorRole::Input),
@@ -872,6 +875,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 dilation_w: 1,
             },
             bias: None,
+            activation: None,
         };
         assert_eq!(pattern_summary(&conv), "CONV_2D");
 
