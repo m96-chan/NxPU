@@ -54,13 +54,33 @@ jobs:
             || echo "no vai_q_onnx"
           ls ~/.local/lib/python*/site-packages 2>/dev/null | grep -iE 'vitis|ryzen|voe' || true
 
-      # Deliberately last and deliberately allowed to fail: it says whether
-      # anything here can run a graph at all, which is the question the rest
-      # of the pipeline depends on.
-      - name: Can it run an ONNX graph
+      # `xrt-smi examine` failed with EAGAIN on a 64 MB mmap while the driver
+      # was loaded and the device node present. That is a limit or a lock, not
+      # a missing device, and the difference decides whether anything can be
+      # built here at all.
+      - name: Why the mmap failed
         continue-on-error: true
         run: |
-          python3 - <<'PY' || echo "could not run a graph"
-          import numpy as np, onnxruntime as ort
-          print("providers in this session:", ort.get_available_providers())
-          PY
+          echo "--- locked memory limit for this user"
+          ulimit -l
+          ulimit -a | head -20
+          echo "--- who holds the device"
+          ls -l /dev/accel/accel0
+          fuser -v /dev/accel/accel0 2>&1 | head -5 || echo "fuser unavailable"
+          echo "--- memory"
+          free -m | head -3
+          echo "--- retry under a raised limit, if the shell is allowed to"
+          (ulimit -l unlimited 2>/dev/null && xrt-smi examine 2>&1 | head -20) \
+            || echo "could not raise the locked-memory limit"
+
+      # onnxruntime is what the AMD backend's own advice depends on, and this
+      # machine runs Python 3.14 — new enough that a wheel may not exist. That
+      # is a different obstacle from a missing package and worth separating.
+      - name: Is an ONNX Runtime installable here
+        continue-on-error: true
+        run: |
+          python3 -m pip --version 2>&1 | head -2 || echo "no pip"
+          python3 -m pip index versions onnxruntime 2>&1 | head -5 \
+            || python3 -m pip install --dry-run onnxruntime 2>&1 | tail -5
+          echo "--- other interpreters on this machine"
+          ls /usr/bin/python3.* 2>/dev/null | head
