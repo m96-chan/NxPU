@@ -79,8 +79,10 @@ fn onnx_carries_the_bias() {
 }
 
 #[test]
-fn a_convolution_without_a_bias_still_emits() {
-    // The optional half of the change: two inputs, no bias, unchanged.
+fn a_convolution_without_a_bias_gets_one() {
+    // TFLite's CONV_2D kernel requires three inputs — `has_bias was not true`
+    // is a hard failure — so a convolution whose source has no bias is given
+    // one here, as a constant of zeros. The model is otherwise unloadable.
     let source = CONV_WITH_BIAS
         .replace(
             "@group(0) @binding(2) var<storage, read> bias: array<f32>;\n",
@@ -94,5 +96,8 @@ fn a_convolution_without_a_bias_still_emits() {
         .replace("@binding(4) var<uniform>", "@binding(3) var<uniform>");
     let bytes = compile(&TfLiteBackend, &source);
     assert_eq!(&bytes[4..8], b"TFL3");
-    assert!(!contains(&bytes, "bias"));
+    assert!(
+        contains(&bytes, "bias"),
+        "a synthesised bias tensor is required for the model to load"
+    );
 }

@@ -32,7 +32,7 @@ pub mod builtin_op {
     pub const SUB: i32 = 41;
     pub const DIV: i32 = 42;
     pub const REDUCE_MAX: i32 = 82;
-    pub const REDUCE_MIN: i32 = 83;
+    pub const REDUCE_MIN: i32 = 89; // 83 is REDUCE_PROD
     pub const SUM: i32 = 74;
     pub const CONCATENATION: i32 = 2;
     pub const SPLIT: i32 = 49;
@@ -41,6 +41,8 @@ pub mod builtin_op {
     pub const SCATTER_ND: i32 = 122;
     pub const DEPTHWISE_CONV_2D: i32 = 4;
     pub const CUSTOM: i32 = 32;
+    pub const CAST: i32 = 53;
+    pub const GELU: i32 = 150;
 }
 
 /// VTable field slot offsets for each TFLite FlatBuffer table.
@@ -86,12 +88,23 @@ pub mod vt {
 /// TFLite `BuiltinOptionsType` enum values (union discriminant stored in operator.builtin_options_type).
 #[allow(dead_code)]
 pub mod builtin_options_type {
+    // Union member indices from TFLite's `BuiltinOptions`, which are unrelated
+    // to the builtin operator codes above and do not follow them.
+    //
+    // Three of these were wrong, and each produced a different failure because
+    // the index selects how TFLite *interprets the options table*: POOL_2D was
+    // 22, which is PadOptions, so a pool's strides were read as absent and
+    // came back zero; SPLIT was 13, LocalResponseNormalizationOptions, and
+    // reading a SplitOptions table as one segfaulted the interpreter;
+    // CONCATENATION was 2, DepthwiseConv2DOptions, which happened to load.
+    //
+    // Verified against `tflite.BuiltinOptions` rather than reasoned about.
     pub const NONE: u8 = 0;
     pub const CONV_2D: u8 = 1;
-    pub const CONCATENATION: u8 = 2;
+    pub const POOL_2D: u8 = 5;
     pub const SOFTMAX: u8 = 9;
-    pub const SPLIT: u8 = 13;
-    pub const POOL_2D: u8 = 22;
+    pub const CONCATENATION: u8 = 10;
+    pub const SPLIT: u8 = 35;
 }
 
 /// VTable field offsets for `SoftmaxOptions`.

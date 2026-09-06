@@ -6,8 +6,8 @@
 use flatbuffers::FlatBufferBuilder;
 use nxpu_analysis::analyze::data_type;
 use nxpu_analysis::analyze::{
-    ActivationOp, Conv2DShape, ElementWiseOp, KernelPattern, PoolKind, PoolShape, ReduceOp,
-    TensorBinding,
+    ActivationOp, ChainOperand, ChainStep, Conv2DShape, ElementWiseOp, KernelPattern, PoolKind,
+    PoolShape, ReduceOp, TensorBinding,
 };
 use nxpu_analysis::fusion::FusedPattern;
 use nxpu_backend_core::BackendError;
@@ -83,6 +83,12 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
                 extent,
             )
         }
+        // Several operators, so it goes through the multi-op builder rather
+        // than through `build_tflite`, which emits exactly one.
+        KernelPattern::ElementWiseChain { .. } => {
+            let desc = collect_single_graph(pattern)?;
+            build_from_graph_desc(&desc, extent)
+        }
         KernelPattern::Conv2D {
             input,
             weight,
@@ -111,14 +117,24 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
                 op,
                 ActivationOp::Gelu | ActivationOp::Silu | ActivationOp::Mish
             ) {
-                // No direct TFLite op for GELU/SiLU/Mish -- use CUSTOM
+                // GELU is builtin 150. It went out as CUSTOM with no
+                // custom_code, which no interpreter can register — the model
+                // was rejected before anything looked at what it computed.
+                // SiLU and Mish have no builtin and remain custom, and remain
+                // unloadable for the same reason; naming them here is the
+                // honest half.
                 let shapes = [vec![-1i32], vec![-1]];
+                let opcode = if matches!(op, ActivationOp::Gelu) {
+                    builtin_op::GELU
+                } else {
+                    builtin_op::CUSTOM
+                };
                 build_tflite_unary(
                     input,
                     output,
                     &shapes[0],
                     &shapes[1],
-                    builtin_op::CUSTOM,
+                    opcode,
                     &format!("{}_1d", op.op_name().to_lowercase()),
                     extent,
                 )
@@ -142,7 +158,10 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
             }
         }
         KernelPattern::Reduce {
-            op, input, output, ..
+            op,
+            input,
+            output,
+            axis,
         } => {
             let shapes = [vec![-1, -1], vec![-1]];
             let opcode = match op {
@@ -151,27 +170,24 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
                 ReduceOp::Max => builtin_op::REDUCE_MAX,
                 ReduceOp::Min => builtin_op::REDUCE_MIN,
             };
-            build_tflite_unary(
+            build_tflite_reduce(
                 input,
                 output,
                 &shapes[0],
                 &shapes[1],
                 opcode,
                 &format!("{}_reduce", op.op_name().to_lowercase()),
+                *axis,
                 extent,
             )
         }
-        KernelPattern::Transpose { input, output, .. } => {
-            let shapes = [vec![-1, -1], vec![-1, -1]];
-            build_tflite_unary(
-                input,
-                output,
-                &shapes[0],
-                &shapes[1],
-                builtin_op::TRANSPOSE,
-                "transpose",
-                extent,
-            )
+        KernelPattern::Transpose {
+            input,
+            output,
+            perm,
+        } => {
+            let dims: Vec<i32> = vec![-1i32; perm.len().max(2)];
+            build_tflite_transpose(input, output, &dims, &dims, perm, extent)
         }
         KernelPattern::Reshape { input, output, .. } => {
             let shapes = [vec![-1i32], vec![-1]];
@@ -221,9 +237,16 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
             output,
             ..
         } => {
+            // TFLite refuses UINT32 positions. WGSL indexes with u32, and
+            // for a non-negative index the bytes are identical, so what has
+            // to change is the declared type rather than the data.
+            let indices_i32 = TensorBinding {
+                elem_type: data_type::INT32,
+                ..indices.clone()
+            };
             let shapes = [vec![-1i32], vec![-1], vec![-1]];
             build_tflite(
-                &[data, indices],
+                &[data, &indices_i32],
                 output,
                 &shapes,
                 builtin_op::GATHER,
@@ -232,21 +255,34 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
             )
         }
         KernelPattern::Scatter {
-            data,
             indices,
             updates,
             output,
             ..
         } => {
-            let shapes = [vec![-1i32], vec![-1], vec![-1]];
-            build_tflite(
-                &[data, indices, updates],
-                output,
-                &shapes,
-                builtin_op::SCATTER_ND,
-                "scatter_nd",
-                extent,
-            )
+            // TFLite's SCATTER_ND is `(indices, updates, shape)`. Emitting
+            // `(data, indices, updates)` made the runtime read the indices as
+            // the updates and refuse them for being UINT32 — the type error
+            // was a symptom of the operands being in the wrong places.
+            //
+            // The base tensor is not dropped information: the kernel these
+            // patterns come from never reads it. `output[indices[i]] =
+            // updates[i]` scatters into a fresh tensor, which is what
+            // SCATTER_ND does.
+            //
+            // It still does not load. SCATTER_ND checks its operands against
+            // each other — `updates.DimensionsCount() - outer_dims ==
+            // shape.Dims(0) - ix` — and that needs real ranks, while every
+            // tensor this backend emits is rank-1 with a symbolic extent.
+            // `TensorBinding` carries an element type and no shape, so there
+            // is nothing here to satisfy the check with. The operand order and
+            // the index type are fixed because they were wrong on their own
+            // terms; the rest waits for shapes.
+            let indices_i32 = TensorBinding {
+                elem_type: data_type::INT32,
+                ..indices.clone()
+            };
+            build_tflite_scatter(&indices_i32, output, &[-1i32], &[-1i32], updates, extent)
         }
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
@@ -604,6 +640,109 @@ fn collect_matmul_bias_graph(
     })
 }
 
+/// Build a [`GraphDesc`] for an element-wise chain: an optional `CAST`,
+/// then one binary operator per step.
+///
+/// The scalars get rank-0 tensors — a shape of no dimensions, not a length-one
+/// vector — because that is what they are, and TFLite broadcasts them over the
+/// other operand. Giving them `[1]` would be a claim about a dimension the
+/// kernel does not have.
+fn collect_elementwise_chain_graph(
+    base: &TensorBinding,
+    cast: Option<i32>,
+    steps: &[ChainStep],
+    output: &TensorBinding,
+) -> Result<GraphDesc, BackendError> {
+    let vector = vec![-1i32];
+    let scalar: Vec<i32> = Vec::new();
+
+    let mut tensors = vec![TensorInfo {
+        name: base.name.clone(),
+        elem_type: base.elem_type,
+        shape: vector.clone(),
+    }];
+    let mut graph_inputs = vec![0i32];
+    let mut ops: Vec<OpDesc> = Vec::new();
+    let mut acc = 0i32;
+    // The type the accumulator carries: the base's, until a cast changes it.
+    let mut acc_type = base.elem_type;
+
+    if let Some(to) = cast {
+        acc_type = to;
+        let idx = tensors.len() as i32;
+        tensors.push(TensorInfo {
+            name: format!("{}_cast", base.name),
+            elem_type: to,
+            shape: vector.clone(),
+        });
+        ops.push(OpDesc {
+            opcode: builtin_op::CAST,
+            inputs: vec![acc],
+            outputs: vec![idx],
+        });
+        acc = idx;
+    }
+
+    for (i, step) in steps.iter().enumerate() {
+        let opcode = match step.op {
+            ElementWiseOp::Add => builtin_op::ADD,
+            ElementWiseOp::Sub => builtin_op::SUB,
+            ElementWiseOp::Mul => builtin_op::MUL,
+            ElementWiseOp::Div => builtin_op::DIV,
+        };
+        let operand_idx = tensors.len() as i32;
+        match &step.operand {
+            ChainOperand::Tensor(t) => tensors.push(TensorInfo {
+                name: t.name.clone(),
+                elem_type: t.elem_type,
+                shape: vector.clone(),
+            }),
+            ChainOperand::Scalar(s) => tensors.push(TensorInfo {
+                name: s.name.clone(),
+                elem_type: s.elem_type,
+                shape: scalar.clone(),
+            }),
+        }
+        graph_inputs.push(operand_idx);
+
+        let last = i + 1 == steps.len();
+        let result_idx = tensors.len() as i32;
+        tensors.push(if last {
+            TensorInfo {
+                name: output.name.clone(),
+                elem_type: output.elem_type,
+                shape: vector.clone(),
+            }
+        } else {
+            TensorInfo {
+                name: format!("{}_step{i}", output.name),
+                elem_type: acc_type,
+                shape: vector.clone(),
+            }
+        });
+        ops.push(OpDesc {
+            opcode,
+            inputs: vec![acc, operand_idx],
+            outputs: vec![result_idx],
+        });
+        acc = result_idx;
+    }
+
+    if ops.is_empty() {
+        return Err(BackendError::Other(
+            "element-wise chain with no steps".into(),
+        ));
+    }
+
+    Ok(GraphDesc {
+        tensors,
+        ops,
+        graph_inputs,
+        graph_outputs: vec![acc],
+        graph_name: nxpu_analysis::analyze::chain_summary(cast, steps).to_lowercase(),
+    })
+}
+
 /// Build a [`GraphDesc`] for a single [`KernelPattern`].
 ///
 /// Handles the patterns that can be represented as a simple 1-op (or
@@ -761,7 +900,11 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                 ActivationOp::Sigmoid => builtin_op::LOGISTIC,
                 ActivationOp::Tanh => builtin_op::TANH,
                 ActivationOp::Softmax => builtin_op::SOFTMAX,
-                ActivationOp::Gelu | ActivationOp::Silu | ActivationOp::Mish => builtin_op::CUSTOM,
+                // GELU is builtin 150. It used to go out as CUSTOM with no
+                // custom_code, which no interpreter can register; Silu and
+                // Mish have no builtin and stay custom.
+                ActivationOp::Gelu => builtin_op::GELU,
+                ActivationOp::Silu | ActivationOp::Mish => builtin_op::CUSTOM,
             };
             let shape_1d = vec![-1i32];
             Ok(GraphDesc {
@@ -968,7 +1111,10 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                     },
                     TensorInfo {
                         name: indices.name.clone(),
-                        elem_type: indices.elem_type,
+                        // TFLite refuses UINT32 positions. WGSL indexes with
+                        // u32, and for a non-negative index the bytes are the
+                        // same, so the declared type is what has to change.
+                        elem_type: data_type::INT32,
                         shape: shape_1d.clone(),
                     },
                     TensorInfo {
@@ -1028,6 +1174,13 @@ fn collect_single_graph(pattern: &KernelPattern) -> Result<GraphDesc, BackendErr
                 graph_name: "scatter_nd".into(),
             })
         }
+        KernelPattern::ElementWiseChain {
+            base,
+            cast,
+            steps,
+            output,
+            ..
+        } => collect_elementwise_chain_graph(base, *cast, steps, output),
         // Patterns that are complex (Attention, Split) fall back to build_model.
         KernelPattern::Attention { .. } | KernelPattern::Split { .. } => Err(BackendError::Other(
             "complex pattern: use build_model fallback".into(),
@@ -1368,6 +1521,408 @@ fn build_tflite_unary(
 /// Build a TFLite model for BatchNorm as MUL(input, scale) → ADD(mul_result, bias).
 ///
 /// Emits a 2-operator subgraph since TFLite has no native BatchNorm op.
+/// Build a reduction: `(input, axes) -> output`.
+///
+/// The parameter count follows `build_tflite_unary`, which this is a variant
+/// of; the same allow is used elsewhere in this file for the same reason.
+///
+/// Separate from [`build_tflite_unary`] because TFLite's reducers are not
+/// unary — the axes arrive as a second input tensor, and a SUM emitted with
+/// one input is rejected before anything runs.
+#[allow(clippy::too_many_arguments)]
+fn build_tflite_reduce(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    in_shape: &[i32],
+    out_shape: &[i32],
+    opcode: i32,
+    graph_name: &str,
+    axis: i64,
+    extent: i32,
+) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::with_capacity(1024);
+
+    let name_in = fbb.create_string(&input.name);
+    let name_out = fbb.create_string(&output.name);
+    let desc = fbb.create_string("nxpu");
+    let sg_name = fbb.create_string(graph_name);
+
+    let shape_in = shape_vector(&mut fbb, in_shape, extent);
+    let shape_out = shape_vector(&mut fbb, out_shape, extent);
+    // The axes tensor: one i32, held in a constant buffer.
+    let shape_axes = shape_vector(&mut fbb, &[1i32], extent);
+    let name_axes = fbb.create_string("reduce_axes");
+    let axes_data = fbb.create_vector(&(axis as i32).to_le_bytes());
+
+    // TFLite's reducers take (input, axes); a single-input SUM is rejected
+    // with `NumInputs(node) != 2`. The axes tensor is a constant, so it is not
+    // a graph input.
+    let op_inputs = fbb.create_vector(&[0i32, 1]);
+    let op_outputs = fbb.create_vector(&[2i32]);
+    let sg_inputs = fbb.create_vector(&[0i32]);
+    let sg_outputs = fbb.create_vector(&[2i32]);
+
+    // 3 buffers: sentinel + input + output
+    let mut buffer_offsets = Vec::new();
+    for i in 0..4 {
+        let start = fbb.start_table();
+        // Buffer 2 holds the axes constant.
+        if i == 2 {
+            fbb.push_slot_always(vt::buffer::DATA, axes_data);
+        }
+        buffer_offsets.push(fbb.end_table(start));
+    }
+    let buffers = fbb.create_vector(&buffer_offsets);
+
+    let tensor_in = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_in);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(input.elem_type), 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 1, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_in);
+        fbb.end_table(start)
+    };
+    let tensor_out = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_out);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 3, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_out);
+        fbb.end_table(start)
+    };
+    let tensor_axes = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_axes);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, tensor_type::INT32, 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 2, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_axes);
+        fbb.end_table(start)
+    };
+    let tensors = fbb.create_vector(&[tensor_in, tensor_axes, tensor_out]);
+
+    let deprecated_code = if opcode <= 127 { opcode as i8 } else { 127 };
+    let opcode_table = {
+        let start = fbb.start_table();
+        fbb.push_slot::<i8>(
+            vt::operator_code::DEPRECATED_BUILTIN_CODE,
+            deprecated_code,
+            0,
+        );
+        fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
+        fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, opcode, 0);
+        fbb.end_table(start)
+    };
+    let operator_codes = fbb.create_vector(&[opcode_table]);
+
+    let operator = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 0, 0);
+        fbb.push_slot_always(vt::operator::INPUTS, op_inputs);
+        fbb.push_slot_always(vt::operator::OUTPUTS, op_outputs);
+        fbb.end_table(start)
+    };
+    let operators = fbb.create_vector(&[operator]);
+
+    let subgraph = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::sub_graph::TENSORS, tensors);
+        fbb.push_slot_always(vt::sub_graph::INPUTS, sg_inputs);
+        fbb.push_slot_always(vt::sub_graph::OUTPUTS, sg_outputs);
+        fbb.push_slot_always(vt::sub_graph::OPERATORS, operators);
+        fbb.push_slot_always(vt::sub_graph::NAME, sg_name);
+        fbb.end_table(start)
+    };
+    let subgraphs = fbb.create_vector(&[subgraph]);
+
+    let model = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::model::VERSION, 3, 0);
+        fbb.push_slot_always(vt::model::OPERATOR_CODES, operator_codes);
+        fbb.push_slot_always(vt::model::SUBGRAPHS, subgraphs);
+        fbb.push_slot_always(vt::model::DESCRIPTION, desc);
+        fbb.push_slot_always(vt::model::BUFFERS, buffers);
+        fbb.end_table(start)
+    };
+
+    fbb.finish(model, Some(TFLITE_FILE_ID));
+    fbb.finished_data().to_vec()
+}
+
+/// Build a TFLite model for BatchNorm as MUL(input, scale) → ADD(mul_result, bias).
+///
+/// Emits a 2-operator subgraph since TFLite has no native BatchNorm op.
+/// Build a scatter: `(indices, updates, shape) -> output`.
+///
+/// SCATTER_ND builds its output rather than editing an existing tensor, so it
+/// takes a shape and no base. The kernels this comes from never read their
+/// `data` binding either — `output[indices[i]] = updates[i]` — so nothing is
+/// lost by leaving it out.
+/// Build a transpose: `(input, perm) -> output`.
+///
+/// The permutation is an operand, not an attribute — a TRANSPOSE emitted with
+/// one input is rejected with `NumInputs(node) != 2`, which is how the first
+/// kernel this backend ever recognised as a Transpose turned out to be
+/// unloadable.
+fn build_tflite_transpose(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    in_shape: &[i32],
+    out_shape: &[i32],
+    perm: &[i64],
+    extent: i32,
+) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::with_capacity(1024);
+
+    let name_in = fbb.create_string(&input.name);
+    let name_out = fbb.create_string(&output.name);
+    let desc = fbb.create_string("nxpu");
+    let sg_name = fbb.create_string("transpose");
+
+    let shape_in = shape_vector(&mut fbb, in_shape, extent);
+    let shape_out = shape_vector(&mut fbb, out_shape, extent);
+    // The permutation, as an i32 constant. TRANSPOSE takes it as a second
+    // input; without it the kernel is rejected with `NumInputs(node) != 2`.
+    let shape_perm = shape_vector(&mut fbb, &[perm.len() as i32], extent);
+    let name_perm = fbb.create_string("perm");
+    let perm_bytes: Vec<u8> = perm
+        .iter()
+        .flat_map(|p| (*p as i32).to_le_bytes())
+        .collect();
+    let perm_data = fbb.create_vector(&perm_bytes);
+
+    // (input, perm) -> output. The permutation is a constant, so the graph's
+    // only input is the tensor being transposed.
+    let op_inputs = fbb.create_vector(&[0i32, 1]);
+    let op_outputs = fbb.create_vector(&[2i32]);
+    let sg_inputs = fbb.create_vector(&[0i32]);
+    let sg_outputs = fbb.create_vector(&[2i32]);
+
+    // 3 buffers: sentinel + input + output
+    let mut buffer_offsets = Vec::new();
+    for i in 0..4 {
+        let start = fbb.start_table();
+        // Buffer 2 holds the permutation.
+        if i == 2 {
+            fbb.push_slot_always(vt::buffer::DATA, perm_data);
+        }
+        buffer_offsets.push(fbb.end_table(start));
+    }
+    let buffers = fbb.create_vector(&buffer_offsets);
+
+    let tensor_in = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_in);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(input.elem_type), 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 1, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_in);
+        fbb.end_table(start)
+    };
+    let tensor_out = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_out);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 3, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_out);
+        fbb.end_table(start)
+    };
+    let tensor_perm = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_perm);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, tensor_type::INT32, 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 2, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_perm);
+        fbb.end_table(start)
+    };
+    let tensors = fbb.create_vector(&[tensor_in, tensor_perm, tensor_out]);
+
+    let opcode = builtin_op::TRANSPOSE;
+    let deprecated_code = if opcode <= 127 { opcode as i8 } else { 127 };
+    let opcode_table = {
+        let start = fbb.start_table();
+        fbb.push_slot::<i8>(
+            vt::operator_code::DEPRECATED_BUILTIN_CODE,
+            deprecated_code,
+            0,
+        );
+        fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
+        fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, opcode, 0);
+        fbb.end_table(start)
+    };
+    let operator_codes = fbb.create_vector(&[opcode_table]);
+
+    let operator = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 0, 0);
+        fbb.push_slot_always(vt::operator::INPUTS, op_inputs);
+        fbb.push_slot_always(vt::operator::OUTPUTS, op_outputs);
+        fbb.end_table(start)
+    };
+    let operators = fbb.create_vector(&[operator]);
+
+    let subgraph = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::sub_graph::TENSORS, tensors);
+        fbb.push_slot_always(vt::sub_graph::INPUTS, sg_inputs);
+        fbb.push_slot_always(vt::sub_graph::OUTPUTS, sg_outputs);
+        fbb.push_slot_always(vt::sub_graph::OPERATORS, operators);
+        fbb.push_slot_always(vt::sub_graph::NAME, sg_name);
+        fbb.end_table(start)
+    };
+    let subgraphs = fbb.create_vector(&[subgraph]);
+
+    let model = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::model::VERSION, 3, 0);
+        fbb.push_slot_always(vt::model::OPERATOR_CODES, operator_codes);
+        fbb.push_slot_always(vt::model::SUBGRAPHS, subgraphs);
+        fbb.push_slot_always(vt::model::DESCRIPTION, desc);
+        fbb.push_slot_always(vt::model::BUFFERS, buffers);
+        fbb.end_table(start)
+    };
+
+    fbb.finish(model, Some(TFLITE_FILE_ID));
+    fbb.finished_data().to_vec()
+}
+
+/// Build a TFLite model for BatchNorm as MUL(input, scale) → ADD(mul_result, bias).
+///
+/// Emits a 2-operator subgraph since TFLite has no native BatchNorm op.
+/// Build a scatter: `(indices, updates, shape) -> output`.
+///
+/// SCATTER_ND builds its output rather than editing an existing tensor, so it
+/// takes a shape and no base. The kernels this comes from never read their
+/// `data` binding either — `output[indices[i]] = updates[i]` — so nothing is
+/// lost by leaving it out.
+fn build_tflite_scatter(
+    input: &TensorBinding,
+    output: &TensorBinding,
+    in_shape: &[i32],
+    out_shape: &[i32],
+    updates: &TensorBinding,
+    extent: i32,
+) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::with_capacity(1024);
+
+    let name_in = fbb.create_string(&input.name);
+    let name_updates = fbb.create_string(&updates.name);
+    let name_out = fbb.create_string(&output.name);
+    let desc = fbb.create_string("nxpu");
+    let sg_name = fbb.create_string("scatter_nd");
+
+    let shape_in = shape_vector(&mut fbb, in_shape, extent);
+    let shape_out = shape_vector(&mut fbb, out_shape, extent);
+    // The shape operand: SCATTER_ND builds its output rather than editing
+    // one, so it has to be told how big that output is. One i32, because
+    // everything this backend emits is rank-1 at the extent it was given.
+    let shape_shape = shape_vector(&mut fbb, &[1i32], extent);
+    let name_shape = fbb.create_string("scatter_shape");
+    let shape_data = fbb.create_vector(&extent.max(1).to_le_bytes());
+
+    // (indices, updates, shape) -> output. The shape is a constant, so the
+    // graph's inputs are the first two.
+    let op_inputs = fbb.create_vector(&[0i32, 1, 2]);
+    let op_outputs = fbb.create_vector(&[3i32]);
+    let sg_inputs = fbb.create_vector(&[0i32, 1]);
+    let sg_outputs = fbb.create_vector(&[3i32]);
+
+    // 3 buffers: sentinel + input + output
+    let mut buffer_offsets = Vec::new();
+    for i in 0..5 {
+        let start = fbb.start_table();
+        // Buffer 3 holds the shape constant.
+        if i == 3 {
+            fbb.push_slot_always(vt::buffer::DATA, shape_data);
+        }
+        buffer_offsets.push(fbb.end_table(start));
+    }
+    let buffers = fbb.create_vector(&buffer_offsets);
+
+    let tensor_in = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_in);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(input.elem_type), 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 1, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_in);
+        fbb.end_table(start)
+    };
+    let tensor_out = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_out);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 4, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_out);
+        fbb.end_table(start)
+    };
+    let tensor_updates = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_out);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(updates.elem_type), 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 2, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_updates);
+        fbb.end_table(start)
+    };
+    let tensor_shape = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::tensor::SHAPE, shape_shape);
+        fbb.push_slot::<i8>(vt::tensor::TYPE, tensor_type::INT32, 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 3, 0);
+        fbb.push_slot_always(vt::tensor::NAME, name_shape);
+        fbb.end_table(start)
+    };
+    let tensors = fbb.create_vector(&[tensor_in, tensor_updates, tensor_shape, tensor_out]);
+
+    let opcode = builtin_op::SCATTER_ND;
+    let deprecated_code = if opcode <= 127 { opcode as i8 } else { 127 };
+    let opcode_table = {
+        let start = fbb.start_table();
+        fbb.push_slot::<i8>(
+            vt::operator_code::DEPRECATED_BUILTIN_CODE,
+            deprecated_code,
+            0,
+        );
+        fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
+        fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, opcode, 0);
+        fbb.end_table(start)
+    };
+    let operator_codes = fbb.create_vector(&[opcode_table]);
+
+    let operator = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::operator::OPCODE_INDEX, 0, 0);
+        fbb.push_slot_always(vt::operator::INPUTS, op_inputs);
+        fbb.push_slot_always(vt::operator::OUTPUTS, op_outputs);
+        fbb.end_table(start)
+    };
+    let operators = fbb.create_vector(&[operator]);
+
+    let subgraph = {
+        let start = fbb.start_table();
+        fbb.push_slot_always(vt::sub_graph::TENSORS, tensors);
+        fbb.push_slot_always(vt::sub_graph::INPUTS, sg_inputs);
+        fbb.push_slot_always(vt::sub_graph::OUTPUTS, sg_outputs);
+        fbb.push_slot_always(vt::sub_graph::OPERATORS, operators);
+        fbb.push_slot_always(vt::sub_graph::NAME, sg_name);
+        fbb.end_table(start)
+    };
+    let subgraphs = fbb.create_vector(&[subgraph]);
+
+    let model = {
+        let start = fbb.start_table();
+        fbb.push_slot::<u32>(vt::model::VERSION, 3, 0);
+        fbb.push_slot_always(vt::model::OPERATOR_CODES, operator_codes);
+        fbb.push_slot_always(vt::model::SUBGRAPHS, subgraphs);
+        fbb.push_slot_always(vt::model::DESCRIPTION, desc);
+        fbb.push_slot_always(vt::model::BUFFERS, buffers);
+        fbb.end_table(start)
+    };
+
+    fbb.finish(model, Some(TFLITE_FILE_ID));
+    fbb.finished_data().to_vec()
+}
+
+/// Build a TFLite model for BatchNorm as MUL(input, scale) → ADD(mul_result, bias).
+///
+/// Emits a 2-operator subgraph since TFLite has no native BatchNorm op.
 fn build_tflite_batchnorm(
     input: &TensorBinding,
     scale: &TensorBinding,
@@ -1650,16 +2205,24 @@ fn build_tflite_conv2d(
     let shape_4d = shape_vector(&mut fbb, &[-1i32, -1, -1, -1], extent);
     // Per-output-channel, so one dimension rather than four.
     let shape_1d = shape_vector(&mut fbb, &[-1i32], extent);
-    let name_bias = bias.map(|b| fbb.create_string(&b.name));
-
-    // With a bias the output tensor moves to index 3, because the bias is
-    // appended before it.
-    let out_index = if bias.is_some() { 3i32 } else { 2 };
-    let op_inputs = if bias.is_some() {
-        fbb.create_vector(&[0i32, 1, 2])
+    // TFLite's CONV_2D kernel requires three inputs — `has_bias was not true`
+    // is a hard failure, not a fallback — so a convolution whose source has no
+    // bias still gets one here, as a constant of zeros.
+    let bias_name = bias
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|| "bias".into());
+    let name_bias = fbb.create_string(&bias_name);
+    let zero_bias = if bias.is_none() {
+        let zeros = vec![0u8; (extent.max(1) as usize) * 4];
+        Some(fbb.create_vector(&zeros))
     } else {
-        fbb.create_vector(&[0i32, 1])
+        None
     };
+
+    // Always three inputs and the output at index 3. When the bias is
+    // synthesised it is a constant, so it is not a graph input.
+    let out_index = 3i32;
+    let op_inputs = fbb.create_vector(&[0i32, 1, 2]);
     let op_outputs = fbb.create_vector(&[out_index]);
     let sg_inputs = if bias.is_some() {
         fbb.create_vector(&[0i32, 1, 2])
@@ -1668,11 +2231,20 @@ fn build_tflite_conv2d(
     };
     let sg_outputs = fbb.create_vector(&[out_index]);
 
-    // sentinel + input + weight + output, and the bias when there is one
-    let buffer_count = if bias.is_some() { 5 } else { 4 };
+    // sentinel + input + weight + bias + output
     let mut buffer_offsets = Vec::new();
-    for _ in 0..buffer_count {
+    for i in 0..5 {
         let start = fbb.start_table();
+        // Buffer 3 is the bias. When it was synthesised it carries zeros;
+        // when it came from the kernel it is a graph input and stays empty.
+        // Nested rather than a let-chain: those are stable from 1.88 and
+        // this workspace's rust-version is 1.87.
+        #[allow(clippy::collapsible_if)]
+        if i == 3 {
+            if let Some(data) = zero_bias {
+                fbb.push_slot_always(vt::buffer::DATA, data);
+            }
+        }
         buffer_offsets.push(fbb.end_table(start));
     }
     let buffers = fbb.create_vector(&buffer_offsets);
@@ -1693,31 +2265,30 @@ fn build_tflite_conv2d(
         fbb.push_slot_always(vt::tensor::NAME, name_w);
         fbb.end_table(start)
     };
-    let tensor_bias = name_bias.map(|name| {
+    let tensor_bias = {
         let start = fbb.start_table();
         fbb.push_slot_always(vt::tensor::SHAPE, shape_1d);
+        // A synthesised bias is f32 whatever the inputs are; TFLite requires
+        // the bias to match the accumulator, not the operands.
         fbb.push_slot::<i8>(
             vt::tensor::TYPE,
-            onnx_to_tflite_type(bias.expect("name implies binding").elem_type),
+            bias.map_or(tensor_type::FLOAT32, |b| onnx_to_tflite_type(b.elem_type)),
             0,
         );
         fbb.push_slot::<u32>(vt::tensor::BUFFER, 3, 0);
-        fbb.push_slot_always(vt::tensor::NAME, name);
+        fbb.push_slot_always(vt::tensor::NAME, name_bias);
         fbb.end_table(start)
-    });
+    };
 
     let tensor_out = {
         let start = fbb.start_table();
         fbb.push_slot_always(vt::tensor::SHAPE, shape_4d);
         fbb.push_slot::<i8>(vt::tensor::TYPE, onnx_to_tflite_type(output.elem_type), 0);
-        fbb.push_slot::<u32>(vt::tensor::BUFFER, buffer_count as u32 - 1, 0);
+        fbb.push_slot::<u32>(vt::tensor::BUFFER, 4, 0);
         fbb.push_slot_always(vt::tensor::NAME, name_out);
         fbb.end_table(start)
     };
-    let tensors = match tensor_bias {
-        Some(b) => fbb.create_vector(&[tensor_in, tensor_w, b, tensor_out]),
-        None => fbb.create_vector(&[tensor_in, tensor_w, tensor_out]),
-    };
+    let tensors = fbb.create_vector(&[tensor_in, tensor_w, tensor_bias, tensor_out]);
 
     let deprecated_code = if builtin_op::CONV_2D <= 127 {
         builtin_op::CONV_2D as i8
@@ -1738,11 +2309,19 @@ fn build_tflite_conv2d(
     let operator_codes = fbb.create_vector(&[opcode_table]);
 
     // Conv2DOptions table: stride_w, stride_h, dilation_w=1, dilation_h=1, padding=VALID(0)
+    //
+    // The stride defaults are 0, not 1. `push_slot` omits a field whose value
+    // equals the default it is given, and TFLite's schema default for a stride
+    // is 0 — so passing 1 here meant a stride of 1, the most common stride
+    // there is, was written as absent and read back as zero. Every convolution
+    // this backend emitted at stride 1 was rejected by TFLite's own kernel
+    // with `params->stride_height > 0 was not true`, before any delegate saw
+    // it.
     let conv2d_opts = {
         let start = fbb.start_table();
         fbb.push_slot::<i8>(conv2d_options::PADDING, 0, 0); // VALID
-        fbb.push_slot::<i32>(conv2d_options::STRIDE_W, shape.stride_w as i32, 1);
-        fbb.push_slot::<i32>(conv2d_options::STRIDE_H, shape.stride_h as i32, 1);
+        fbb.push_slot::<i32>(conv2d_options::STRIDE_W, shape.stride_w.max(1) as i32, 0);
+        fbb.push_slot::<i32>(conv2d_options::STRIDE_H, shape.stride_h.max(1) as i32, 0);
         fbb.push_slot::<i32>(conv2d_options::ACTIVATION, 0, 0); // NONE
         fbb.push_slot::<i32>(conv2d_options::DILATION_W, 1, 1);
         fbb.push_slot::<i32>(conv2d_options::DILATION_H, 1, 1);
@@ -1856,8 +2435,10 @@ fn build_tflite_pool(
     let pool2d_opts = {
         let start = fbb.start_table();
         fbb.push_slot::<i8>(pool2d_options::PADDING, 0, 0); // VALID
-        fbb.push_slot::<i32>(pool2d_options::STRIDE_W, shape.stride_w as i32, 1);
-        fbb.push_slot::<i32>(pool2d_options::STRIDE_H, shape.stride_h as i32, 1);
+        // Same defaulting bug as Conv2DOptions above: 0 is TFLite's schema
+        // default, so a stride of 1 has to be written rather than omitted.
+        fbb.push_slot::<i32>(pool2d_options::STRIDE_W, shape.stride_w.max(1) as i32, 0);
+        fbb.push_slot::<i32>(pool2d_options::STRIDE_H, shape.stride_h.max(1) as i32, 0);
         fbb.push_slot::<i32>(pool2d_options::FILTER_W, shape.kernel_w as i32, 1);
         fbb.push_slot::<i32>(pool2d_options::FILTER_H, shape.kernel_h as i32, 1);
         fbb.push_slot::<i32>(pool2d_options::ACTIVATION, 0, 0); // NONE
@@ -2073,7 +2654,15 @@ fn build_tflite_attention(
     // Operator codes: BATCH_MATMUL(0), DIV(1), SOFTMAX(2)
     let matmul_code = {
         let start = fbb.start_table();
-        fbb.push_slot::<i8>(vt::operator_code::DEPRECATED_BUILTIN_CODE, 127, 0);
+        // TFLite resolves an operator as `max(builtin_code, deprecated_builtin_code)`,
+        // so 127 here does not mean "read the other field" — it wins, and 127
+        // is PLACEHOLDER_FOR_GREATER_OP_CODES. Writing the real code in both
+        // is what the reader expects for anything that fits in a byte.
+        fbb.push_slot::<i8>(
+            vt::operator_code::DEPRECATED_BUILTIN_CODE,
+            builtin_op::BATCH_MATMUL as i8,
+            0,
+        );
         fbb.push_slot::<i32>(vt::operator_code::VERSION, 1, 1);
         fbb.push_slot::<i32>(vt::operator_code::BUILTIN_CODE, builtin_op::BATCH_MATMUL, 0);
         fbb.end_table(start)
@@ -2206,7 +2795,11 @@ fn build_tflite_concat(
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("concat");
 
-    let shape_1d = shape_vector(&mut fbb, &[-1i32], extent);
+    // Rank has to cover the axis. Concatenating rank-1 tensors on axis 1 is
+    // rejected — `axis < t0->dims->size was not true` — and the axis is known
+    // right here, so the rank can follow it.
+    let dims: Vec<i32> = vec![-1i32; (axis.max(0) as usize) + 1];
+    let shape_1d = shape_vector(&mut fbb, &dims, extent);
 
     let num_tensors = inputs.len() + 1; // inputs + output
     let mut buffer_offsets = Vec::new();
@@ -2334,8 +2927,10 @@ fn build_tflite_split(
     let desc = fbb.create_string("nxpu");
     let sg_name = fbb.create_string("split");
 
-    let shape_in = shape_vector(&mut fbb, &[-1i32], extent);
-    let shape_out = shape_vector(&mut fbb, &[-1i32], extent);
+    // Same as concat: splitting along axis 1 needs tensors that have one.
+    let dims: Vec<i32> = vec![-1i32; (axis.max(0) as usize) + 1];
+    let shape_in = shape_vector(&mut fbb, &dims, extent);
+    let shape_out = shape_vector(&mut fbb, &dims, extent);
     let shape_scalar = fbb.create_vector::<i32>(&[]);
 
     // Buffer for axis constant: little-endian i32

@@ -40,7 +40,7 @@ impl Backend for SamsungBackend {
         let mut op_names = Vec::new();
         for (i, ep) in module.entry_points.iter().enumerate() {
             match analyze::classify_entry_point(module, i) {
-                Ok(pattern) => op_names.push(pattern_op_name(&pattern)),
+                Ok(pattern) => op_names.extend(analyze::pattern_op_names(&pattern)),
                 Err(e) => {
                     return Err(BackendError::Unsupported(format!(
                         "entry point '{}': {e}",
@@ -75,26 +75,6 @@ impl Backend for SamsungBackend {
 
         output.diagnostics = diagnostics;
         Ok(output)
-    }
-}
-
-fn pattern_op_name(pattern: &analyze::KernelPattern) -> String {
-    match pattern {
-        analyze::KernelPattern::MatMul { .. } => "MatMul".into(),
-        analyze::KernelPattern::ElementWise { op, .. } => op.op_name().into(),
-        analyze::KernelPattern::Conv2D { .. } => "Conv".into(),
-        analyze::KernelPattern::Pool { kind, .. } => kind.op_name().into(),
-        analyze::KernelPattern::Activation { op, .. } => op.op_name().into(),
-        analyze::KernelPattern::Reduce { op, .. } => op.op_name().into(),
-        analyze::KernelPattern::Transpose { .. } => "Transpose".into(),
-        analyze::KernelPattern::Reshape { .. } => "Reshape".into(),
-        analyze::KernelPattern::Normalization { .. } => "BatchNormalization".into(),
-        analyze::KernelPattern::Concat { .. } => "Concat".into(),
-        analyze::KernelPattern::Split { .. } => "Split".into(),
-        analyze::KernelPattern::Attention { .. } => "Attention".into(),
-        analyze::KernelPattern::Gather { .. } => "Gather".into(),
-        analyze::KernelPattern::Scatter { .. } => "ScatterND".into(),
-        analyze::KernelPattern::Unknown { .. } => "Unknown".into(),
     }
 }
 

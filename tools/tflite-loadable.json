@@ -1,0 +1,27 @@
+{
+  "loads": [
+    "attention",
+    "batchnorm",
+    "causal_attention",
+    "concat",
+    "concat_axis1",
+    "conv2d",
+    "conv2d_5x5",
+    "depthwise_conv",
+    "gather",
+    "gelu",
+    "layernorm",
+    "matmul",
+    "maxpool",
+    "multihead_attention",
+    "reduce_sum",
+    "relu",
+    "split",
+    "split_axis1",
+    "tanh_act",
+    "vecadd",
+    "vecadd_const",
+    "vecmul",
+    "vecsub"
+  ]
+}

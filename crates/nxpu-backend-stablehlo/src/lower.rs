@@ -94,6 +94,19 @@ pub fn build_mlir(pattern: &KernelPattern, ep_name: &str) -> Result<String, Back
             output,
             ..
         } => build_scatter_mlir(data, indices, updates, output, ep_name),
+        // Every builder below writes a function whose operands are all the
+        // same rank, and a chain has a rank-0 scalar among them: StableHLO
+        // needs an explicit `broadcast_in_dim` for that, which nothing here
+        // emits. Refusing names the gap; writing the multiply and dropping the
+        // scale would be a module that runs and computes something else.
+        KernelPattern::ElementWiseChain { cast, steps, .. } => {
+            return Err(BackendError::Unsupported(format!(
+                "cannot lower an element-wise chain ({}) to StableHLO: its \
+                 dispatch-time scalars are rank-0 and this backend emits no \
+                 broadcast_in_dim",
+                nxpu_analysis::analyze::chain_summary(*cast, steps)
+            )));
+        }
         KernelPattern::Unknown { reason } => {
             return Err(BackendError::Unsupported(format!(
                 "cannot lower Unknown pattern to StableHLO: {reason}"

@@ -63,6 +63,7 @@ impl Backend for StableHloBackend {
                 analyze::KernelPattern::Attention { .. } => "attention",
                 analyze::KernelPattern::Gather { .. } => "gather",
                 analyze::KernelPattern::Scatter { .. } => "scatter",
+                analyze::KernelPattern::ElementWiseChain { .. } => "element-wise chain",
                 analyze::KernelPattern::Unknown { .. } => "Unknown",
             };
 

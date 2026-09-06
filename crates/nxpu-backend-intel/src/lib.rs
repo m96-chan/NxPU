@@ -45,7 +45,7 @@ impl Backend for IntelBackend {
         for (i, ep) in module.entry_points.iter().enumerate() {
             match analyze::classify_entry_point(module, i) {
                 Ok(pattern) => {
-                    op_names.push(pattern_op_name(&pattern));
+                    op_names.extend(analyze::pattern_op_names(&pattern));
                     patterns.push(pattern);
                 }
                 Err(e) => {
@@ -99,27 +99,6 @@ impl Backend for IntelBackend {
         });
 
         Ok(BackendOutput { files, diagnostics })
-    }
-}
-
-/// Map a KernelPattern to its ONNX-compatible op name string.
-fn pattern_op_name(pattern: &analyze::KernelPattern) -> String {
-    match pattern {
-        analyze::KernelPattern::MatMul { .. } => "MatMul".into(),
-        analyze::KernelPattern::ElementWise { op, .. } => op.op_name().into(),
-        analyze::KernelPattern::Conv2D { .. } => "Conv".into(),
-        analyze::KernelPattern::Pool { kind, .. } => kind.op_name().into(),
-        analyze::KernelPattern::Activation { op, .. } => op.op_name().into(),
-        analyze::KernelPattern::Reduce { op, .. } => op.op_name().into(),
-        analyze::KernelPattern::Transpose { .. } => "Transpose".into(),
-        analyze::KernelPattern::Reshape { .. } => "Reshape".into(),
-        analyze::KernelPattern::Normalization { .. } => "BatchNormalization".into(),
-        analyze::KernelPattern::Concat { .. } => "Concat".into(),
-        analyze::KernelPattern::Split { .. } => "Split".into(),
-        analyze::KernelPattern::Attention { .. } => "Attention".into(),
-        analyze::KernelPattern::Gather { .. } => "Gather".into(),
-        analyze::KernelPattern::Scatter { .. } => "ScatterND".into(),
-        analyze::KernelPattern::Unknown { .. } => "Unknown".into(),
     }
 }
 

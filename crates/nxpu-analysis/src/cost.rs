@@ -161,6 +161,22 @@ pub fn estimate_kernel_cost(pattern: &KernelPattern) -> OpCost {
                 bytes_written,
             }
         }
+        // One operation per element per step. A scalar operand is read once
+        // for the whole dispatch, not once per element, so only the tensor
+        // operands count toward the traffic — which is the whole reason `axpy`
+        // keeps its coefficient in a uniform.
+        KernelPattern::ElementWiseChain { steps, .. } => {
+            let n = parse_dim_name_default();
+            let tensor_operands = steps
+                .iter()
+                .filter(|s| matches!(s.operand, crate::analyze::ChainOperand::Tensor(_)))
+                .count() as u64;
+            OpCost {
+                flops: n * steps.len() as u64,
+                bytes_read: (1 + tensor_operands) * n * ELEM_SIZE,
+                bytes_written: n * ELEM_SIZE,
+            }
+        }
         KernelPattern::Pool { shape, .. } => {
             let (batch, cout, oh, ow) = (1u64, 1, 64, 64);
             let kh = shape.kernel_h as u64;
