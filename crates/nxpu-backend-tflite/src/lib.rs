@@ -198,8 +198,15 @@ impl Backend for TfLiteBackend {
 /// sweeps and a byte-level diff went into learning that from the outside.
 ///
 /// So it is said here instead. Not an error: TFLite's own GPU delegate takes
-/// the convolution either way, and on that phone the GPU accepts more of what
-/// this compiler emits than any NNAPI driver does.
+/// the convolution either way.
+///
+/// The GPU is not an equivalent answer, though, and the warning says so. It is
+/// the engine the display composites on, so occupying it contends with
+/// everything drawing on screen. Timed on the same phone with the thermal
+/// conditions reported stable throughout, it is faster than the NPU in the
+/// middle on 8 of the 12 operators both accept and twice as spread at p99 --
+/// 2.04x its own median against the NPU's 1.27x, worst case 6.23x. Reaching
+/// the NPU is what this flag is for.
 fn emit_runtime_filter_diagnostic(
     fp: &fusion::FusedPattern,
     ep_name: &str,
@@ -217,7 +224,8 @@ fn emit_runtime_filter_diagnostic(
         message: format!(
             "entry point '{ep_name}': `{}` is a graph input, so an NNAPI driver will \
              refuse this convolution and it will run on the CPU. TFLite's GPU delegate \
-             takes it as it is. To reach an NPU, supply the contents with \
+             takes it as it is, at the cost of occupying the engine the display \
+             composites on. To reach an NPU, supply the contents with \
              --weights <DIR>/{}.bin",
             weight.name, weight.name
         ),
