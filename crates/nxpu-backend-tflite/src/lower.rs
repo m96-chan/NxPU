@@ -10,12 +10,47 @@ use nxpu_analysis::analyze::{
     PoolShape, ReduceOp, TensorBinding,
 };
 use nxpu_analysis::fusion::FusedPattern;
-use nxpu_backend_core::BackendError;
+use nxpu_backend_core::{BackendError, ConstantTensor};
 
 use crate::schema::{
     activation_function, builtin_op, builtin_options_type, concatenation_options, conv2d_options,
     padding, pool2d_options, softmax_options, split_options, tensor_type, vt,
 };
+
+/// What the caller supplies to a lowering beyond the pattern itself.
+///
+/// This was a bare `extent: i32` threaded through every builder. Tensor
+/// contents had to reach the same places, and adding a second parameter meant
+/// editing a hundred call sites that pass a literal and want nothing else —
+/// so `From<i32>` is implemented and every one of them still reads
+/// `build_model(&pattern, 8)`. Only the caller that has weights builds one of
+/// these by hand.
+#[derive(Clone, Copy)]
+pub struct Lowering<'a> {
+    /// Concrete extent for the dimensions the kernel leaves symbolic.
+    pub extent: i32,
+    /// Tensor contents the caller supplied, by name.
+    pub constants: &'a [ConstantTensor],
+}
+
+impl From<i32> for Lowering<'_> {
+    fn from(extent: i32) -> Self {
+        Self {
+            extent,
+            constants: &[],
+        }
+    }
+}
+
+impl Lowering<'_> {
+    /// The contents supplied for this tensor, if any.
+    fn constant(&self, name: &str) -> Option<&[u8]> {
+        self.constants
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.data.as_slice())
+    }
+}
 
 /// File identifier for TFLite FlatBuffer files.
 const TFLITE_FILE_ID: &str = "TFL3";
@@ -47,7 +82,12 @@ fn concrete_shape(dims: &[i32], extent: i32) -> Vec<i32> {
 }
 
 /// Build a TFLite FlatBuffer model from a classified kernel pattern.
-pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, BackendError> {
+pub fn build_model<'a>(
+    pattern: &KernelPattern,
+    lowering: impl Into<Lowering<'a>>,
+) -> Result<Vec<u8>, BackendError> {
+    let lowering = lowering.into();
+    let extent = lowering.extent;
     let bytes = match pattern {
         KernelPattern::MatMul {
             inputs,
@@ -86,7 +126,7 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
         // Several operators, so these go through the multi-op builder rather
         // than through `build_tflite`, which emits exactly one.
         KernelPattern::ElementWiseChain { .. } | KernelPattern::QuantizedMatMul { .. } => {
-            let desc = collect_single_graph(pattern, extent)?;
+            let desc = collect_single_graph(pattern, lowering)?;
             build_from_graph_desc(&desc, extent)
         }
         KernelPattern::Conv2D {
@@ -103,8 +143,8 @@ pub fn build_model(pattern: &KernelPattern, extent: i32) -> Result<Vec<u8>, Back
             output,
             shape,
             *activation,
-            extent,
-        ),
+            lowering,
+        )?,
         KernelPattern::Pool {
             kind,
             input,
@@ -1181,7 +1221,11 @@ fn collect_quantized_matmul_graph(
 /// already-multi-op for Normalization/Attention) subgraph.  Returns an error
 /// for patterns that are better handled by the specialised builders (e.g.
 /// Attention), causing the caller to fall back to [`build_model`].
-fn collect_single_graph(pattern: &KernelPattern, extent: i32) -> Result<GraphDesc, BackendError> {
+fn collect_single_graph(
+    pattern: &KernelPattern,
+    lowering: Lowering<'_>,
+) -> Result<GraphDesc, BackendError> {
+    let extent = lowering.extent;
     match pattern {
         KernelPattern::MatMul {
             inputs,
@@ -1275,15 +1319,15 @@ fn collect_single_graph(pattern: &KernelPattern, extent: i32) -> Result<GraphDes
             shape,
             bias,
             activation,
-        } => Ok(conv2d_graph(
+        } => conv2d_graph(
             input,
             weight,
             bias.as_ref(),
             output,
             shape,
             *activation,
-            extent,
-        )),
+            lowering,
+        ),
         KernelPattern::Pool {
             kind,
             input,
@@ -1567,9 +1611,14 @@ fn append_activation(
 /// Handles single patterns, Conv+BatchNorm, MatMul+Bias (Gemm), and
 /// activation fusion.  All fused combinations now emit proper multi-operator
 /// subgraphs instead of delegating to the unfused single-op builder.
-pub fn build_fused_model(fp: &FusedPattern, extent: i32) -> Result<Vec<u8>, BackendError> {
+pub fn build_fused_model<'a>(
+    fp: &FusedPattern,
+    lowering: impl Into<Lowering<'a>>,
+) -> Result<Vec<u8>, BackendError> {
+    let lowering = lowering.into();
+    let extent = lowering.extent;
     match fp {
-        FusedPattern::Single(p) => build_model(p, extent),
+        FusedPattern::Single(p) => build_model(p, lowering),
         FusedPattern::ConvBatchNorm { conv, norm } => {
             let desc = collect_conv_batchnorm_graph(conv, norm, extent)?;
             Ok(build_from_graph_desc(&desc, extent))
@@ -1588,16 +1637,16 @@ pub fn build_fused_model(fp: &FusedPattern, extent: i32) -> Result<Vec<u8>, Back
             // a rule that cannot be checked.
             let act_opcode = match activation_opcode(activation) {
                 Some(c) => c,
-                None => return build_fused_model(base, extent),
+                None => return build_fused_model(base, lowering),
             };
 
             // Collect the base graph descriptor, then append the activation op.
             let mut desc = match base.as_ref() {
-                FusedPattern::Single(p) => match collect_single_graph(p, extent) {
+                FusedPattern::Single(p) => match collect_single_graph(p, lowering) {
                     Ok(d) => d,
                     // Fall back to build_model for complex single patterns
                     // (Attention, Split) and just return it without activation.
-                    Err(_) => return build_model(p, extent),
+                    Err(_) => return build_model(p, lowering),
                 },
                 FusedPattern::ConvBatchNorm { conv, norm } => {
                     collect_conv_batchnorm_graph(conv, norm, extent)?
@@ -1607,7 +1656,7 @@ pub fn build_fused_model(fp: &FusedPattern, extent: i32) -> Result<Vec<u8>, Back
                 }
                 FusedPattern::WithActivation { .. } => {
                     // Nested WithActivation should not occur in practice.
-                    return build_fused_model(base, extent);
+                    return build_fused_model(base, lowering);
                 }
             };
 
@@ -2535,12 +2584,12 @@ fn build_tflite_conv2d(
     output: &TensorBinding,
     shape: &Conv2DShape,
     activation: Option<ActivationOp>,
-    extent: i32,
-) -> Vec<u8> {
-    build_from_graph_desc(
-        &conv2d_graph(input, weight, bias, output, shape, activation, extent),
-        extent,
-    )
+    lowering: Lowering<'_>,
+) -> Result<Vec<u8>, BackendError> {
+    Ok(build_from_graph_desc(
+        &conv2d_graph(input, weight, bias, output, shape, activation, lowering)?,
+        lowering.extent,
+    ))
 }
 
 /// The graph a convolution becomes, so that the fused path and the standalone
@@ -2558,8 +2607,9 @@ fn conv2d_graph(
     output: &TensorBinding,
     shape: &Conv2DShape,
     activation: Option<ActivationOp>,
-    extent: i32,
-) -> GraphDesc {
+    lowering: Lowering<'_>,
+) -> Result<GraphDesc, BackendError> {
+    let extent = lowering.extent;
     // TFLite carries an activation inside the convolution's own options, and
     // has a form for exactly these. Sigmoid and the multiply-shaped ones
     // (GELU, SiLU, Mish) have none, and the classifier does not report them
@@ -2656,12 +2706,41 @@ fn conv2d_graph(
         0
     };
 
+    // An NNAPI driver requires the filter to be a compile-time constant. A
+    // MediaTek MT6899 accelerates this convolution when it is one and refuses
+    // it, at the same shapes, when it is a graph input; TFLite's own GPU
+    // delegate takes it either way. So the caller decides, by supplying the
+    // contents or not, and nothing is invented when they do not.
+    let weight_shape = vec![channels_out, kernel_h, kernel_w, channels_in];
     let weight_index = tensors.len() as i32;
-    tensors.push(TensorInfo::input(
-        weight.name.clone(),
-        weight.elem_type,
-        vec![channels_out, kernel_h, kernel_w, channels_in],
-    ));
+    let weight_is_constant = match lowering.constant(&weight.name) {
+        None => {
+            tensors.push(TensorInfo::input(
+                weight.name.clone(),
+                weight.elem_type,
+                weight_shape,
+            ));
+            false
+        }
+        Some(data) => {
+            let wanted = element_count(&weight_shape) * element_size(weight.elem_type);
+            if data.len() != wanted {
+                return Err(BackendError::Other(format!(
+                    "weights for `{}`: {} bytes supplied, {wanted} wanted for {weight_shape:?} \
+                     at --symbolic-dim {extent}",
+                    weight.name,
+                    data.len(),
+                )));
+            }
+            tensors.push(TensorInfo::constant(
+                weight.name.clone(),
+                weight.elem_type,
+                weight_shape,
+                data.to_vec(),
+            ));
+            true
+        }
+    };
 
     // TFLite's CONV_2D kernel requires three inputs — `has_bias was not true`
     // is a hard failure, not a fallback — so a convolution whose source has no
@@ -2711,17 +2790,35 @@ fn conv2d_graph(
 
     // A constant is not a graph input; the synthesised bias and the paddings
     // are constants, and listing either here makes the model invalid.
-    let mut graph_inputs = vec![0, weight_index];
+    let mut graph_inputs = vec![0];
+    if !weight_is_constant {
+        graph_inputs.push(weight_index);
+    }
     if bias.is_some() {
         graph_inputs.push(bias_index);
     }
 
-    GraphDesc {
+    Ok(GraphDesc {
         tensors,
         ops,
         graph_inputs,
         graph_outputs: vec![output_index],
         graph_name: "conv2d".into(),
+    })
+}
+
+/// How many elements a concrete shape holds.
+fn element_count(shape: &[i32]) -> usize {
+    shape.iter().map(|d| (*d).max(0) as usize).product()
+}
+
+/// Bytes per element, by the ONNX type code the bindings carry.
+fn element_size(elem_type: i32) -> usize {
+    match elem_type {
+        data_type::INT8 | data_type::UINT8 | data_type::BOOL => 1,
+        data_type::FLOAT16 | data_type::BFLOAT16 => 2,
+        data_type::INT64 => 8,
+        _ => 4,
     }
 }
 
@@ -4478,7 +4575,7 @@ mod tests {
         let pattern = KernelPattern::Unknown {
             reason: "test".into(),
         };
-        let result = collect_single_graph(&pattern, 8);
+        let result = collect_single_graph(&pattern, 8.into());
         assert!(result.is_err());
     }
 
@@ -4496,7 +4593,7 @@ mod tests {
             num_kv_heads: 1,
             causal: false,
         };
-        let result = collect_single_graph(&pattern, 8);
+        let result = collect_single_graph(&pattern, 8.into());
         assert!(result.is_err());
     }
 
@@ -4511,7 +4608,7 @@ mod tests {
             ],
             axis: 0,
         };
-        let result = collect_single_graph(&pattern, 8);
+        let result = collect_single_graph(&pattern, 8.into());
         assert!(result.is_err());
     }
 
