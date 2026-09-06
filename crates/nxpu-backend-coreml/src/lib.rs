@@ -57,6 +57,7 @@ impl Backend for CoreMlBackend {
 
             let summary = match &pattern {
                 analyze::KernelPattern::MatMul { .. } => "matmul",
+                analyze::KernelPattern::QuantizedMatMul { .. } => "quantized matmul",
                 analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
                 analyze::KernelPattern::Conv2D { .. } => "conv",
                 analyze::KernelPattern::Pool { kind, .. } => match kind {

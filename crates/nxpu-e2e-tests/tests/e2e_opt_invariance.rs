@@ -203,6 +203,118 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// `out[i] = (sum_k unpack(w[i,k]) * v[k]) * scale[i]` — vendor/web-xpu-ops
+/// `ops/matvec/q8.wgsl`, reduced to one workgroup's worth so the test does not
+/// need the submodule.
+///
+/// Two multiply-adds that FMA fusion rewrites, and they are *not* both float:
+/// the weight's address `row * words_per_row + word_index` is integer
+/// arithmetic and `-O1` turns it into an integer `fma` too. The recogniser
+/// reads that address to find which axis of the weight is an output channel,
+/// so a matcher that knew only the `Add`-of-`Mul` spelling classified this
+/// kernel at `-O0` and refused it at `-O1`.
+const MATVEC_Q8: &str = r#"
+struct Params { N: u32, K: u32 }
+@group(0) @binding(0) var<storage, read> weight: array<u32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read> vector: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+fn unpack_i8(word: u32, lane: u32) -> f32 {
+  return f32(extractBits(bitcast<i32>(word), lane * 8u, 8u));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>) {
+  let row = wg_id.x;
+  let words_per_row = (params.K + 3u) / 4u;
+  let row_word_offset = row * words_per_row;
+  var partial: f32 = 0.0;
+  for (var word_index = 0u; word_index < words_per_row; word_index += 1u) {
+    let word = weight[row_word_offset + word_index];
+    let base_col = word_index * 4u;
+    for (var lane = 0u; lane < 4u; lane += 1u) {
+      let col = base_col + lane;
+      if (col >= params.K) { break; }
+      partial += unpack_i8(word, lane) * vector[col];
+    }
+  }
+  output[row] = partial * scale[row];
+}
+"#;
+
+/// The same kernel with a residual added after the row scale —
+/// `ops/matvec/q8_residual.wgsl`. The store is `acc * scale[row] + res[row]` at
+/// `-O0` and `fma(acc, scale[row], res[row])` at `-O1`, and telling the scale
+/// from the addend is exactly what decides whether the pattern comes back with
+/// a bias, so the two spellings have to be read the same way.
+const MATVEC_Q8_RESIDUAL: &str = r#"
+struct Params { N: u32, K: u32 }
+@group(0) @binding(0) var<storage, read> weight: array<u32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read> vector: array<f32>;
+@group(0) @binding(3) var<storage, read> residual: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<uniform> params: Params;
+fn unpack_i8(word: u32, lane: u32) -> f32 {
+  return f32(extractBits(bitcast<i32>(word), lane * 8u, 8u));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>) {
+  let row = wg_id.x;
+  let words_per_row = (params.K + 3u) / 4u;
+  let row_word_offset = row * words_per_row;
+  var partial: f32 = 0.0;
+  for (var word_index = 0u; word_index < words_per_row; word_index += 1u) {
+    let word = weight[row_word_offset + word_index];
+    let base_col = word_index * 4u;
+    for (var lane = 0u; lane < 4u; lane += 1u) {
+      let col = base_col + lane;
+      if (col >= params.K) { break; }
+      partial += unpack_i8(word, lane) * vector[col];
+    }
+  }
+  output[row] = partial * scale[row] + residual[row];
+}
+"#;
+
+/// `ops/matvec/q4_g128.wgsl`, reduced: four-bit codes and a scale per group of
+/// contracted columns. Refused, and it has to be refused the same way at every
+/// level — the refusal is decided by reading the scale's address, which FMA
+/// fusion rewrites.
+const MATVEC_Q4_G128: &str = r#"
+struct Params { N: u32, K: u32 }
+@group(0) @binding(0) var<storage, read> weight: array<u32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read> vector: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+fn unpack_i4(word: u32, lane: u32) -> f32 {
+  return f32(extractBits(bitcast<i32>(word), lane * 4u, 4u));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>) {
+  let row = wg_id.x;
+  let words_per_row = (params.K + 7u) / 8u;
+  let groups_per_row = (params.K + 127u) / 128u;
+  let row_word_offset = row * words_per_row;
+  let row_group_offset = row * groups_per_row;
+  var partial: f32 = 0.0;
+  for (var word_index = 0u; word_index < words_per_row; word_index += 1u) {
+    let word = weight[row_word_offset + word_index];
+    let base_col = word_index * 8u;
+    let group_scale = scale[row_group_offset + base_col / 128u];
+    var word_sum: f32 = 0.0;
+    for (var lane = 0u; lane < 8u; lane += 1u) {
+      let col = base_col + lane;
+      if (col >= params.K) { break; }
+      word_sum += unpack_i4(word, lane) * vector[col];
+    }
+    partial += word_sum * group_scale;
+  }
+  output[row] = partial;
+}
+"#;
+
 /// `max(x, 0)` — an activation, reached before the element-wise matcher runs.
 const RELU: &str = r#"
 struct Params { N: u32 }
@@ -318,6 +430,9 @@ const KERNELS: &[(&str, &str)] = &[
     ("elementwise_add", ELEMENTWISE_ADD),
     ("sub_of_multiplies", SUB_OF_MULTIPLIES),
     ("matmul", MATMUL),
+    ("matvec_q8", MATVEC_Q8),
+    ("matvec_q8_residual", MATVEC_Q8_RESIDUAL),
+    ("matvec_q4_g128", MATVEC_Q4_G128),
     ("relu", RELU),
     ("gelu", GELU),
     ("softmax", SOFTMAX),

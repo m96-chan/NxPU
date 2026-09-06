@@ -241,6 +241,8 @@ fn no_example_carries_a_negative_extent() {
         "gelu",
         "layernorm",
         "matmul",
+        "matvec_q8",
+        "matvec_q8_residual",
         "maxpool",
         "multihead_attention",
         "reduce_sum",

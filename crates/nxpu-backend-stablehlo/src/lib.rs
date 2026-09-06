@@ -50,6 +50,7 @@ impl Backend for StableHloBackend {
 
             let summary = match &pattern {
                 analyze::KernelPattern::MatMul { .. } => "dot_general",
+                analyze::KernelPattern::QuantizedMatMul { .. } => "quantized matmul",
                 analyze::KernelPattern::ElementWise { op, .. } => op.op_name(),
                 analyze::KernelPattern::Conv2D { .. } => "convolution",
                 analyze::KernelPattern::Pool { .. } => "reduce_window",
