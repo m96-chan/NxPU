@@ -2655,10 +2655,13 @@ fn reads_global(
         let Some(expr) = exprs.try_get(handle) else {
             continue;
         };
-        if let Expression::Load { pointer } = expr
-            && access_base_global(exprs, *pointer).is_some_and(|g| wanted.contains(&g))
-        {
-            return true;
+        // Nested rather than a let-chain: those are stable from 1.88 and this
+        // workspace's rust-version is 1.87.
+        #[allow(clippy::collapsible_if)]
+        if let Expression::Load { pointer } = expr {
+            if access_base_global(exprs, *pointer).is_some_and(|g| wanted.contains(&g)) {
+                return true;
+            }
         }
         push_operands(expr, &mut stack);
     }
