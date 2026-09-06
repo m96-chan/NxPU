@@ -1,0 +1,264 @@
+name: Device ULP
+
+# Run DroidRunner's own ULP fixtures on every phone in this repository's fleet.
+#
+# The point is that the bytes are identical to the ones their SM8650 was
+# measured with, so V73 and V75 compare like for like rather than as two
+# experiments that happen to be about the same thing. Nothing here generates
+# a fixture; generating our own is how two measurements stop being comparable.
+#
+# The fleet now spans two vendors, and one model already separated them: the
+# same NxPU-emitted vecadd returns 1024 of 1024 elements off by one ULP on the
+# Hexagon and 1024 of 1024 bit-exact on MT6899's APU. These fixtures ask the
+# same question with operands chosen to tell apart deviations that a coarse
+# input cannot -- which is why all four sets run, on both phones.
+on:
+  # Dispatch needs the file on the default branch, so the branch push trigger
+  # is how this runs before it is merged. Remove it when it is.
+  push:
+    branches: [feat/device-ulp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to a tag, not a branch: a fixture that changes under us turns a
+  # comparison into a coincidence. The hashes below are checked too, because a
+  # tag can be moved.
+  DROIDRUNNER_REF: v0.10.0
+
+jobs:
+  fetch:
+    name: Fetch ${{ matrix.set }}
+    runs-on: ubuntu-latest
+    # All four sets, because the first one alone misled the people who built
+    # them: on `baseline` every expected value is a multiple of 0.25, so its
+    # low mantissa bit is already clear and "+1 to the word" and "set the low
+    # bit" produce identical output. `odd` is what separates them.
+    strategy:
+      matrix:
+        set: [baseline, signed, odd, resolution]
+    steps:
+      - name: Download
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/m96-chan/DroidRunner/${DROIDRUNNER_REF}/tools/ulp/fixtures"
+          mkdir -p fixtures
+          case "${{ matrix.set }}" in
+            baseline)   prefix="" ;;
+            signed)     prefix="signed-" ;;
+            odd)        prefix="odd-" ;;
+            resolution) prefix="resolution-" ;;
+            *) echo "::error::unknown fixture set: $SET"; exit 1 ;;
+          esac
+          curl -fsSL -o fixtures/add-f32.tflite "$base/add-f32.tflite"
+          for f in input-0 input-1 expected; do
+            curl -fsSL -o "fixtures/$f.bin" "$base/${prefix}${f}.bin"
+          done
+          ls -l fixtures/
+
+          # Checked against the hashes DroidRunner published for this tag. A
+          # fixture that arrived as an HTML error page, or from a moved tag,
+          # would make the comparison meaningless rather than failing it — and
+          # "identical bytes" is the entire reason to fetch theirs instead of
+          # generating our own.
+          cat > expected.sha256 <<'SUMS'
+          de28ea6c8299b7b03bd3dbb7fd0db03981f60998b2f3cc7edadf15d8490aa6fd  add-f32.tflite
+          938d5a1eba4e7cdc474be2900bae10603ea13ba9012c68d324fb2549b7904011  baseline-input-0.bin
+          012b2194f5a578b969d981c062db771f383e2b3aa3d8c9a3ab733f9aa6a6de67  baseline-input-1.bin
+          4d01c1d7df42641d284145617099566c84912f314283b66a62844b17ecd37b6f  baseline-expected.bin
+          ad3d7b572a6e3b99ded4520333e4136d3c273af6e26301574e21514b39d41e2b  odd-input-0.bin
+          e2b7bec7a3806df824f0f9c8dfcb5fa3003e0bdea6036326126437b600f33e17  odd-input-1.bin
+          58861abc5c7283e548cb3d71076b9da47b8efb5ecc45c561f3574acff1b1cf38  odd-expected.bin
+          e9bac255f4adc7cb4ada9298e193a5ff66b434d15afabd458505325f29c398c7  resolution-input-0.bin
+          e5f111ed3b3216f923f9dc39e403e5bbac3d354eefd81aa540cc204f03251946  resolution-input-1.bin
+          317b8534a96889fbe0642b5090e3a588930bb1fdc127ba32ca5c739dd42a150d  resolution-expected.bin
+          5f3fa5dbcc710fac746e3f10ff98fb037e44406c010f59689f13a8dd5cca2eea  signed-input-0.bin
+          51cb01a83e22c5aaed11a86f40db4a30433bf88b20db9d1d45551920cf5ff5ad  signed-input-1.bin
+          68db9bbe4ca190ab891e68721845e12e367c76c0ef6fdad1611450409d05af4a  signed-expected.bin
+          SUMS
+          sed -i 's/^ *//' expected.sha256
+          for f in input-0 input-1 expected; do
+            want=$(grep " ${{ matrix.set }}-$f.bin$" expected.sha256 | cut -d' ' -f1)
+            got=$(sha256sum "fixtures/$f.bin" | cut -d' ' -f1)
+            [ "$want" = "$got" ] || { echo "::error::${{ matrix.set }}/$f.bin hash mismatch"; exit 1; }
+          done
+          want=$(grep ' add-f32.tflite$' expected.sha256 | cut -d' ' -f1)
+          got=$(sha256sum fixtures/add-f32.tflite | cut -d' ' -f1)
+          [ "$want" = "$got" ] || { echo "::error::add-f32.tflite hash mismatch"; exit 1; }
+          echo "fixtures verified against ${DROIDRUNNER_REF}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ulp-fixtures-${{ matrix.set }}
+          path: fixtures/
+          if-no-files-found: error
+
+  device:
+    name: Run ${{ matrix.set }} on ${{ matrix.phone }}
+    needs: fetch
+    # Two phones, four sets, eight jobs. A self-hosted runner takes one job at
+    # a time, so each phone works through its four in sequence on its own and
+    # never measures another job's thermal state; the two phones proceed
+    # independently because they are different runners.
+    strategy:
+      fail-fast: false
+      matrix:
+        set: [baseline, signed, odd, resolution]
+        phone: [NX729J, 2511FPC34G]
+        include:
+          # `soc-*` picks the handset, not the vendor. Two Snapdragons share
+          # the vendor labels, and one of them once served results from a stale
+          # build.
+          - phone: NX729J
+            soc: soc-qti-sm8550-qcom
+            # Qualcomm ships no NNAPI driver, so its Hexagon is reachable only
+            # through Qualcomm's own runtime.
+            device: qnn-htp
+          - phone: 2511FPC34G
+            soc: soc-mediatek-mt6899-mt6899
+            # MediaTek's accelerators are NNAPI drivers, named as
+            # `droidrunner-device devices` lists them. This is the APU.
+            device: mtk-neuron_shim
+    runs-on: [self-hosted, android, "${{ matrix.soc }}"]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ulp-fixtures-${{ matrix.set }}
+          path: fixtures
+
+      - name: What the phone has
+        run: droidrunner-device capabilities
+
+      - name: The fixtures arrived
+        run: |
+          test -f fixtures/add-f32.tflite
+          ls -l fixtures/
+
+      # The CPU control first. If the reference and the harness do not agree
+      # bit for bit, nothing the accelerator says afterwards means anything —
+      # this is the step that makes the rest publishable.
+      - name: CPU control
+        id: cpu
+        uses: m96-chan/DroidRunner/actions/run-model@main
+        with:
+          model: fixtures/add-f32.tflite
+          iterations: 5
+          inputs: |
+            fixtures/input-0.bin
+            fixtures/input-1.bin
+          output-dir: out-cpu
+          results-path: cpu.json
+
+      - name: On the accelerator
+        id: npu
+        continue-on-error: true
+        uses: m96-chan/DroidRunner/actions/run-model@main
+        with:
+          model: fixtures/add-f32.tflite
+          device: ${{ matrix.device }}
+          iterations: 5
+          inputs: |
+            fixtures/input-0.bin
+            fixtures/input-1.bin
+          output-dir: out-npu
+          results-path: npu.json
+
+      - name: What came back
+        if: always()
+        run: |
+          echo "cpu: executed=${{ steps.cpu.outputs.executed }} by=${{ steps.cpu.outputs.executed-by }}"
+          echo "${{ matrix.device }}: executed=${{ steps.npu.outputs.executed }} by=${{ steps.npu.outputs.executed-by }} stable=${{ steps.npu.outputs.stable }}"
+          ls -l out-cpu out-npu 2>/dev/null || true
+
+      - name: Verdict
+        if: always()
+        run: |
+          # A device step allowed to fail must not make the job green.
+          if [ -z "${{ steps.cpu.outputs.executed }}" ]; then
+            echo "::error::the CPU control did not run; the rest is unreadable"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ulp-result-${{ matrix.phone }}-${{ matrix.set }}
+          path: |
+            out-cpu/
+            out-npu/
+            cpu.json
+            npu.json
+          if-no-files-found: warn
+
+  compare:
+    name: Histogram for ${{ matrix.set }} on ${{ matrix.phone }}
+    needs: [fetch, device]
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        set: [baseline, signed, odd, resolution]
+        phone: [NX729J, 2511FPC34G]
+        # Carried through only so the histogram is labelled with the delegate
+        # that produced it. "the accelerator" in a table covering two vendors
+        # is the label that makes a saved log unreadable a month later.
+        include:
+          - phone: NX729J
+            device: qnn-htp
+          - phone: 2511FPC34G
+            device: mtk-neuron_shim
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ulp-fixtures-${{ matrix.set }}
+          path: fixtures
+      - uses: actions/download-artifact@v8
+        with:
+          name: ulp-result-${{ matrix.phone }}-${{ matrix.set }}
+          path: result
+        continue-on-error: true
+
+      - name: Compare
+        env:
+          DEVICE: ${{ matrix.device }}
+        run: |
+          set -euo pipefail
+          if [ ! -f result/out-cpu/output-0.bin ]; then
+            echo "::error::no CPU output; nothing to compare"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import os, struct, collections, pathlib
+          words = lambda p: struct.unpack(f"<{p.stat().st_size//4}I", p.read_bytes())
+          floats = lambda p: struct.unpack(f"<{p.stat().st_size//4}f", p.read_bytes())
+          want = pathlib.Path("fixtures/expected.bin")
+
+          def report(name, got):
+              # Compared as raw words: the deviation Qualcomm's path shows is
+              # defined on the encoding, not on the value, so a signed result
+              # moves away from zero. Counting in "ULP toward positive" hides
+              # that.
+              d = [g - w for w, g in zip(words(want), words(got))]
+              hist = dict(sorted(collections.Counter(d).items()))
+              exact = sum(1 for x in d if x == 0)
+              print(f"{name}: {exact} of {len(d)} bit-exact, histogram {hist}")
+              return d
+
+          cpu = report("cpu", pathlib.Path("result/out-cpu/output-0.bin"))
+          device = os.environ.get("DEVICE") or "the accelerator"
+          npu_path = pathlib.Path("result/out-npu/output-0.bin")
+          if npu_path.exists():
+              report(device, npu_path)
+          else:
+              print(f"{device}: no output — the delegate refused or was not reached")
+
+          # The control is the load-bearing assertion. If the CPU is not exact
+          # against the reference then the reference, the harness or the
+          # fixture is wrong, and the accelerator's numbers say nothing.
+          if any(x != 0 for x in cpu):
+              raise SystemExit("the CPU control is not bit-exact; the comparison is void")
+          print("CPU control bit-exact")
+          PY
