@@ -30,6 +30,15 @@ on:
         description: Concrete extent for the dimensions the kernels leave symbolic.
         required: true
         default: "64"
+      models:
+        description: >-
+          Examples to ask about, space separated. A split needs a model holding
+          an operator one engine refuses and the other takes, and on this phone
+          that means an attention: it lowers to BATCH_MATMUL, DIV, SOFTMAX and
+          BATCH_MATMUL, and the NNAPI drivers here refuse a float32
+          BATCH_MATMUL while the GPU takes one.
+        required: true
+        default: "vecadd batchnorm attention"
 
 permissions:
   contents: read
@@ -37,6 +46,7 @@ permissions:
 env:
   ITERATIONS: ${{ inputs.iterations || '30' }}
   SYMBOLIC_DIM: ${{ inputs.symbolic-dim || '64' }}
+  MODELS: ${{ inputs.models || 'vecadd batchnorm attention' }}
 
 jobs:
   models:
@@ -50,15 +60,23 @@ jobs:
 
       # Three shapes of question, so one device visit answers all of them.
       #
-      #   vecadd     one operator      — the control: no split is possible
-      #   batchnorm  MUL + ADD         — two operators the NPU takes both of
-      #   matvec_q8  four operators    — holds a float32 BATCH_MATMUL, which
-      #                                  the NPU refuses and the GPU takes
+      #   vecadd     one operator   — the control: no split is possible
+      #   batchnorm  MUL + ADD      — two operators the NPU takes both of, so
+      #                               the second delegate is offered nothing
+      #   attention  BMM, DIV, SOFTMAX, BMM — the NPU refuses a float32
+      #                               BATCH_MATMUL and takes the other two, so
+      #                               this is the one that can split
+      #
+      # `matvec_q8` was the first candidate and is not here: both engines
+      # refuse it outright, for different reasons — the GPU delegate will not
+      # do our INT8-to-FLOAT32 CAST, and the NNAPI driver answers
+      # ANEURALNETWORKS_BAD_DATA while adding an operation. Both are findings
+      # about what this compiler emits and neither produces a split.
       - name: Compile them
         run: |
           set -euo pipefail
           mkdir -p models
-          for name in vecadd batchnorm matvec_q8; do
+          for name in $MODELS; do
             ./target/release/nxpu "examples/$name.wgsl" --target tflite \
               --precision keep --symbolic-dim "$SYMBOLIC_DIM" \
               -o "models/$name.tflite"
@@ -109,7 +127,7 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
-          for model in vecadd batchnorm matvec_q8; do
+          for model in $MODELS; do
             for device in mtk-neuron_shim gpu 'mtk-neuron_shim+gpu'; do
               slug="$(echo "$model-$device" | tr -c 'A-Za-z0-9._-' '-')"
               echo "=== $model on $device"
