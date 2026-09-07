@@ -7,13 +7,22 @@ documentation.
 **A cell is a claim about a model, not about an operator.** It is silent on
 several axes at once — the shape the operator was given, whether it was fused
 with anything, how fast it ran, and every phone that was not this one. To those,
-add the one this project found the hard way:
+add two more:
 
 > **How an operand is supplied.** Every weight in the converter-built reference
 > models is a compile-time constant, because that is what a converter emits. A
 > driver can require that: on MT6899, `mtk-neuron_shim` accelerates a
 > convolution whose filter is a constant and refuses the same convolution, at
 > the same shapes, whose filter is a graph input.
+>
+> **What occupying that engine costs the rest of the device.** A `✓` under
+> `gpu` says the delegate took the operator. It does not say the phone stayed
+> usable while it did. The GPU is the same engine the display composites on, so
+> a long compute workload there contends with everything drawing on screen and
+> can stall it; the NPU is a dedicated part and does not. That is why "send
+> everything the NPU will take" is a defensible policy even where the GPU is
+> the faster engine per operator — and it is not visible in any cell here, on
+> any row, for either column.
 
 So `CONV_2D | float32 | accelerated` means *this driver took that model*. It
 does not mean the driver takes every CONV_2D, and reading it that way cost a day
