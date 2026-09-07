@@ -1,0 +1,231 @@
+name: Delegate split
+
+# Can two delegates share one interpreter, what does each claim, and what does
+# crossing between them cost?
+#
+# The three measurements in #174, all of them answered on an MT6899 and none of
+# them fixed in place: a driver arrives with the system image and is replaced by
+# OTA updates nobody asks permission for, and `--weights` (#176) will move the
+# split by giving the NPU a convolution it currently refuses.
+#
+#   coexist    yes. Attaching an idle second delegate is free -- batchnorm
+#              76.91ms alone against 74.25ms with the GPU attached and claiming
+#              nothing, which is noise in both directions.
+#   claim      both, when the graph gives them reason to. On conv2d_5x5 the
+#              NNAPI delegate takes one operator and the GPU the other.
+#   crossing   1.67x. That same graph is 100.48ms split and 60.04ms with both
+#              operators on the GPU.
+#
+# The 40ms is an upper bound on the crossing rather than the crossing: it also
+# holds whatever the NNAPI delegate's PAD costs against the GPU's. The
+# direction is not in doubt.
+#
+# What this cannot do, and does not pretend to: `a+b` decides the *order*
+# delegates are offered the graph, not which node goes where. So a model whose
+# operators are all acceptable to the first delegate comes back with one claim
+# and an idle second — which is what DroidRunner saw on an SM8650, and is a
+# property of the mechanism rather than a failed run. Forcing a split needs a
+# model holding an operator the NPU refuses, and `matvec_q8` is one: it lowers
+# to TRANSPOSE, CAST, BATCH_MATMUL and MUL, and this phone's NNAPI drivers
+# refuse a float32 BATCH_MATMUL while its GPU takes one.
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Timed iterations. This one is about time.
+        required: true
+        default: "30"
+      symbolic-dim:
+        description: Concrete extent for the dimensions the kernels leave symbolic.
+        required: true
+        default: "64"
+      models:
+        description: >-
+          Examples to ask about, space separated. A split needs a model holding
+          an operator one engine refuses and the other takes, and on this phone
+          that means an attention: it lowers to BATCH_MATMUL, DIV, SOFTMAX and
+          BATCH_MATMUL, and the NNAPI drivers here refuse a float32
+          BATCH_MATMUL while the GPU takes one.
+        required: true
+        default: "vecadd conv2d_3x3 conv2d_5x5"
+
+permissions:
+  contents: read
+
+env:
+  ITERATIONS: ${{ inputs.iterations || '30' }}
+  SYMBOLIC_DIM: ${{ inputs.symbolic-dim || '64' }}
+  MODELS: ${{ inputs.models || 'vecadd conv2d_3x3 conv2d_5x5' }}
+
+jobs:
+  models:
+    name: Build the fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p nxpu-cli
+
+      # Three shapes of question, so one device visit answers all of them.
+      #
+      #   vecadd     one operator   — the control: no split is possible
+      #   batchnorm  MUL + ADD      — two operators the NPU takes both of, so
+      #                               the second delegate is offered nothing
+      #   conv2d_3x3 one CONV_2D — the NPU refuses it while the filter is a
+      #                               graph input, so the GPU should get all of it
+      #   conv2d_5x5 PAD + CONV_2D — two operators the two engines should want
+      #                               different halves of, which is the shape a
+      #                               crossing needs
+      #
+      # `attention` was the previous candidate and partitions correctly -- the
+      # NPU takes 2 of its 4 operators in 3 partitions, and with the GPU
+      # attached the remainder is offered to it -- but the GPU delegate then
+      # fails to invoke on this model at all, alone as well as combined:
+      # `Failed to upload data to GPU (clEnqueueWriteBuffer) - Invalid command
+      # queue`. A partition that cannot run is not a crossing that can be
+      # timed.
+      #
+      # `matvec_q8` was the first candidate and is not here: both engines
+      # refuse it outright, for different reasons — the GPU delegate will not
+      # do our INT8-to-FLOAT32 CAST, and the NNAPI driver answers
+      # ANEURALNETWORKS_BAD_DATA while adding an operation. Both are findings
+      # about what this compiler emits and neither produces a split.
+      - name: Compile them
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          for name in $MODELS; do
+            ./target/release/nxpu "examples/$name.wgsl" --target tflite \
+              --precision keep --symbolic-dim "$SYMBOLIC_DIM" \
+              -o "models/$name.tflite"
+            echo "$name: $(stat -c%s "models/$name.tflite") bytes"
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: split-models
+          path: models/
+          if-no-files-found: error
+
+  device:
+    name: Ask the MT6899
+    needs: models
+    runs-on: [self-hosted, android, soc-mediatek-mt6899-mt6899]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: split-models
+          path: models
+
+      # A stale workspace on a self-hosted runner is how a previous run's
+      # answers end up in this one's artifact.
+      - name: Start from nothing
+        run: rm -f result-*.json
+
+      - name: What this phone and this build are
+        run: |
+          droidrunner-device capabilities --output capabilities.json
+          droidrunner-device devices
+
+      # `--feature multi-delegate` is experimental and refused without the
+      # flag, so a build that predates v0.12.0 fails here and says so rather
+      # than silently running one delegate and reporting a crossing of zero.
+      - name: Does this build know the vocabulary
+        id: vocabulary
+        continue-on-error: true
+        run: |
+          droidrunner-device test model models/vecadd.tflite \
+            --device 'mtk-neuron_shim+gpu' --feature multi-delegate \
+            --iterations 1 --output result-vocabulary.json
+          echo "ok=yes" >> "$GITHUB_OUTPUT"
+
+      # Every cell, each allowed to fail, because one visit to the phone should
+      # answer as much as it can.
+      - name: Every model on every arrangement
+        if: always()
+        run: |
+          set -uo pipefail
+          for model in $MODELS; do
+            for device in mtk-neuron_shim gpu 'mtk-neuron_shim+gpu'; do
+              slug="$(echo "$model-$device" | tr -c 'A-Za-z0-9._-' '-')"
+              echo "=== $model on $device"
+              status=0
+              droidrunner-device test model "models/$model.tflite" \
+                --device "$device" --feature multi-delegate \
+                --iterations "$ITERATIONS" --output "result-$slug.json" \
+                > /dev/null || status=$?
+              case $status in
+                0) ;;
+                2) echo "  refused" ;;
+                3) echo "  no such device" ;;
+                4) echo "  the agent stopped answering" ;;
+                *) echo "  exit $status" ;;
+              esac
+              grep -o '"delegations":\[[^]]*\]' "result-$slug.json" 2>/dev/null \
+                || grep -o '"executedBy":"[^"]*"' "result-$slug.json" 2>/dev/null \
+                || echo "  no result file"
+            done
+          done
+
+      - name: Verdict
+        if: always()
+        run: |
+          # A run that produced no result at all has learned nothing, and must
+          # not be green for having tried.
+          count=$(ls result-*.json 2>/dev/null | wc -l)
+          echo "$count result file(s)"
+          if [ "$count" = "0" ]; then
+            echo "::error::nothing ran; see the log above"
+            exit 1
+          fi
+          if [ "${{ steps.vocabulary.outcome }}" != "success" ]; then
+            echo "::warning::this build did not accept --feature multi-delegate, so \
+            every split cell below is a single delegate and not a split"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: split-results
+          path: |
+            result-*.json
+            capabilities.json
+          if-no-files-found: error
+
+  report:
+    name: Reduce it to a table
+    needs: [models, device]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: split-results
+          path: results
+      - name: Table
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          rows = []
+          for path in sorted(pathlib.Path("results").glob("result-*.json")):
+              if path.stem == "result-vocabulary":
+                  continue
+              d = json.loads(path.read_text())
+              rows.append((path.stem.removeprefix("result-"), d))
+          print("| model on device | executed | by | median | delegations |")
+          print("| --- | --- | --- | --- | --- |")
+          for name, d in rows:
+              delegations = d.get("delegations")
+              claims = "; ".join(
+                  f"{x.get('delegate', '?')} took {x.get('nodes', '?')}"
+                  for x in delegations
+              ) if isinstance(delegations, list) else "—"
+              median = d.get("medianUs")
+              print(f"| `{name}` | {d.get('executed', '—')} | "
+                    f"`{d.get('executedBy', '—')}` | "
+                    f"{median / 1000:.2f}ms | {claims} |"
+                    if median else
+                    f"| `{name}` | {d.get('executed', '—')} | "
+                    f"`{d.get('executedBy', '—')}` | — | {claims} |")
+          PY
