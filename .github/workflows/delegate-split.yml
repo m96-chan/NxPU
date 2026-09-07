@@ -213,19 +213,47 @@ jobs:
                   continue
               d = json.loads(path.read_text())
               rows.append((path.stem.removeprefix("result-"), d))
-          print("| model on device | executed | by | median | delegations |")
-          print("| --- | --- | --- | --- | --- |")
-          for name, d in rows:
+          def claims_of(d):
+              """What the delegates actually took, from the array rather than
+              the summary.
+
+              `delegations` is the evidence and `executed` is a description of
+              it, and on the build this was first run against the description
+              was wrong: a graph the two delegates split one operator each was
+              reported `cpu-fallback`, which the contract defines as the
+              delegates having taken nothing. Fixed in DroidRunner#170, and the
+              habit outlives the bug -- summaries are where a wrong claim gets
+              to look tidy.
+              """
               delegations = d.get("delegations")
-              claims = "; ".join(
-                  f"{x.get('delegate', '?')} took {x.get('nodes', '?')}"
+              if not isinstance(delegations, list) or not delegations:
+                  return "—", None
+              text = "; ".join(
+                  f"{x.get('delegate', '?')} {x.get('delegated', '?')}"
+                  f"/{x.get('total', '?')} in {x.get('partitions', '?')}"
                   for x in delegations
-              ) if isinstance(delegations, list) else "—"
+              )
+              total = delegations[0].get("total")
+              taken = sum(x.get("delegated", 0) for x in delegations)
+              if total is None:
+                  return text, None
+              if taken == 0:
+                  return text, "cpu-fallback"
+              return text, "accelerator" if taken >= total else "partial"
+
+          print("| model on device | reported | from delegations | by | median | claims |")
+          print("| --- | --- | --- | --- | --- | --- |")
+          for name, d in rows:
+              claims, derived = claims_of(d)
+              reported = d.get("executed") or "—"
+              # Shown side by side on purpose. They should agree, and a run
+              # where they do not is reporting a defect in one of them rather
+              # than a fact about the silicon.
+              derived = derived or "—"
+              if derived not in ("—", reported):
+                  derived = f"**{derived}**"
               median = d.get("medianUs")
-              print(f"| `{name}` | {d.get('executed', '—')} | "
-                    f"`{d.get('executedBy', '—')}` | "
-                    f"{median / 1000:.2f}ms | {claims} |"
-                    if median else
-                    f"| `{name}` | {d.get('executed', '—')} | "
-                    f"`{d.get('executedBy', '—')}` | — | {claims} |")
+              median = f"{median / 1000:.2f}ms" if median else "—"
+              print(f"| `{name}` | {reported} | {derived} | "
+                    f"`{d.get('executedBy', '—')}` | {median} | {claims} |")
           PY
