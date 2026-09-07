@@ -38,7 +38,7 @@ on:
           BATCH_MATMUL, and the NNAPI drivers here refuse a float32
           BATCH_MATMUL while the GPU takes one.
         required: true
-        default: "vecadd batchnorm attention"
+        default: "vecadd conv2d_3x3 conv2d_5x5"
 
 permissions:
   contents: read
@@ -46,7 +46,7 @@ permissions:
 env:
   ITERATIONS: ${{ inputs.iterations || '30' }}
   SYMBOLIC_DIM: ${{ inputs.symbolic-dim || '64' }}
-  MODELS: ${{ inputs.models || 'vecadd batchnorm attention' }}
+  MODELS: ${{ inputs.models || 'vecadd conv2d_3x3 conv2d_5x5' }}
 
 jobs:
   models:
@@ -63,9 +63,19 @@ jobs:
       #   vecadd     one operator   — the control: no split is possible
       #   batchnorm  MUL + ADD      — two operators the NPU takes both of, so
       #                               the second delegate is offered nothing
-      #   attention  BMM, DIV, SOFTMAX, BMM — the NPU refuses a float32
-      #                               BATCH_MATMUL and takes the other two, so
-      #                               this is the one that can split
+      #   conv2d_3x3 one CONV_2D — the NPU refuses it while the filter is a
+      #                               graph input, so the GPU should get all of it
+      #   conv2d_5x5 PAD + CONV_2D — two operators the two engines should want
+      #                               different halves of, which is the shape a
+      #                               crossing needs
+      #
+      # `attention` was the previous candidate and partitions correctly -- the
+      # NPU takes 2 of its 4 operators in 3 partitions, and with the GPU
+      # attached the remainder is offered to it -- but the GPU delegate then
+      # fails to invoke on this model at all, alone as well as combined:
+      # `Failed to upload data to GPU (clEnqueueWriteBuffer) - Invalid command
+      # queue`. A partition that cannot run is not a crossing that can be
+      # timed.
       #
       # `matvec_q8` was the first candidate and is not here: both engines
       # refuse it outright, for different reasons — the GPU delegate will not
