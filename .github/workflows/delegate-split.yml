@@ -3,9 +3,22 @@ name: Delegate split
 # Can two delegates share one interpreter, what does each claim, and what does
 # crossing between them cost?
 #
-# The three measurements in #174. They were blocked until DroidRunner v0.12.0
-# shipped `--device 'a+b'` behind `--feature multi-delegate`; the vocabulary
-# exists now and the phone that can answer is here.
+# The three measurements in #174, all of them answered on an MT6899 and none of
+# them fixed in place: a driver arrives with the system image and is replaced by
+# OTA updates nobody asks permission for, and `--weights` (#176) will move the
+# split by giving the NPU a convolution it currently refuses.
+#
+#   coexist    yes. Attaching an idle second delegate is free -- batchnorm
+#              76.91ms alone against 74.25ms with the GPU attached and claiming
+#              nothing, which is noise in both directions.
+#   claim      both, when the graph gives them reason to. On conv2d_5x5 the
+#              NNAPI delegate takes one operator and the GPU the other.
+#   crossing   1.67x. That same graph is 100.48ms split and 60.04ms with both
+#              operators on the GPU.
+#
+# The 40ms is an upper bound on the crossing rather than the crossing: it also
+# holds whatever the NNAPI delegate's PAD costs against the GPU's. The
+# direction is not in doubt.
 #
 # What this cannot do, and does not pretend to: `a+b` decides the *order*
 # delegates are offered the graph, not which node goes where. So a model whose
@@ -16,10 +29,6 @@ name: Delegate split
 # to TRANSPOSE, CAST, BATCH_MATMUL and MUL, and this phone's NNAPI drivers
 # refuse a float32 BATCH_MATMUL while its GPU takes one.
 on:
-  # Dispatch needs the file on the default branch, so the branch push trigger
-  # is how this runs before it is merged. Remove it when it is.
-  push:
-    branches: [ci/delegate-split]
   workflow_dispatch:
     inputs:
       iterations:
