@@ -16,6 +16,10 @@ name: Delegate split
 # to TRANSPOSE, CAST, BATCH_MATMUL and MUL, and this phone's NNAPI drivers
 # refuse a float32 BATCH_MATMUL while its GPU takes one.
 on:
+  # Dispatch needs the file on the default branch, so the branch push trigger
+  # is how this runs before it is merged. Remove it when it is.
+  push:
+    branches: [ci/delegate-split]
   workflow_dispatch:
     inputs:
       iterations:
