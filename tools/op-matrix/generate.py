@@ -90,6 +90,16 @@ def const(*shape, seed=0):
 # `support.rs` — the tables stay hand-written until somebody decides, on
 # purpose, how a measurement becomes a compiler's belief.
 OPS = {
+    # The one operator here whose input is not float32, and the reason
+    # `spec_of` exists. NxPU dequantizes an int8 weight with a CAST followed by
+    # a MUL, and on an MT6899 both engines refuse the result -- the GPU
+    # delegate by name (`CAST: Not supported Cast case. Input type: INT8 and
+    # output type: FLOAT32`) and the NNAPI driver with
+    # ANEURALNETWORKS_BAD_DATA. Neither had ever been measured, because the
+    # matrix skips models that lower to four operators. This row asks whether
+    # the drivers take that cast at all, which is the difference between an
+    # operator they do not have and an instance of ours they will not take.
+    "CAST": ([(FLAT, tf.int8)], lambda x: tf.cast(x, tf.float32), "Cast"),
     "ADD": ([SPATIAL, SPATIAL], lambda a, b: a + b, "Add"),
     "SUB": ([SPATIAL, SPATIAL], lambda a, b: a - b, "Sub"),
     "MUL": ([SPATIAL, SPATIAL], lambda a, b: a * b, "Mul"),
@@ -137,18 +147,48 @@ PRECISIONS = ("float32", "int8")
 EMITTED_BUILTINS = set(OPS) | {"CUSTOM"}
 
 
+def spec_of(entry):
+    """A `TensorSpec` from a shape, or from a `(shape, dtype)` pair.
+
+    Every reference model took float32 inputs, which is right for all but one
+    question. `CAST` is the operator NxPU emits to dequantize an int8 weight,
+    and the conversion it does -- INT8 to FLOAT32 -- is the one a GPU delegate
+    named when it refused: an int8 *input* is the only way to ask a driver
+    about that cast rather than about some other one.
+
+    `FLAT` is `(1, 64)`, a two-element tuple, so the pair is recognised by its
+    second element being a dtype rather than by its length.
+    """
+    if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], tf.DType):
+        return tf.TensorSpec(entry[0], entry[1])
+    return tf.TensorSpec(entry, tf.float32)
+
+
 def representative(shapes):
     def dataset():
         rng = np.random.default_rng(7)
         for _ in range(16):
-            yield [rng.standard_normal(s).astype("float32") for s in shapes]
+            samples = []
+            for entry in shapes:
+                spec = spec_of(entry)
+                if spec.dtype.is_integer:
+                    info = np.iinfo(spec.dtype.as_numpy_dtype)
+                    samples.append(
+                        rng.integers(info.min, info.max + 1, spec.shape)
+                        .astype(spec.dtype.as_numpy_dtype)
+                    )
+                else:
+                    samples.append(
+                        rng.standard_normal(spec.shape).astype("float32")
+                    )
+            yield samples
 
     return dataset
 
 
 def convert(shapes, build, precision):
     fn = tf.function(build).get_concrete_function(
-        *[tf.TensorSpec(s, tf.float32) for s in shapes]
+        *[spec_of(s) for s in shapes]
     )
     converter = tf.lite.TFLiteConverter.from_concrete_functions([fn])
     if precision == "int8":
@@ -240,7 +280,10 @@ def reference_models(wanted, out):
                 "id": name, "operator": operator, "precision": precision,
                 "source": "reference", "nxpuOp": nxpu_op,
                 "file": f"{name}.tflite", "bytes": len(blob),
-                "inputShapes": [list(s) for s in shapes]})
+                # Through `spec_of`, so an entry carrying a dtype records the
+                # shape rather than the pair -- a `tf.DType` is not JSON.
+                "inputShapes": [list(spec_of(s).shape) for s in shapes],
+                "inputTypes": [spec_of(s).dtype.name for s in shapes]})
     return generated, skipped
 
 
